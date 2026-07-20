@@ -1,18 +1,45 @@
 """FastAPI application factory and ASGI entry point."""
 
+import asyncio
+import logging
 from contextlib import asynccontextmanager
 from typing import AsyncIterator
 
 from fastapi import FastAPI
 
-from backend.api.routes import health
+from backend.api.routes import health, jobs
 from backend.core.config import Settings, get_settings
+from backend.database.session import get_sessionmaker
+from backend.messaging.kafka_producer import build_producer
+from backend.messaging.outbox_publisher import OutboxPublisher
+
+logger = logging.getLogger(__name__)
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
-    """Startup/shutdown hooks. DB engine and Kafka clients attach here later."""
-    yield
+    """Starts the outbox publisher as a background task.
+
+    It connects to Kafka lazily (see OutboxPublisher.ensure_started), so a
+    Kafka outage at boot never blocks the API from serving requests — jobs
+    still get written to the outbox and drain once the broker is reachable.
+    """
+    settings = get_settings()
+    publisher = OutboxPublisher(
+        get_sessionmaker(),
+        build_producer(),
+        poll_interval_seconds=settings.outbox_poll_interval_seconds,
+        batch_size=settings.outbox_batch_size,
+    )
+    stop_event = asyncio.Event()
+    publisher_task = asyncio.create_task(publisher.run_forever(stop_event))
+
+    try:
+        yield
+    finally:
+        stop_event.set()
+        await publisher_task
+        await publisher.stop()
 
 
 def create_app(settings: Settings | None = None) -> FastAPI:
@@ -25,6 +52,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         lifespan=lifespan,
     )
     app.include_router(health.router)
+    app.include_router(jobs.router)
     return app
 
 

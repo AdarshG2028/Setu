@@ -89,7 +89,27 @@ async def test_results_cascade_on_job_delete(session: AsyncSession) -> None:
 
 
 async def test_unpublished_outbox_partial_index_is_used(session: AsyncSession) -> None:
-    """The publisher's poll must hit the partial index, not a seq scan."""
+    """The publisher's poll must hit the partial index, not a seq scan.
+
+    Postgres's planner only prefers an index over a seq scan when scanning
+    the whole table would actually cost more — on a near-empty table a seq
+    scan legitimately wins regardless of the index. So this seeds a batch of
+    already-published rows (excluded by the partial predicate, but bulking
+    up the table) to reproduce the real scenario the index exists for:
+    many published rows, a few unpublished ones the publisher must find
+    cheaply.
+    """
+    await session.execute(
+        sa.text(
+            "INSERT INTO outbox_events "
+            "(id, aggregate_type, aggregate_id, event_type, topic, "
+            " partition_key, payload, status, published_at, attempts, "
+            " created_at, updated_at) "
+            "SELECT gen_random_uuid(), 'job', gen_random_uuid(), 'job.created', "
+            " 'setu.jobs', 'k', '{}'::jsonb, 'published', now(), 0, now(), now() "
+            "FROM generate_series(1, 5000)"
+        )
+    )
     session.add(
         OutboxEvent(
             aggregate_type="job",
@@ -101,6 +121,7 @@ async def test_unpublished_outbox_partial_index_is_used(session: AsyncSession) -
         )
     )
     await session.flush()
+    await session.execute(sa.text("ANALYZE outbox_events"))
 
     plan = await session.scalar(
         sa.text(

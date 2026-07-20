@@ -1,0 +1,36 @@
+"""Request/response schemas for the jobs endpoints."""
+
+import datetime as dt
+import uuid
+from typing import Any
+
+from pydantic import BaseModel, Field
+
+from backend.models import Job
+
+
+class JobCreateRequest(BaseModel):
+    workflow: list[str] = Field(min_length=1)
+    payload: dict[str, Any] = Field(default_factory=dict)
+
+
+class JobResponse(BaseModel):
+    id: uuid.UUID
+    status: str
+    workflow: list[str]
+    current_stage: int
+    attempts: int
+    max_attempts: int
+    created_at: dt.datetime
+
+    @classmethod
+    def from_model(cls, job: Job) -> "JobResponse":
+        return cls(
+            id=job.id,
+            status=job.status,
+            workflow=job.workflow["workflow"],
+            current_stage=job.current_stage,
+            attempts=job.attempts,
+            max_attempts=job.max_attempts,
+            created_at=job.created_at,
+        )

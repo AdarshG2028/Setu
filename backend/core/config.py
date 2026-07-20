@@ -34,6 +34,9 @@ class Settings(BaseSettings):
     # network; this default is for processes running on the host via uv.
     kafka_bootstrap_servers: str = "localhost:19092"
 
+    outbox_poll_interval_seconds: float = 2.0
+    outbox_batch_size: int = 50
+
     log_level: Literal["DEBUG", "INFO", "WARNING", "ERROR"] = "INFO"
 
 

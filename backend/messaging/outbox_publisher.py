@@ -1,0 +1,91 @@
+"""Outbox Publisher: drains OutboxEvents into Kafka.
+
+Guarantee: an event is marked published only after send_and_wait() returns
+(i.e. the broker acked it). If the process dies between the ack and the
+status update, the event is still 'pending' and gets republished on the next
+poll — at-least-once delivery. A duplicate downstream is expected and must be
+handled by idempotent consumers (see Result.UNIQUE(job_id, stage)); a lost
+event is not acceptable and this ordering is what prevents it.
+"""
+
+import asyncio
+import json
+import logging
+
+from aiokafka import AIOKafkaProducer
+from sqlalchemy.ext.asyncio import async_sessionmaker
+
+from backend.repositories.outbox_repository import OutboxRepository
+
+logger = logging.getLogger(__name__)
+
+
+class OutboxPublisher:
+    def __init__(
+        self,
+        sessionmaker: async_sessionmaker,
+        producer: AIOKafkaProducer,
+        *,
+        poll_interval_seconds: float,
+        batch_size: int,
+    ) -> None:
+        self._sessionmaker = sessionmaker
+        self._producer = producer
+        self._poll_interval_seconds = poll_interval_seconds
+        self._batch_size = batch_size
+        self._started = False
+
+    async def ensure_started(self) -> None:
+        """Connects to Kafka lazily so a broker outage never blocks app startup.
+
+        Jobs still get written to the outbox while Kafka is down; this just
+        keeps retrying until it can start draining them.
+        """
+        if not self._started:
+            await self._producer.start()
+            self._started = True
+
+    async def stop(self) -> None:
+        if self._started:
+            await self._producer.stop()
+
+    async def poll_once(self) -> int:
+        """Publish one batch of pending events. Returns the count published."""
+        async with self._sessionmaker() as session:
+            repo = OutboxRepository(session)
+            events = await repo.fetch_unpublished_batch(self._batch_size)
+
+            published = 0
+            for event in events:
+                try:
+                    await self._producer.send_and_wait(
+                        event.topic,
+                        key=event.partition_key.encode("utf-8"),
+                        value=json.dumps(event.payload).encode("utf-8"),
+                    )
+                except Exception as exc:  # broker down, topic misconfigured, etc.
+                    logger.warning("outbox publish failed for %s: %s", event.id, exc)
+                    await repo.mark_failed(event.id, str(exc))
+                    await session.commit()
+                    continue
+
+                # Ack has landed — only now is it safe to mark published.
+                await repo.mark_published(event.id)
+                await session.commit()
+                published += 1
+
+            return published
+
+    async def run_forever(self, stop_event: asyncio.Event) -> None:
+        while not stop_event.is_set():
+            try:
+                await self.ensure_started()
+                await self.poll_once()
+            except Exception:
+                logger.exception("outbox publisher poll iteration failed")
+            try:
+                await asyncio.wait_for(
+                    stop_event.wait(), timeout=self._poll_interval_seconds
+                )
+            except asyncio.TimeoutError:
+                pass
