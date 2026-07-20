@@ -36,6 +36,7 @@ class Settings(BaseSettings):
 
     outbox_poll_interval_seconds: float = 2.0
     outbox_batch_size: int = 50
+    outbox_max_publish_attempts: int = 10
 
     log_level: Literal["DEBUG", "INFO", "WARNING", "ERROR"] = "INFO"
 

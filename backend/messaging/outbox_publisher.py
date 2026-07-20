@@ -28,11 +28,13 @@ class OutboxPublisher:
         *,
         poll_interval_seconds: float,
         batch_size: int,
+        max_publish_attempts: int,
     ) -> None:
         self._sessionmaker = sessionmaker
         self._producer = producer
         self._poll_interval_seconds = poll_interval_seconds
         self._batch_size = batch_size
+        self._max_publish_attempts = max_publish_attempts
         self._started = False
 
     async def ensure_started(self) -> None:
@@ -65,7 +67,9 @@ class OutboxPublisher:
                     )
                 except Exception as exc:  # broker down, topic misconfigured, etc.
                     logger.warning("outbox publish failed for %s: %s", event.id, exc)
-                    await repo.mark_failed(event.id, str(exc))
+                    await repo.mark_failed(
+                        event.id, str(exc), max_attempts=self._max_publish_attempts
+                    )
                     await session.commit()
                     continue
 

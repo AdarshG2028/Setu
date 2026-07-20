@@ -71,7 +71,7 @@ async def test_successful_publish_marks_event_published(session: AsyncSession) -
 
     producer = _FakeProducer()
     publisher = OutboxPublisher(
-        await _maker_for(session), producer, poll_interval_seconds=1, batch_size=10
+        await _maker_for(session), producer, poll_interval_seconds=1, batch_size=10, max_publish_attempts=10
     )
 
     published = await publisher.poll_once()
@@ -91,7 +91,7 @@ async def test_failed_send_leaves_event_pending(session: AsyncSession) -> None:
 
     producer = _FakeProducer(fail=True)
     publisher = OutboxPublisher(
-        await _maker_for(session), producer, poll_interval_seconds=1, batch_size=10
+        await _maker_for(session), producer, poll_interval_seconds=1, batch_size=10, max_publish_attempts=10
     )
 
     published = await publisher.poll_once()
@@ -103,6 +103,38 @@ async def test_failed_send_leaves_event_pending(session: AsyncSession) -> None:
     assert "simulated broker failure" in event.last_error
 
 
+async def test_permanently_failing_event_stops_after_max_attempts(session: AsyncSession) -> None:
+    """A poison message (e.g. an invalid topic name) must not retry forever.
+
+    Regression test: this exact scenario — an event whose topic can never
+    be published — spun in a tight, unbounded loop in production before
+    max_publish_attempts existed, because fetch_unpublished_batch() kept
+    returning it every single poll with no cap.
+    """
+    event = _event()
+    session.add(event)
+    await session.commit()
+
+    producer = _FakeProducer(fail=True)
+    publisher = OutboxPublisher(
+        await _maker_for(session), producer, poll_interval_seconds=1, batch_size=10, max_publish_attempts=3
+    )
+
+    for _ in range(3):
+        await publisher.poll_once()
+
+    await session.refresh(event)
+    assert event.attempts == 3
+    assert event.status == "failed"  # moved out of PENDING; stops showing up in polls
+
+    # A 4th poll must not touch it — it's no longer "unpublished" for polling
+    # purposes, even though it never actually reached Kafka.
+    published = await publisher.poll_once()
+    assert published == 0
+    await session.refresh(event)
+    assert event.attempts == 3  # unchanged
+
+
 async def test_already_published_events_are_not_republished(session: AsyncSession) -> None:
     event = _event()
     session.add(event)
@@ -110,7 +142,7 @@ async def test_already_published_events_are_not_republished(session: AsyncSessio
 
     producer = _FakeProducer()
     publisher = OutboxPublisher(
-        await _maker_for(session), producer, poll_interval_seconds=1, batch_size=10
+        await _maker_for(session), producer, poll_interval_seconds=1, batch_size=10, max_publish_attempts=10
     )
     await publisher.poll_once()
     assert len(producer.sent) == 1
@@ -130,7 +162,7 @@ async def test_publish_against_real_kafka_is_consumable(session: AsyncSession) -
 
     producer = build_producer()
     publisher = OutboxPublisher(
-        await _maker_for(session), producer, poll_interval_seconds=1, batch_size=10
+        await _maker_for(session), producer, poll_interval_seconds=1, batch_size=10, max_publish_attempts=10
     )
     await publisher.ensure_started()
     try:

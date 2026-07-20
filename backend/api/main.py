@@ -30,6 +30,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         build_producer(),
         poll_interval_seconds=settings.outbox_poll_interval_seconds,
         batch_size=settings.outbox_batch_size,
+        max_publish_attempts=settings.outbox_max_publish_attempts,
     )
     stop_event = asyncio.Event()
     publisher_task = asyncio.create_task(publisher.run_forever(stop_event))
