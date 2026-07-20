@@ -134,7 +134,83 @@ across `down`, which is what caused the stale-revision issue above; use
 
 ## Phase 1 — Outbox + Guaranteed Delivery
 
-Not started. Scope per the roadmap: `POST /jobs` writes a `Job` +
-`OutboxEvent` in one transaction; an Outbox Publisher polls unpublished
-events and publishes them to Kafka; idempotency key enforcement on job
-submission.
+### 2026-07-20 — `1d0621d` Phase 1: outbox pattern, guaranteed delivery, idempotent job submission
+
+Populated `repositories/`, `services/`, `messaging/`, and `api/routes/`
+against the Phase 0 models. Two invariants carry the whole "guaranteed
+delivery" claim:
+
+- **Atomic write.** `JobSubmissionService.submit()`
+  (`backend/services/job_submission_service.py`) inserts `Job` +
+  `OutboxEvent` + `IdempotencyKey` on one session and commits once. There is
+  never a `Job` without its `OutboxEvent`. The outbox event's `topic` is set
+  to the workflow's first stage name (`workflow[0]`) — dispatch stays data,
+  not a hardcoded chain, consistent with the Phase 4 workflow-engine plan.
+- **Publish-after-ack.** `OutboxPublisher.poll_once()`
+  (`backend/messaging/outbox_publisher.py`) marks an event `published` only
+  after `producer.send_and_wait()` returns. If the process dies in between,
+  the event is still `pending` and gets republished on the next poll — a
+  duplicate downstream is expected (idempotent consumers own that, via
+  `Result.UNIQUE(job_id, stage)` from Phase 0); a lost event is not.
+
+Idempotency is enforced by the database, not a check-then-insert race:
+`IdempotencyKey.key` is the primary key, so a concurrent duplicate loses the
+insert and its `IntegrityError` is caught and turned into "return the
+existing job." Same key with a different request body is rejected as a 422
+conflict. Verified with a genuine two-coroutine concurrent-insert race (not
+a simulated one) — both submissions resolve to the same job, exactly one
+`IdempotencyKey` row exists.
+
+The publisher connects to Kafka lazily from its background task
+(`OutboxPublisher.ensure_started()`), not during app startup — a Kafka
+outage at boot doesn't block the API; jobs still land in the outbox and
+drain once the broker is reachable. This was also necessary for testability:
+an eager `producer.start()` in the lifespan would make even the plain
+`/health` check depend on Kafka being up.
+
+Added `POST /jobs` (requires an `Idempotency-Key` header) and `GET
+/jobs/{id}` (`backend/api/routes/jobs.py`).
+
+**Test coverage:** atomicity and the real idempotency race against Postgres
+(`tests/test_job_submission_service.py`); publish-after-ack and
+failure-leaves-pending using a fake producer, plus a real Kafka round-trip
+(`tests/test_outbox_publisher.py`); full HTTP tests including the
+outbox-to-Kafka delivery chain (`tests/test_jobs_api.py`).
+
+**A real bug surfaced and fixed during this phase, worth remembering:**
+`backend.database.session.get_engine()` is a process-wide singleton
+(`@lru_cache`), which is correct for production (one process, one event
+loop) but broke under a function-scoped `TestClient` fixture — each test was
+spinning a fresh portal thread/event loop while the app kept reusing that
+one cached engine's connection pool across all of them. A connection opened
+under test 1's (now-dead) loop would later get reused and torn down under
+test 3's different loop, which asyncpg can't do. Symptoms were inconsistent
+by design: an outright hang in one run, a cascade of "Event loop is closed"
+failures starting partway through the suite in another — both from the same
+root cause. Fixed by scoping the `TestClient` fixture to the test module
+instead of each test function, matching how the app actually runs (started
+once, serves many requests). Two smaller false leads were tried and
+discarded first: switching pytest-asyncio's loop scope to `session` (didn't
+address the actual cause), and having test cleanup fixtures share the app's
+cached engine directly (made it worse — that's what caused the hang, since
+it added a *second* concurrent live event loop touching the same pool).
+
+Also seeded 5,000 dummy rows in `test_unpublished_outbox_partial_index_is_used`
+after the table was cleaned to empty during this debugging — Postgres's
+planner correctly prefers a seq scan over the partial index on a near-empty
+table, so the test needed to reproduce the actual scenario the index exists
+for (many published rows, a few unpublished ones) rather than assert
+index-usage unconditionally.
+
+No `docker-compose.yml` changes this phase — Postgres and Redpanda from
+Phase 0 cover everything Phase 1 needed.
+
+**Status at end of Phase 1:** 26 tests passing. Database confirmed empty of
+test residue after a full run.
+
+### Next up
+
+Phase 2 — Reliability: dummy worker(s) on a common Worker interface,
+idempotent processing, retry with exponential backoff, DLQ after max
+retries, and the worker-crash-recovery demo (kill mid-job → no loss, no
+duplicates).
