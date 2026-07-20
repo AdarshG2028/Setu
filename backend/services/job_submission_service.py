@@ -69,7 +69,12 @@ class JobSubmissionService:
                 # engine (Phase 4) owns dispatch, not this service.
                 topic=workflow[0],
                 partition_key=str(job.id),
-                payload={"job_id": str(job.id), "workflow": workflow, "payload": payload},
+                payload={
+                    "job_id": str(job.id),
+                    "stage": 0,
+                    "workflow": workflow,
+                    "payload": payload,
+                },
             )
         )
         self._idempotency.add(
