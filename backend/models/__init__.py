@@ -1,0 +1,25 @@
+"""SQLAlchemy ORM models.
+
+Importing this package registers every model on ``Base.metadata``; Alembic's
+autogenerate depends on that, so new models must be re-exported here.
+"""
+
+from backend.database.base import Base
+from backend.models.enums import ExecutionStatus, JobStatus, OutboxStatus
+from backend.models.idempotency import IdempotencyKey
+from backend.models.job import Job
+from backend.models.outbox import OutboxEvent
+from backend.models.result import Result
+from backend.models.worker_execution import WorkerExecution
+
+__all__ = [
+    "Base",
+    "ExecutionStatus",
+    "IdempotencyKey",
+    "Job",
+    "JobStatus",
+    "OutboxEvent",
+    "OutboxStatus",
+    "Result",
+    "WorkerExecution",
+]

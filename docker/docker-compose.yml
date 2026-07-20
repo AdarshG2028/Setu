@@ -1,0 +1,59 @@
+name: setu
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: setu
+      POSTGRES_PASSWORD: setu
+      POSTGRES_DB: setu
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U setu -d setu"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  # Redpanda speaks the Kafka protocol but runs as a single process with no
+  # ZooKeeper, which keeps the "kill a broker / kill a worker" demo simple.
+  redpanda:
+    image: redpandadata/redpanda:v24.2.7
+    command:
+      - redpanda
+      - start
+      - --smp=1
+      - --memory=1G
+      - --overprovisioned
+      - --node-id=0
+      - --check=false
+      - --kafka-addr=INTERNAL://0.0.0.0:9092,EXTERNAL://0.0.0.0:19092
+      # Clients inside the compose network use redpanda:9092; clients on the
+      # host use localhost:19092. Both must be advertised or one side breaks.
+      - --advertise-kafka-addr=INTERNAL://redpanda:9092,EXTERNAL://localhost:19092
+    ports:
+      - "19092:19092"
+      - "9644:9644"
+    volumes:
+      - redpanda_data:/var/lib/redpanda/data
+    healthcheck:
+      test: ["CMD-SHELL", "rpk cluster health | grep -q 'Healthy:.*true'"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  console:
+    image: redpandadata/console:v2.7.2
+    depends_on:
+      redpanda:
+        condition: service_healthy
+    environment:
+      KAFKA_BROKERS: redpanda:9092
+    ports:
+      - "8081:8080"
+
+volumes:
+  postgres_data:
+  redpanda_data:
