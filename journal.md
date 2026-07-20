@@ -208,9 +208,79 @@ Phase 0 cover everything Phase 1 needed.
 **Status at end of Phase 1:** 26 tests passing. Database confirmed empty of
 test residue after a full run.
 
+---
+
+## Phase 2 — Reliability
+
+### 2026-07-20 — `881e8a9` fix: cap outbox publish retries so a poison event can't loop forever
+
+A live incident, not planned work: while restarting the API server for
+Phase 2, it immediately spammed ~33,000 log lines in seconds. Root cause: a
+job submitted through Swagger earlier (during the manual-testing walkthrough)
+used `workflow: ["Frame Extraction"]` — capitalized, with a space, an
+invalid Kafka topic name. That `OutboxEvent` had been sitting `pending`
+ever since, retried on every publisher poll with **no cap and no backoff**,
+because `fetch_unpublished_batch()` only ever filters on `status ==
+PENDING` and nothing ever moved a permanently-failing event out of that
+state — despite `OutboxStatus.FAILED` already existing in the enum from
+Phase 0, unused until now.
+
+Fixed: `OutboxRepository.mark_failed()` now takes `max_attempts` and
+transitions the event to `FAILED` once reached, in the same atomic
+`UPDATE` that increments `attempts` (via `sa.case()`, avoiding a
+read-then-write race). New `Settings.outbox_max_publish_attempts` (default
+10). Regression test (`test_permanently_failing_event_stops_after_max_attempts`)
+reproduces the exact scenario and confirms it stops.
+
+### 2026-07-20 — `9f8ff1d` Phase 2 (part 1): dummy worker, idempotent processing, crash recovery
+
+Built the crash-safe spine first, deliberately before retry/backoff or DLQ
+(per plan — prove the reliable core, then layer failure handling on top).
+
+- **A worker is a real, standalone OS process**
+  (`python -m backend.workers.cli <topic>`), not a background task inside
+  the API. This was a deliberate choice, not a default: the crash-recovery
+  guarantee has to survive an actual kill of just the worker, and asyncio
+  task cancellation running inside the API process isn't a real crash.
+- **Offset-commit ordering is the entire guarantee.** Per message: consume
+  → `StageProcessingService.handle()` commits `Result` + `WorkerExecution`
+  + `Job` status to Postgres → only *then* does the harness
+  (`backend/workers/runner.py`) commit the Kafka offset
+  (`enable_auto_commit=False`). A crash before the Postgres commit loses
+  nothing (offset was never committed, Kafka redelivers). A crash after the
+  Postgres commit but before the offset commit causes redelivery into a
+  handler that finds `Result` already exists for `(job_id, stage)` and
+  treats it as a no-op — idempotent, not duplicated.
+- **The retry budget lives in Postgres** (`Job.attempts`, read fresh on
+  every delivery), not as an in-memory loop variable — an in-memory counter
+  would reset to zero on every crash, and a permanently-failing message
+  would never reach a DLQ.
+- `DummyWorker` does no real work; it exists purely to exercise the
+  harness. Two payload flags enable deterministic testing: `_hang_seconds`
+  (sleep before finishing, so a test can kill the process at a known point
+  mid-processing) and `_fail` (for the retry/DLQ work still to come).
+- Outbox events now carry an explicit `"stage"` index rather than the
+  worker assuming 0 — true today since only `workflow[0]` is ever
+  dispatched, but hardcoding it would be a latent bug once Phase 4's engine
+  dispatches other stages.
+- **Scope for this part:** a job is marked `COMPLETED` only when its
+  dispatched stage is the *last* one in the workflow list; otherwise it's
+  left `RUNNING`. There's no engine yet to advance to the next stage — use
+  single-stage workflows for now so "stage done" and "job done" mean the
+  same thing.
+
+**The actual deliverable:** `tests/test_worker_crash_recovery.py`. Spawns
+the worker CLI as a genuine OS subprocess, hard-kills it while `DummyWorker`
+is deliberately hanging mid-processing (well before any DB write or offset
+commit), restarts an identical worker on the same consumer group, and
+asserts: zero `Result`/`WorkerExecution` rows immediately after the kill,
+job still `pending`; exactly one of each after recovery, job `completed`,
+`attempts == 1`. Passes in ~22s.
+
+**Status: 28 tests passing.** Database confirmed clean after a full run.
+
 ### Next up
 
-Phase 2 — Reliability: dummy worker(s) on a common Worker interface,
-idempotent processing, retry with exponential backoff, DLQ after max
-retries, and the worker-crash-recovery demo (kill mid-job → no loss, no
-duplicates).
+Retry with exponential backoff (currently an immediate redelivery loop —
+Kafka just redelivers instantly with no delay), and a dead-letter queue
+once `Job.max_attempts` is exhausted. Then Phase 3 (observability).
