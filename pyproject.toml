@@ -5,6 +5,7 @@ description = "Event-driven backend platform for orchestrating AI media workflow
 readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
+    "aiokafka>=0.14.0",
     "alembic>=1.18.5",
     "asyncpg>=0.31.0",
     "fastapi>=0.139.2",
@@ -26,3 +27,7 @@ dev = [
     "pytest>=9.1.1",
     "pytest-asyncio>=1.4.0",
 ]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
