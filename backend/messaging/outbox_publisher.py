@@ -6,6 +6,17 @@ status update, the event is still 'pending' and gets republished on the next
 poll — at-least-once delivery. A duplicate downstream is expected and must be
 handled by idempotent consumers (see Result.UNIQUE(job_id, stage)); a lost
 event is not acceptable and this ordering is what prevents it.
+
+send_and_wait() is wrapped in a timeout, not called bare: a topic name
+aiokafka rejects client-side (illegal characters) makes send_and_wait()
+retry an internal "not a valid topic name" metadata refresh forever without
+ever raising — unlike a broker-side rejection (e.g.
+UnknownTopicOrPartitionError), which the broker returns promptly as a real
+exception. Without the timeout, one bad topic name in a job submission
+hangs poll_once()'s sequential loop forever, wedging the whole publisher —
+not just that one event, every event behind it too, indefinitely. A
+TimeoutError is handled by the same mark_failed/max_attempts path as any
+other publish failure.
 """
 
 import asyncio
@@ -29,12 +40,14 @@ class OutboxPublisher:
         poll_interval_seconds: float,
         batch_size: int,
         max_publish_attempts: int,
+        publish_timeout_seconds: float = 10.0,
     ) -> None:
         self._sessionmaker = sessionmaker
         self._producer = producer
         self._poll_interval_seconds = poll_interval_seconds
         self._batch_size = batch_size
         self._max_publish_attempts = max_publish_attempts
+        self._publish_timeout_seconds = publish_timeout_seconds
         self._started = False
 
     async def ensure_started(self) -> None:
@@ -60,12 +73,15 @@ class OutboxPublisher:
             published = 0
             for event in events:
                 try:
-                    await self._producer.send_and_wait(
-                        event.topic,
-                        key=event.partition_key.encode("utf-8"),
-                        value=json.dumps(event.payload).encode("utf-8"),
+                    await asyncio.wait_for(
+                        self._producer.send_and_wait(
+                            event.topic,
+                            key=event.partition_key.encode("utf-8"),
+                            value=json.dumps(event.payload).encode("utf-8"),
+                        ),
+                        timeout=self._publish_timeout_seconds,
                     )
-                except Exception as exc:  # broker down, topic misconfigured, etc.
+                except Exception as exc:  # broker down, topic misconfigured, timed out, etc.
                     logger.warning("outbox publish failed for %s: %s", event.id, exc)
                     await repo.mark_failed(
                         event.id, str(exc), max_attempts=self._max_publish_attempts
