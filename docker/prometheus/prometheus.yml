@@ -1,0 +1,21 @@
+global:
+  scrape_interval: 5s
+
+scrape_configs:
+  # The API and workers run on the host via uv (see README), not in
+  # compose, so Prometheus (which does run in compose) reaches them
+  # through host.docker.internal rather than a service name.
+  - job_name: setu-api
+    static_configs:
+      - targets: ["host.docker.internal:8000"]
+        labels:
+          service: api
+
+  # Default port from `backend/workers/cli.py --metrics-port` (9100).
+  # Running a second worker on the same host needs a second scrape target
+  # here with its own --metrics-port.
+  - job_name: setu-worker
+    static_configs:
+      - targets: ["host.docker.internal:9100"]
+        labels:
+          service: worker

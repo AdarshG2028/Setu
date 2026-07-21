@@ -26,6 +26,7 @@ import logging
 from aiokafka import AIOKafkaProducer
 from sqlalchemy.ext.asyncio import async_sessionmaker
 
+from backend.observability.metrics import OUTBOX_PUBLISH_TOTAL
 from backend.repositories.outbox_repository import OutboxRepository
 
 logger = logging.getLogger(__name__)
@@ -95,12 +96,14 @@ class OutboxPublisher:
                         event.id, str(exc), max_attempts=self._max_publish_attempts
                     )
                     await session.commit()
+                    OUTBOX_PUBLISH_TOTAL.labels(outcome="failed").inc()
                     continue
 
                 # Ack has landed — only now is it safe to mark published.
                 await repo.mark_published(event.id)
                 await session.commit()
                 published += 1
+                OUTBOX_PUBLISH_TOTAL.labels(outcome="published").inc()
                 logger.info(
                     "outbox event published",
                     extra={

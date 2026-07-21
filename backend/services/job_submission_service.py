@@ -15,6 +15,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from backend.models import IdempotencyKey, Job, OutboxEvent
+from backend.observability.metrics import JOBS_SUBMITTED_TOTAL
 from backend.repositories.idempotency_repository import IdempotencyRepository
 from backend.repositories.job_repository import JobRepository
 from backend.repositories.outbox_repository import OutboxRepository
@@ -99,6 +100,7 @@ class JobSubmissionService:
             "job created",
             extra={"job_id": str(job.id), "workflow": workflow, "idempotency_key": idempotency_key},
         )
+        JOBS_SUBMITTED_TOTAL.inc()
         return JobSubmissionResult(job=job, replayed=False)
 
     async def _handle_existing_key(

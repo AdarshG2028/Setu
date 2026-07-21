@@ -18,6 +18,7 @@ partition.
 
 import datetime as dt
 import logging
+import time
 from dataclasses import dataclass
 from enum import StrEnum
 
@@ -26,6 +27,11 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from backend.models import Job, JobStatus, Result, WorkerExecution
 from backend.models.enums import ExecutionStatus
+from backend.observability.metrics import (
+    JOBS_DEAD_LETTERED_TOTAL,
+    STAGE_OUTCOMES_TOTAL,
+    STAGE_PROCESSING_DURATION_SECONDS,
+)
 from backend.repositories.job_repository import JobRepository
 from backend.repositories.result_repository import ResultRepository
 from backend.repositories.worker_execution_repository import WorkerExecutionRepository
@@ -64,6 +70,7 @@ class StageProcessingService:
                 "stage already has a result; redelivery, skipping",
                 extra={"job_id": str(message.job_id), "stage": message.stage},
             )
+            STAGE_OUTCOMES_TOTAL.labels(outcome=ProcessingOutcome.ALREADY_DONE).inc()
             return ProcessingResult(outcome=ProcessingOutcome.ALREADY_DONE)
 
         job = await self._jobs.get(message.job_id)
@@ -73,6 +80,7 @@ class StageProcessingService:
             # dropping it or retrying forever against a job that will never
             # exist.
             logger.error("job not found", extra={"job_id": str(message.job_id)})
+            STAGE_OUTCOMES_TOTAL.labels(outcome=ProcessingOutcome.EXHAUSTED).inc()
             return ProcessingResult(
                 outcome=ProcessingOutcome.EXHAUSTED, error=f"job {message.job_id} not found"
             )
@@ -83,11 +91,14 @@ class StageProcessingService:
 
         attempt = job.attempts + 1
 
+        start = time.perf_counter()
         try:
             result_payload = await self._worker.process(message)
         except Exception as exc:
+            STAGE_PROCESSING_DURATION_SECONDS.observe(time.perf_counter() - start)
             return await self._record_failure(job, message, attempt, exc)
 
+        STAGE_PROCESSING_DURATION_SECONDS.observe(time.perf_counter() - start)
         return await self._record_success(job, message, attempt, result_payload)
 
     async def _record_failure(
@@ -116,8 +127,12 @@ class StageProcessingService:
             # updated_at for when this became terminal.
 
         await self._session.commit()
+        outcome = ProcessingOutcome.EXHAUSTED if exhausted else ProcessingOutcome.RETRY
+        STAGE_OUTCOMES_TOTAL.labels(outcome=outcome).inc()
+        if exhausted:
+            JOBS_DEAD_LETTERED_TOTAL.inc()
         return ProcessingResult(
-            outcome=ProcessingOutcome.EXHAUSTED if exhausted else ProcessingOutcome.RETRY,
+            outcome=outcome,
             attempt=attempt,
             max_attempts=job.max_attempts,
             error=error_text,
@@ -173,4 +188,5 @@ class StageProcessingService:
                 "job_status": job.status,
             },
         )
+        STAGE_OUTCOMES_TOTAL.labels(outcome=ProcessingOutcome.SUCCEEDED).inc()
         return ProcessingResult(outcome=ProcessingOutcome.SUCCEEDED, attempt=attempt)

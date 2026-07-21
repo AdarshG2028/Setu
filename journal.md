@@ -414,6 +414,78 @@ in that specific test, not a regression.
 line is JSON, correlated by `job_id`, with a `trace_id`/`span_id` hook
 ready for Part 3.
 
+### 2026-07-21 — Phase 3 (part 2): Prometheus metrics + Grafana dashboards
+
+`backend/observability/metrics.py` defines every metric once, shared by
+import across the API and worker processes — but each process has its own
+in-memory Prometheus registry, so they're two separate scrape targets, not
+one shared counter set: `/metrics` mounted on the API
+(`prometheus_client.make_asgi_app()`) and a dedicated HTTP server per
+worker (`prometheus_client.start_http_server(args.metrics_port)`, new
+`--metrics-port` CLI flag, default 9100 — running two workers on one host
+needs two different ports).
+
+Metrics: `setu_jobs_submitted_total` (API, new jobs only — idempotent
+replays don't count), `setu_outbox_publish_total{outcome}` (API),
+`setu_stage_processing_duration_seconds` histogram + `setu_stage_outcomes_total{outcome}`
++ `setu_jobs_dead_lettered_total` (worker). The four requested lifecycle
+metrics (`setu_jobs_pending/processing/completed/failed`) are `Gauge`s,
+not `Counter`s incremented at transition points — pending/processing
+counts have to be able to go *down* as jobs move on, which a plain
+counter can't express. They're refreshed every `metrics_poll_interval_seconds`
+(default 5s) by a new background task in the API's lifespan
+(`poll_job_lifecycle_gauges`) that runs `SELECT status, COUNT(*) FROM jobs
+GROUP BY status` — Postgres is the one shared source of truth, so only the
+API polls it; workers don't duplicate this. `setu_jobs_failed` maps to
+`DEAD_LETTERED`, not the unused `JobStatus.FAILED` enum member — nothing
+in this pipeline ever sets `FAILED`, `DEAD_LETTERED` is the terminal
+failure state it actually produces.
+
+Deliberately did *not* add separate retry/DLQ counters in `runner.py`
+even though the plan's initial framing mentioned it there — `runner.py`
+only acts on the outcome `stage_processing_service.py` already decided
+and already counts (`STAGE_OUTCOMES_TOTAL{outcome="retry"|"exhausted"}`);
+a second counter in the harness would just double-count the same event
+under a different name.
+
+`docker-compose.yml` gets two new services: `prometheus` (scrapes the API
+and worker via `host.docker.internal`, since both run on the host through
+uv, not in compose — `docker/prometheus/prometheus.yml`) and `grafana`
+(anonymous admin access, no login prompt, matching the fact nothing else
+in this local-only stack has auth either; datasource + one seed dashboard
+provisioned from `docker/grafana/provisioning/`, 8 panels: the 4 lifecycle
+gauges as stat panels, job throughput, stage outcomes by rate, p50/p95
+processing duration, outbox publish rate by outcome).
+
+**Verification hit a wrinkle worth recording:** ran a second API instance
+on an alternate port to test against, since the port-8000 terminal still
+had pre-Phase-3 code loaded (same situation as Part 1). With two
+`OutboxPublisher` instances polling the same Postgres table, the *stale*
+process kept winning the race to claim and publish the same outbox rows
+my test instance's requests created — so my instance's own
+`setu_outbox_publish_total` stayed at zero even though the jobs
+completed successfully via the other process. Confirmed this was a race
+artifact of running two competing publishers, not a bug, with a clean
+single-process repro (`OutboxPublisher.poll_once()` called directly,
+no competition): published count and metric both came back exactly 1,
+deterministically. Real deployments only run one API instance, so this
+race doesn't occur outside of parallel manual testing like this.
+
+Confirmed via Prometheus itself (not just curl against each process):
+`setu-worker` scrape target came up healthy through
+`host.docker.internal`, and a live query
+(`setu_jobs_dead_lettered_total`) returned real, correctly-labeled data
+that had flowed all the way through worker → registry → scrape →
+Prometheus TSDB. Also confirmed Grafana's provisioning: dashboard loaded
+with all 8 panels, datasource wired to the right URL. The `setu-api`
+scrape target stays down until the port-8000 terminal is restarted with
+current code — expected, not a defect, same as the `/metrics` 404 seen
+during Part 1 verification.
+
+**Status: 30 tests passing.** Part 2 milestone met: Grafana renders live
+pipeline health from Prometheus, including all four job-lifecycle gauges
+reflecting real Postgres state.
+
 ### Next up
 
-Phase 3 (part 2): Prometheus metrics + Grafana dashboards.
+Phase 3 (part 3): OpenTelemetry tracing with Jaeger.

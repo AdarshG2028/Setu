@@ -42,6 +42,10 @@ class Settings(BaseSettings):
     worker_retry_base_delay_seconds: float = 2.0
     worker_retry_max_delay_seconds: float = 30.0
 
+    # How often the API refreshes the job-lifecycle Prometheus gauges
+    # (setu_jobs_pending/processing/completed/failed) from Postgres.
+    metrics_poll_interval_seconds: float = 5.0
+
     log_level: Literal["DEBUG", "INFO", "WARNING", "ERROR"] = "INFO"
 
 
