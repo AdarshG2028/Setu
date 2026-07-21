@@ -37,6 +37,8 @@ def main() -> None:
         bootstrap_servers=settings.kafka_bootstrap_servers,
         topic=args.topic,
         group_id=args.group_id or f"setu-{args.topic}-workers",
+        retry_base_delay_seconds=settings.worker_retry_base_delay_seconds,
+        retry_max_delay_seconds=settings.worker_retry_max_delay_seconds,
     )
     asyncio.run(runner.run_forever())
 

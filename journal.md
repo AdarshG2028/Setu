@@ -279,8 +279,64 @@ job still `pending`; exactly one of each after recovery, job `completed`,
 
 **Status: 28 tests passing.** Database confirmed clean after a full run.
 
+### 2026-07-21 — Phase 2 (part 2): exponential backoff + dead-letter queue
+
+`StageProcessingService.handle()` now returns a `ProcessingResult` (outcome
++ attempt/max_attempts/error) instead of raising or silently returning —
+raising couldn't distinguish "still has retry budget" from "budget
+exhausted, DLQ it," and both needed different harness behavior.
+`ProcessingOutcome`: `SUCCEEDED`, `ALREADY_DONE` (idempotent redelivery
+no-op), `RETRY`, `EXHAUSTED`. Failure now routes through
+`_record_failure()`, which compares `attempt` to `Job.max_attempts` (both
+in Postgres, per the Phase 2 part 1 rule about not trusting an in-memory
+counter) and marks the job `DEAD_LETTERED` when the budget is spent.
+
+`WorkerRunner` acts on the outcome: `RETRY` sleeps for
+`base_delay * 2^(attempt-1)` (capped at `retry_max_delay_seconds`,
+new `Settings` fields) and leaves the offset uncommitted; `EXHAUSTED`
+publishes the message to `<topic>.dlq` (direct produce, not the outbox —
+this is a worker-internal failure record, not a domain event) and commits
+the offset to unblock the partition. `WorkerRunner.consume_one()` is a new
+method, split out of `run_forever()`'s loop body, so
+`tests/test_worker_retry_and_dlq.py` can drive one delivery at a time and
+assert state between them.
+
+**Bug found by the test, not by inspection:** the first version of
+`test_failing_job_retries_then_dead_letters` hung indefinitely on the
+second `consume_one()` call. Root cause: "leave the offset uncommitted so
+Kafka redelivers" is only true across a *consumer restart* — that's the
+mechanism the crash-recovery test exercises. Within one live
+`AIOKafkaConsumer` instance, the local fetch position advances on every
+`getone()` regardless of whether the offset was committed; not committing
+just means a *future* restart would refetch from the last commit. Since
+`run_forever()` runs a single long-lived consumer for the worker's entire
+life, the original RETRY path would have silently skipped a failed message
+forever instead of retrying it — never actually reprocessing anything,
+just quietly losing failed jobs. Confirmed with a standalone script before
+touching the fix: one `consume_one()` call worked, a second hung waiting
+for a message that would never arrive. Fix: `RETRY` now explicitly
+`consumer.seek()`s back to the failed record's offset before returning, so
+the next `getone()` re-fetches the same message. Verified the fix with the
+same standalone repro (3 calls now correctly produce attempt 1 → retry,
+attempt 2 → retry, attempt 3 → exhausted/DLQ) before rerunning the suite.
+
+`tests/test_worker_retry_and_dlq.py` — two tests: full retry → DLQ →
+partition-unblocked cycle (asserts a DLQ message lands with the right
+payload, and that a fresh healthy message on the same topic afterward is
+processed promptly rather than stuck behind the poison one), and a timing
+test confirming backoff actually grows between attempts rather than just
+"retries happen at all."
+
+Also found ~1hr of stale test data (three `running` Jobs from
+`retry-dlq-*` test topics, no matching `results`/`worker_executions`)
+left behind by the killed hung run — its `finally` cleanup never executed
+because the process was killed mid-`await`, not exited normally. Deleted
+manually; not a code bug, just a reminder that killing a test mid-run
+skips its cleanup same as any other crash.
+
+**Status: 30 tests passing.** Database confirmed clean after a full run.
+
 ### Next up
 
-Retry with exponential backoff (currently an immediate redelivery loop —
-Kafka just redelivers instantly with no delay), and a dead-letter queue
-once `Job.max_attempts` is exhausted. Then Phase 3 (observability).
+Phase 3 (observability): structured logging, OpenTelemetry tracing,
+Prometheus metrics, Grafana dashboards.

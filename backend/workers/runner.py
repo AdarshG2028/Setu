@@ -13,16 +13,38 @@ Either way: no lost work, no duplicated Result.
 enable_auto_commit=False is what makes this true — auto-commit would ack
 the offset on a timer regardless of whether the message was actually
 processed, which can lose work on a crash.
+
+On failure, the outcome from StageProcessingService decides what happens:
+  - RETRY (budget remains): sleep for an exponentially increasing delay,
+    then explicitly seek() the consumer back to the failed record's offset
+    before returning without committing. This is not optional bookkeeping:
+    within one live consumer instance the fetch position auto-advances on
+    every getone() regardless of whether the offset was committed — an
+    uncommitted offset only causes redelivery across a consumer restart
+    (that's what the crash-recovery path relies on). Without the seek,
+    run_forever()'s single long-lived consumer would silently skip a
+    failed message instead of retrying it. This blocks the partition for
+    the sleep duration — accepted for this single-worker demo; a
+    production system would isolate slow/failing jobs onto their own
+    partition or a delay queue instead. Cumulative backoff is capped well
+    under Kafka's max.poll.interval.ms (~5 min default) so the broker
+    doesn't rebalance the partition away mid-retry.
+  - EXHAUSTED (budget spent, or the job no longer exists): publish the
+    message to "<topic>.dlq" and commit the offset, unblocking the
+    partition. Direct produce, not routed through the outbox — this is a
+    worker-internal failure record, not a domain event the rest of the
+    system needs guaranteed delivery of.
 """
 
+import asyncio
 import json
 import logging
 import uuid
 
-from aiokafka import AIOKafkaConsumer
+from aiokafka import AIOKafkaConsumer, AIOKafkaProducer, TopicPartition
 from sqlalchemy.ext.asyncio import async_sessionmaker
 
-from backend.services.stage_processing_service import StageProcessingService
+from backend.services.stage_processing_service import ProcessingOutcome, StageProcessingService
 from backend.workers.base import StageMessage, Worker
 
 logger = logging.getLogger(__name__)
@@ -37,53 +59,117 @@ class WorkerRunner:
         bootstrap_servers: str,
         topic: str,
         group_id: str,
+        retry_base_delay_seconds: float = 2.0,
+        retry_max_delay_seconds: float = 30.0,
     ) -> None:
         self._worker = worker
         self._sessionmaker = sessionmaker
         self._topic = topic
         self._group_id = group_id
         self._bootstrap_servers = bootstrap_servers
+        self._retry_base_delay_seconds = retry_base_delay_seconds
+        self._retry_max_delay_seconds = retry_max_delay_seconds
         self._consumer: AIOKafkaConsumer | None = None
+        self._dlq_producer: AIOKafkaProducer | None = None
+
+    async def _ensure_started(self) -> None:
+        # Constructed here, not in __init__: aiokafka clients need a running
+        # event loop at construction time, and __init__ runs before
+        # asyncio.run() starts one.
+        if self._consumer is None:
+            self._consumer = AIOKafkaConsumer(
+                self._topic,
+                bootstrap_servers=self._bootstrap_servers,
+                group_id=self._group_id,
+                enable_auto_commit=False,
+                auto_offset_reset="earliest",
+            )
+            await self._consumer.start()
+            self._dlq_producer = AIOKafkaProducer(bootstrap_servers=self._bootstrap_servers)
+            await self._dlq_producer.start()
+            logger.info(
+                "worker %r consuming topic=%r group=%r",
+                self._worker.name,
+                self._topic,
+                self._group_id,
+            )
+
+    async def stop(self) -> None:
+        if self._consumer is not None:
+            await self._consumer.stop()
+            await self._dlq_producer.stop()
 
     async def run_forever(self) -> None:
-        # Constructed here, not in __init__: AIOKafkaConsumer needs a
-        # running event loop at construction time, and __init__ runs before
-        # asyncio.run() starts one.
-        self._consumer = AIOKafkaConsumer(
-            self._topic,
-            bootstrap_servers=self._bootstrap_servers,
-            group_id=self._group_id,
-            enable_auto_commit=False,
-            auto_offset_reset="earliest",
-        )
-        await self._consumer.start()
-        logger.info(
-            "worker %r consuming topic=%r group=%r",
-            self._worker.name,
-            self._topic,
-            self._group_id,
-        )
+        await self._ensure_started()
         try:
-            async for record in self._consumer:
-                await self._handle_record(record)
+            while True:
+                await self.consume_one()
         finally:
-            await self._consumer.stop()
+            await self.stop()
+
+    async def consume_one(self) -> None:
+        """Fetches and fully handles exactly one message. Exposed separately
+        from run_forever() so tests can drive the harness one delivery at a
+        time and inspect state between them."""
+        await self._ensure_started()
+        record = await self._consumer.getone()
+        await self._handle_record(record)
 
     async def _handle_record(self, record) -> None:
         message = self._parse(record.value)
 
         async with self._sessionmaker() as session:
-            try:
-                await StageProcessingService(session, self._worker).handle(message)
-            except Exception:
-                logger.exception(
-                    "job=%s stage=%s failed; leaving offset uncommitted for redelivery",
-                    message.job_id,
-                    message.stage,
-                )
-                return  # offset NOT committed -> Kafka redelivers this message
+            result = await StageProcessingService(session, self._worker).handle(message)
 
-        await self._consumer.commit()
+        if result.outcome in (ProcessingOutcome.SUCCEEDED, ProcessingOutcome.ALREADY_DONE):
+            await self._consumer.commit()
+            return
+
+        if result.outcome is ProcessingOutcome.RETRY:
+            delay = min(
+                self._retry_base_delay_seconds * (2 ** (result.attempt - 1)),
+                self._retry_max_delay_seconds,
+            )
+            logger.warning(
+                "job=%s stage=%s failed (attempt %s/%s); retrying in %.1fs: %s",
+                message.job_id,
+                message.stage,
+                result.attempt,
+                result.max_attempts,
+                delay,
+                result.error,
+            )
+            await asyncio.sleep(delay)
+            # Rewind the consumer's local fetch position so the next
+            # getone() re-fetches this same record instead of moving on to
+            # whatever comes next on the partition.
+            self._consumer.seek(TopicPartition(record.topic, record.partition), record.offset)
+            return  # offset NOT committed -> redelivered on this seek or a future restart
+
+        # EXHAUSTED
+        logger.error(
+            "job=%s stage=%s exhausted retries; sending to DLQ: %s",
+            message.job_id,
+            message.stage,
+            result.error,
+        )
+        await self._send_to_dlq(message, result.error)
+        await self._consumer.commit()  # unblock the partition
+
+    async def _send_to_dlq(self, message: StageMessage, error: str | None) -> None:
+        dlq_topic = f"{self._topic}.dlq"
+        payload = {
+            "job_id": str(message.job_id),
+            "stage": message.stage,
+            "workflow": message.workflow,
+            "payload": message.payload,
+            "error": error,
+        }
+        await self._dlq_producer.send_and_wait(
+            dlq_topic,
+            key=str(message.job_id).encode("utf-8"),
+            value=json.dumps(payload).encode("utf-8"),
+        )
 
     @staticmethod
     def _parse(raw: bytes) -> StageMessage:

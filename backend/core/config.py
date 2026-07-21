@@ -38,6 +38,9 @@ class Settings(BaseSettings):
     outbox_batch_size: int = 50
     outbox_max_publish_attempts: int = 10
 
+    worker_retry_base_delay_seconds: float = 2.0
+    worker_retry_max_delay_seconds: float = 30.0
+
     log_level: Literal["DEBUG", "INFO", "WARNING", "ERROR"] = "INFO"
 
 
