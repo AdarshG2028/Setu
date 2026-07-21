@@ -24,12 +24,25 @@ import json
 import logging
 
 from aiokafka import AIOKafkaProducer
+from opentelemetry import propagate, trace
+from opentelemetry.trace import Status, StatusCode
 from sqlalchemy.ext.asyncio import async_sessionmaker
 
 from backend.observability.metrics import OUTBOX_PUBLISH_TOTAL
 from backend.repositories.outbox_repository import OutboxRepository
 
 logger = logging.getLogger(__name__)
+tracer = trace.get_tracer(__name__)
+
+
+def _inject_trace_headers() -> list[tuple[str, bytes]]:
+    """Injects the current span's context into Kafka-wire-format headers
+    (a list of (str, bytes) tuples) so the consumer -- a different OS
+    process, see backend/workers/runner.py -- can extract it back out and
+    continue the same trace."""
+    carrier: dict[str, str] = {}
+    propagate.inject(carrier)
+    return [(key, value.encode("utf-8")) for key, value in carrier.items()]
 
 
 class OutboxPublisher:
@@ -73,45 +86,63 @@ class OutboxPublisher:
 
             published = 0
             for event in events:
-                try:
-                    await asyncio.wait_for(
-                        self._producer.send_and_wait(
-                            event.topic,
-                            key=event.partition_key.encode("utf-8"),
-                            value=json.dumps(event.payload).encode("utf-8"),
-                        ),
-                        timeout=self._publish_timeout_seconds,
-                    )
-                except Exception as exc:  # broker down, topic misconfigured, timed out, etc.
-                    logger.warning(
-                        "outbox publish failed: %s",
-                        exc,
+                # Parented on the submitting request's span, captured in
+                # OutboxEvent.trace_context at creation time (see
+                # job_submission_service.py) -- this poll loop runs in an
+                # unrelated later async task with no other way to know
+                # which trace this row belongs to.
+                parent_ctx = propagate.extract(event.trace_context or {})
+                with tracer.start_as_current_span("outbox.publish", context=parent_ctx) as span:
+                    span.set_attribute("job_id", str(event.aggregate_id))
+                    span.set_attribute("outbox_event_id", str(event.id))
+                    span.set_attribute("topic", event.topic)
+
+                    try:
+                        await asyncio.wait_for(
+                            self._producer.send_and_wait(
+                                event.topic,
+                                key=event.partition_key.encode("utf-8"),
+                                value=json.dumps(event.payload).encode("utf-8"),
+                                # Injected here, not left for the consumer to
+                                # assume: this is the one point that has both
+                                # the live span context and the outgoing
+                                # Kafka message in hand at the same time.
+                                headers=_inject_trace_headers(),
+                            ),
+                            timeout=self._publish_timeout_seconds,
+                        )
+                    except Exception as exc:  # broker down, topic misconfigured, timed out, etc.
+                        span.record_exception(exc)
+                        span.set_status(Status(StatusCode.ERROR, str(exc)))
+                        logger.warning(
+                            "outbox publish failed: %s",
+                            exc,
+                            extra={
+                                "job_id": str(event.aggregate_id),
+                                "outbox_event_id": str(event.id),
+                                "topic": event.topic,
+                            },
+                        )
+                        await repo.mark_failed(
+                            event.id, str(exc), max_attempts=self._max_publish_attempts
+                        )
+                        await session.commit()
+                        OUTBOX_PUBLISH_TOTAL.labels(outcome="failed").inc()
+                        continue
+
+                    # Ack has landed — only now is it safe to mark published.
+                    await repo.mark_published(event.id)
+                    await session.commit()
+                    published += 1
+                    OUTBOX_PUBLISH_TOTAL.labels(outcome="published").inc()
+                    logger.info(
+                        "outbox event published",
                         extra={
                             "job_id": str(event.aggregate_id),
                             "outbox_event_id": str(event.id),
                             "topic": event.topic,
                         },
                     )
-                    await repo.mark_failed(
-                        event.id, str(exc), max_attempts=self._max_publish_attempts
-                    )
-                    await session.commit()
-                    OUTBOX_PUBLISH_TOTAL.labels(outcome="failed").inc()
-                    continue
-
-                # Ack has landed — only now is it safe to mark published.
-                await repo.mark_published(event.id)
-                await session.commit()
-                published += 1
-                OUTBOX_PUBLISH_TOTAL.labels(outcome="published").inc()
-                logger.info(
-                    "outbox event published",
-                    extra={
-                        "job_id": str(event.aggregate_id),
-                        "outbox_event_id": str(event.id),
-                        "topic": event.topic,
-                    },
-                )
 
             return published
 

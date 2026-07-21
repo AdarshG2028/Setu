@@ -20,6 +20,7 @@ from prometheus_client import start_http_server
 from backend.core.config import get_settings
 from backend.database.session import get_sessionmaker
 from backend.observability.logging import configure_logging
+from backend.observability.tracing import configure_tracing
 from backend.workers.dummy_worker import DummyWorker
 from backend.workers.runner import WorkerRunner
 
@@ -43,6 +44,7 @@ def main() -> None:
 
     settings = get_settings()
     configure_logging(settings)
+    configure_tracing(settings, service_name="setu-worker")
     start_http_server(args.metrics_port)
 
     worker = WORKERS[args.worker]()

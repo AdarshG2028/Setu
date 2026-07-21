@@ -46,6 +46,11 @@ class Settings(BaseSettings):
     # (setu_jobs_pending/processing/completed/failed) from Postgres.
     metrics_poll_interval_seconds: float = 5.0
 
+    # Jaeger's OTLP/grpc receiver. Like kafka_bootstrap_servers above, this
+    # is the host-side address -- the API and workers run on the host via
+    # uv, not in compose.
+    otel_exporter_otlp_endpoint: str = "localhost:4317"
+
     log_level: Literal["DEBUG", "INFO", "WARNING", "ERROR"] = "INFO"
 
 

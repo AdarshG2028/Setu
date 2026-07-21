@@ -32,7 +32,9 @@ class _FakeProducer:
     async def stop(self) -> None:
         pass
 
-    async def send_and_wait(self, topic: str, value: bytes, key: bytes) -> None:
+    async def send_and_wait(
+        self, topic: str, value: bytes, key: bytes, headers: list | None = None
+    ) -> None:
         if self.fail:
             raise RuntimeError("simulated broker failure")
         self.sent.append((topic, key, value))

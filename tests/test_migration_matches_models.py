@@ -1,8 +1,8 @@
-"""Guards against the initial migration drifting from the ORM models.
+"""Guards against the migration history drifting from the ORM models.
 
-The migration was hand-written (no Postgres was available to autogenerate
-against), so this compares the DDL Alembic emits in offline mode against the
-DDL SQLAlchemy generates from Base.metadata. Any missing column, constraint,
+Compares the DDL Alembic emits in offline mode (the full migration chain,
+baseline CREATE TABLEs plus any later ALTER TABLEs) against the DDL
+SQLAlchemy generates from Base.metadata. Any missing column, constraint,
 or index shows up as a diff.
 """
 
@@ -36,6 +36,15 @@ def _parse_create_tables(sql: str) -> dict[str, str]:
         if name == "alembic_version":  # Alembic's own bookkeeping table
             continue
         tables[name] = _normalize(match.group(2))
+
+    # A later migration can add a column via ALTER TABLE instead of
+    # touching the original CREATE TABLE -- fold those in too, or an
+    # incrementally-added column would silently never be checked here.
+    for match in re.finditer(r"ALTER TABLE (\w+) ADD COLUMN (.+?);", sql):
+        name, column_def = match.group(1), match.group(2)
+        if name in tables:
+            tables[name] = f"{tables[name]},{_normalize(column_def)}"
+
     return tables
 
 

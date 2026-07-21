@@ -84,6 +84,20 @@ services:
     ports:
       - "3000:3000"
 
+  # All-in-one image: OTLP receiver (spans arrive on 4317/grpc) + its own
+  # UI (16686), no separate collector/storage needed for local use. The
+  # API and workers reach it at localhost:4317, same host-not-in-compose
+  # situation as Prometheus's targets above, just in the other direction
+  # (host process -> compose service, via the published port, rather than
+  # compose -> host.docker.internal).
+  jaeger:
+    image: jaegertracing/all-in-one:1.62.0
+    environment:
+      COLLECTOR_OTLP_ENABLED: "true"
+    ports:
+      - "16686:16686"
+      - "4317:4317"
+
 volumes:
   postgres_data:
   redpanda_data:

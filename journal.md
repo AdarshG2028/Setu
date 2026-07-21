@@ -486,6 +486,72 @@ during Part 1 verification.
 pipeline health from Prometheus, including all four job-lifecycle gauges
 reflecting real Postgres state.
 
+### 2026-07-21 — Phase 3 (part 3): OpenTelemetry tracing with Jaeger
+
+`backend/observability/tracing.py`: `configure_tracing(settings, service_name)`
+sets the process-wide `TracerProvider` with an OTLP/grpc exporter pointed
+at Jaeger (`docker-compose` gets a `jaeger` all-in-one service — OTLP
+receiver on 4317, UI on 16686). Called from both entry points with a
+different `service_name` each (`setu-api`, `setu-worker`) so Jaeger's
+service dropdown tells them apart. Manual spans only, not
+auto-instrumentation packages, at the three agreed boundaries:
+`JobSubmissionService.submit`, `OutboxPublisher.poll_once` (per event),
+and `stage.process` (opened in `runner.py`, wrapping the call to
+`StageProcessingService.handle` — has to live there because Kafka
+headers, needed for context extraction, aren't visible inside
+`StageProcessingService` itself, which stays Kafka-agnostic on purpose).
+
+**The Kafka hop worked on the first try; the Postgres hop didn't, and
+the gap is worth remembering.** Cross-process propagation through Kafka
+(`opentelemetry.propagate.inject` into message headers at publish,
+`.extract` at consume) linked `outbox.publish` and `stage.process` into
+one trace immediately. But `job_submission.submit` kept showing up as a
+*separate* trace — because unlike the Kafka hop, nothing carries context
+across the gap between "API request creates an OutboxEvent row" and
+"an unrelated later poll cycle picks that row up and publishes it."
+There's no live call stack connecting those two moments — OTel context
+only flows through an active call stack or an explicit carrier, and nothing
+was serializing one across that particular gap. Found this by actually
+querying Jaeger's API after the first end-to-end submission, not by
+inspecting the code — the code looked complete, but two trace IDs came
+back instead of one.
+
+Fix: added `OutboxEvent.trace_context` (nullable JSON column, migration
+`1bb46fc946c7`) — `JobSubmissionService.submit` injects its span context
+into it at creation time; `OutboxPublisher.poll_once` extracts it back out
+and uses it as the parent when starting `outbox.publish`. Deliberately a
+separate column from `payload` (which is the literal Kafka message body)
+rather than stashing it there, so tracing plumbing never leaks onto the
+wire. Confirmed live: one job submission now produces exactly one trace
+in Jaeger with all three spans (`job_submission.submit` → `outbox.publish`
+→ `stage.process`) across both services, in order.
+
+**This surfaced a real gap in `tests/test_migration_matches_models.py`**,
+not caused by the bug above but by the fix for it: that test's SQL parser
+only ever read `CREATE TABLE` statements when diffing the full migration
+history against the models, because until this migration, the only
+migration this project had was the single hand-written baseline — nothing
+had ever tested an incremental `ALTER TABLE ADD COLUMN` migration against
+it before. Fixed the parser to fold `ALTER TABLE ... ADD COLUMN` into the
+right table's column set too, so it won't go blind again the next time a
+column gets added instead of a table.
+
+**Status: 30 tests passing.** Part 3 milestone met: submitting a job
+produces one connected trace in Jaeger spanning API → Outbox → Kafka →
+Worker, with `trace_id`/`span_id` also showing up in the Part 1 JSON logs
+for the same request (the hook that part left ready for this one).
+
+**All three parts of Phase 3 are now complete: structured logging,
+Prometheus metrics + Grafana dashboards, and OpenTelemetry tracing with
+Jaeger.** Everything in this entry is committed except the very last
+verification pass (git status confirms clean beyond that at time of
+writing). Session paused here at the user's request (stepping away for a
+few hours) — nothing left mid-air: DB confirmed clean of demo residue,
+all background verification processes stopped, full suite green.
+
 ### Next up
 
-Phase 3 (part 3): OpenTelemetry tracing with Jaeger.
+Phase 4: multi-worker JSON workflow orchestration (per the roadmap —
+Frame Extraction → Vision Detection → Rendering as independent workers,
+with a lightweight sequential workflow engine sitting between the API and
+the workers).

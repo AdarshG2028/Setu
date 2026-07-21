@@ -33,6 +33,15 @@ class OutboxEvent(Base, TimestampMixin):
 
     payload: Mapped[dict[str, Any]] = mapped_column(JSONType, nullable=False)
 
+    # The producer's OpenTelemetry span context at creation time, injected
+    # via opentelemetry.propagate.inject() -- captured here, not just kept
+    # in the outbox publisher's Kafka headers, because the actual publish
+    # happens later in an unrelated async task (the background poll loop);
+    # nothing about the call stack still connects it to the request that
+    # created this row. Kept separate from `payload`, which is the literal
+    # Kafka message body, so this never leaks onto the wire.
+    trace_context: Mapped[dict[str, Any] | None] = mapped_column(JSONType, nullable=True)
+
     status: Mapped[str] = mapped_column(
         sa.String(16), nullable=False, default=OutboxStatus.PENDING
     )

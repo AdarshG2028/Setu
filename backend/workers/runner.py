@@ -42,12 +42,24 @@ import logging
 import uuid
 
 from aiokafka import AIOKafkaConsumer, AIOKafkaProducer, TopicPartition
+from opentelemetry import propagate, trace
+from opentelemetry.context import Context
 from sqlalchemy.ext.asyncio import async_sessionmaker
 
 from backend.services.stage_processing_service import ProcessingOutcome, StageProcessingService
 from backend.workers.base import StageMessage, Worker
 
 logger = logging.getLogger(__name__)
+tracer = trace.get_tracer(__name__)
+
+
+def _extract_trace_context(headers: list[tuple[str, bytes]] | None) -> Context:
+    """The other half of outbox_publisher.py's _inject_trace_headers():
+    pulls the producer's span context back out of the Kafka message
+    headers so this worker's "stage.process" span becomes a child of the
+    same trace, not the start of a new, disconnected one."""
+    carrier = {key: value.decode("utf-8") for key, value in (headers or [])}
+    return propagate.extract(carrier)
 
 
 class WorkerRunner:
@@ -117,9 +129,21 @@ class WorkerRunner:
 
     async def _handle_record(self, record) -> None:
         message = self._parse(record.value)
+        ctx = _extract_trace_context(record.headers)
 
-        async with self._sessionmaker() as session:
-            result = await StageProcessingService(session, self._worker).handle(message)
+        # The span's lifetime is deliberately scoped to just the processing
+        # call, not the retry sleep/seek or DLQ dispatch below -- those are
+        # harness reactions to the outcome, not part of "processing" the
+        # stage.
+        with tracer.start_as_current_span("stage.process", context=ctx) as span:
+            span.set_attribute("job_id", str(message.job_id))
+            span.set_attribute("stage", message.stage)
+
+            async with self._sessionmaker() as session:
+                result = await StageProcessingService(session, self._worker).handle(message)
+
+            span.set_attribute("outcome", str(result.outcome))
+            span.set_attribute("attempt", result.attempt)
 
         if result.outcome in (ProcessingOutcome.SUCCEEDED, ProcessingOutcome.ALREADY_DONE):
             await self._consumer.commit()
