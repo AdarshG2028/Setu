@@ -336,7 +336,84 @@ skips its cleanup same as any other crash.
 
 **Status: 30 tests passing.** Database confirmed clean after a full run.
 
+### 2026-07-21 — Manual testing session (Phase 2) + a real bug found live
+
+Ran the full Phase 2 guarantee set by hand against the real running stack
+(API + worker + Postgres + Redpanda), not just pytest: exponential
+backoff, DLQ, partition unblocking, idempotent processing (forced via
+`rpk group seek` rewinding the consumer group offset to redeliver an
+already-completed message — worker correctly logged the no-op and wrote
+no duplicate rows), and worker crash recovery (hard-killed the worker
+mid-`_hang_seconds`, confirmed zero rows written and `Job.status` still
+`pending`, restarted, confirmed exactly-once recovery).
+
+Found a second production bug this way, distinct from the poison-outbox-
+event issue Phase 2 already fixed: `OutboxPublisher.poll_once()` called
+`producer.send_and_wait()` with no timeout. A topic name aiokafka rejects
+*client-side* (illegal characters, e.g. from a malformed Swagger request)
+makes `send_and_wait()` retry an internal "not a valid topic name"
+metadata refresh forever without ever raising — unlike a *broker-side*
+rejection (`UnknownTopicOrPartitionError`), which returns promptly as a
+real exception and was already handled. Since `poll_once()` processes a
+batch in one sequential loop, one bad topic name wedged the publisher
+forever, silently blocking every job submitted after it, not just the bad
+one. Fixed (committed separately as `cc021c6`, outside this session) by
+wrapping the send in `asyncio.wait_for(..., timeout=outbox_publish_timeout_seconds)`
+so a hang becomes an ordinary caught failure, handled by the same
+`mark_failed`/max-attempts path as any other publish error.
+
+### 2026-07-21 — Phase 3 (part 1): structured JSON logging
+
+Every log line across all three processes (API, outbox publisher inside
+it, worker) is now one JSON object — `backend/observability/logging.py`,
+a stdlib `logging.Formatter` subclass, no new heavyweight dependency (just
+`opentelemetry-api`, the lightweight API-only package, for the trace/span
+lookup below). `configure_logging(settings)` replaces the root logger's
+handlers; called once from each process entry point
+(`backend/api/main.py`'s `create_app()`, `backend/workers/cli.py`'s
+`main()`), replacing the old bare `logging.basicConfig()` in the worker
+and the API's previous total lack of any logging config.
+
+Every log call site that already knew a job's identity now passes it via
+`extra={"job_id": ..., "stage": ...}` rather than string-interpolating it
+into the message — `job_submission_service.py`, `outbox_publisher.py`,
+`stage_processing_service.py`, `runner.py`. `job_submission_service.py`
+had no logging at all before this; added `logger.info` on job creation,
+idempotent replay, and idempotency conflict, and `stage_processing_service.py`'s
+`_record_success` had no log line at all (the reason a healthy job
+produced silent worker output during the manual testing session above) —
+added one there too, since "every line touching a job carries its id" was
+the whole point and a silent success path defeated it.
+
+The formatter also looks up the current OpenTelemetry span on every
+record (`trace.get_current_span().get_span_context()`) and includes
+`trace_id`/`span_id` when valid. This is a no-op today — no
+`TracerProvider` is configured yet, so `get_current_span()` returns an
+invalid context and those fields stay absent — but it means Part 3
+(tracing) requires zero changes back in this file; spans just start
+appearing in every log line the moment a real provider exists.
+
+Verified live against the real stack (not just unit tests): submitted a
+job, watched the API log `job created` → `outbox event published`, then
+the worker log `stage processed successfully` for the *same* `job_id` —
+plus, organically, a second delivery of the same message (the outbox's
+own at-least-once retry) correctly logged as `stage already has a result;
+redelivery, skipping`, no duplicate row. One `job_id` grep across both
+terminals reconstructs the job's whole cross-process story, which was
+the actual goal.
+
+One pre-existing flaky test surfaced while re-running the suite:
+`test_retry_backoff_increases_between_attempts` failed once inside the
+full 30-test run (a razor-thin timing margin — 0.3s base delay, the
+failure was an 8ms difference) but passed every time run alone or in
+isolation reruns. Not caused by the logging change (confirmed by rerunning
+the full suite clean afterward); a pre-existing timing-margin fragility
+in that specific test, not a regression.
+
+**Status: 30 tests passing.** Part 1 milestone met: every pipeline log
+line is JSON, correlated by `job_id`, with a `trace_id`/`span_id` hook
+ready for Part 3.
+
 ### Next up
 
-Phase 3 (observability): structured logging, OpenTelemetry tracing,
-Prometheus metrics, Grafana dashboards.
+Phase 3 (part 2): Prometheus metrics + Grafana dashboards.

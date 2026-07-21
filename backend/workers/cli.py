@@ -8,10 +8,10 @@ matches the spec's "independently deployable worker" requirement.
 
 import argparse
 import asyncio
-import logging
 
 from backend.core.config import get_settings
 from backend.database.session import get_sessionmaker
+from backend.observability.logging import configure_logging
 from backend.workers.dummy_worker import DummyWorker
 from backend.workers.runner import WorkerRunner
 
@@ -28,7 +28,7 @@ def main() -> None:
     args = parser.parse_args()
 
     settings = get_settings()
-    logging.basicConfig(level=settings.log_level)
+    configure_logging(settings)
 
     worker = WORKERS[args.worker]()
     runner = WorkerRunner(

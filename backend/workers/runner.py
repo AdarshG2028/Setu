@@ -131,13 +131,15 @@ class WorkerRunner:
                 self._retry_max_delay_seconds,
             )
             logger.warning(
-                "job=%s stage=%s failed (attempt %s/%s); retrying in %.1fs: %s",
-                message.job_id,
-                message.stage,
-                result.attempt,
-                result.max_attempts,
-                delay,
+                "stage failed; retrying with backoff: %s",
                 result.error,
+                extra={
+                    "job_id": str(message.job_id),
+                    "stage": message.stage,
+                    "attempt": result.attempt,
+                    "max_attempts": result.max_attempts,
+                    "retry_delay_seconds": delay,
+                },
             )
             await asyncio.sleep(delay)
             # Rewind the consumer's local fetch position so the next
@@ -148,10 +150,14 @@ class WorkerRunner:
 
         # EXHAUSTED
         logger.error(
-            "job=%s stage=%s exhausted retries; sending to DLQ: %s",
-            message.job_id,
-            message.stage,
+            "stage exhausted retries; sending to DLQ: %s",
             result.error,
+            extra={
+                "job_id": str(message.job_id),
+                "stage": message.stage,
+                "attempt": result.attempt,
+                "max_attempts": result.max_attempts,
+            },
         )
         await self._send_to_dlq(message, result.error)
         await self._consumer.commit()  # unblock the partition

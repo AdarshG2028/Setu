@@ -61,9 +61,8 @@ class StageProcessingService:
         existing = await self._results.get(message.job_id, message.stage)
         if existing is not None:
             logger.info(
-                "job=%s stage=%s already has a result; redelivery, skipping",
-                message.job_id,
-                message.stage,
+                "stage already has a result; redelivery, skipping",
+                extra={"job_id": str(message.job_id), "stage": message.stage},
             )
             return ProcessingResult(outcome=ProcessingOutcome.ALREADY_DONE)
 
@@ -73,7 +72,7 @@ class StageProcessingService:
             # DLQ for a human to look at rather than either silently
             # dropping it or retrying forever against a job that will never
             # exist.
-            logger.error("job %s not found", message.job_id)
+            logger.error("job not found", extra={"job_id": str(message.job_id)})
             return ProcessingResult(
                 outcome=ProcessingOutcome.EXHAUSTED, error=f"job {message.job_id} not found"
             )
@@ -165,4 +164,13 @@ class StageProcessingService:
             # this commit. Their write stands; ours is redundant, not wrong.
             await self._session.rollback()
 
+        logger.info(
+            "stage processed successfully",
+            extra={
+                "job_id": str(job.id),
+                "stage": message.stage,
+                "attempt": attempt,
+                "job_status": job.status,
+            },
+        )
         return ProcessingResult(outcome=ProcessingOutcome.SUCCEEDED, attempt=attempt)

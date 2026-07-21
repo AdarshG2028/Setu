@@ -82,7 +82,15 @@ class OutboxPublisher:
                         timeout=self._publish_timeout_seconds,
                     )
                 except Exception as exc:  # broker down, topic misconfigured, timed out, etc.
-                    logger.warning("outbox publish failed for %s: %s", event.id, exc)
+                    logger.warning(
+                        "outbox publish failed: %s",
+                        exc,
+                        extra={
+                            "job_id": str(event.aggregate_id),
+                            "outbox_event_id": str(event.id),
+                            "topic": event.topic,
+                        },
+                    )
                     await repo.mark_failed(
                         event.id, str(exc), max_attempts=self._max_publish_attempts
                     )
@@ -93,6 +101,14 @@ class OutboxPublisher:
                 await repo.mark_published(event.id)
                 await session.commit()
                 published += 1
+                logger.info(
+                    "outbox event published",
+                    extra={
+                        "job_id": str(event.aggregate_id),
+                        "outbox_event_id": str(event.id),
+                        "topic": event.topic,
+                    },
+                )
 
             return published
 

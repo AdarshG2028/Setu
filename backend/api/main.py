@@ -12,6 +12,7 @@ from backend.core.config import Settings, get_settings
 from backend.database.session import get_sessionmaker
 from backend.messaging.kafka_producer import build_producer
 from backend.messaging.outbox_publisher import OutboxPublisher
+from backend.observability.logging import configure_logging
 
 logger = logging.getLogger(__name__)
 
@@ -46,6 +47,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 
 def create_app(settings: Settings | None = None) -> FastAPI:
     settings = settings or get_settings()
+    configure_logging(settings)
 
     app = FastAPI(
         title=settings.app_name,

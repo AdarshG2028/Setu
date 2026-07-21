@@ -7,6 +7,7 @@ and a client retrying the same Idempotency-Key never creates a second job.
 
 import hashlib
 import json
+import logging
 from dataclasses import dataclass
 from typing import Any
 
@@ -17,6 +18,8 @@ from backend.models import IdempotencyKey, Job, OutboxEvent
 from backend.repositories.idempotency_repository import IdempotencyRepository
 from backend.repositories.job_repository import JobRepository
 from backend.repositories.outbox_repository import OutboxRepository
+
+logger = logging.getLogger(__name__)
 
 
 class IdempotencyConflictError(Exception):
@@ -92,16 +95,28 @@ class JobSubmissionService:
                 raise  # not a key collision; some other integrity failure
             return await self._handle_existing_key(existing, request_hash)
 
+        logger.info(
+            "job created",
+            extra={"job_id": str(job.id), "workflow": workflow, "idempotency_key": idempotency_key},
+        )
         return JobSubmissionResult(job=job, replayed=False)
 
     async def _handle_existing_key(
         self, existing: IdempotencyKey, request_hash: str
     ) -> JobSubmissionResult:
         if existing.request_hash != request_hash:
+            logger.warning(
+                "idempotency key reused with a different request body",
+                extra={"job_id": str(existing.job_id), "idempotency_key": existing.key},
+            )
             raise IdempotencyConflictError(
                 f"Idempotency-Key {existing.key!r} was already used with a "
                 "different request body"
             )
         job = await self._jobs.get(existing.job_id)
         assert job is not None, "idempotency key points at a missing job"
+        logger.info(
+            "job submission replayed via idempotency key",
+            extra={"job_id": str(job.id), "idempotency_key": existing.key},
+        )
         return JobSubmissionResult(job=job, replayed=True)
