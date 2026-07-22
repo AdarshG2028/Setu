@@ -33,5 +33,13 @@ class Worker(ABC):
     name: str
 
     @abstractmethod
-    async def process(self, message: StageMessage) -> dict[str, Any]:
-        """Do the stage's work and return the result payload to persist."""
+    async def process(
+        self, message: StageMessage, previous_output: dict[str, Any] | None
+    ) -> dict[str, Any]:
+        """Do the stage's work and return the result payload to persist.
+
+        previous_output is the prior stage's Result payload (None for the
+        first stage), fetched and injected by StageProcessingService — a
+        worker never queries the database itself, keeping it a stateless
+        function of its inputs.
+        """

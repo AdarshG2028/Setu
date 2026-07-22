@@ -33,9 +33,11 @@ from backend.observability.metrics import (
     STAGE_PROCESSING_DURATION_SECONDS,
 )
 from backend.repositories.job_repository import JobRepository
+from backend.repositories.outbox_repository import OutboxRepository
 from backend.repositories.result_repository import ResultRepository
 from backend.repositories.worker_execution_repository import WorkerExecutionRepository
 from backend.workers.base import StageMessage, Worker
+from backend.workflow.engine import WorkflowEngine
 
 logger = logging.getLogger(__name__)
 
@@ -62,6 +64,7 @@ class StageProcessingService:
         self._jobs = JobRepository(session)
         self._results = ResultRepository(session)
         self._executions = WorkerExecutionRepository(session)
+        self._engine = WorkflowEngine(OutboxRepository(session))
 
     async def handle(self, message: StageMessage) -> ProcessingResult:
         existing = await self._results.get(message.job_id, message.stage)
@@ -91,9 +94,14 @@ class StageProcessingService:
 
         attempt = job.attempts + 1
 
+        previous_output = None
+        if message.stage > 0:
+            previous_result = await self._results.get(message.job_id, message.stage - 1)
+            previous_output = previous_result.payload if previous_result else None
+
         start = time.perf_counter()
         try:
-            result_payload = await self._worker.process(message)
+            result_payload = await self._worker.process(message, previous_output)
         except Exception as exc:
             STAGE_PROCESSING_DURATION_SECONDS.observe(time.perf_counter() - start)
             return await self._record_failure(job, message, attempt, exc)
@@ -160,14 +168,13 @@ class StageProcessingService:
             )
         )
         job.attempts = attempt
-        job.current_stage = message.stage + 1
-        is_last_stage = message.stage == len(message.workflow) - 1
-        if is_last_stage:
-            # Phase 2 scope: no engine yet to dispatch further stages, so a
-            # job is only "done" when its last stage succeeds. Earlier
-            # stages leave it RUNNING — correct today for single-stage demo
-            # workflows, and forward-compatible with Phase 4's engine
-            # picking up current_stage for the rest.
+        # WorkflowEngine owns workflow position (current_stage, whether
+        # another stage exists, dispatching it) — not job lifecycle. It
+        # already added the next stage's OutboxEvent to this same session
+        # if progress.is_last_stage is False; committing below covers
+        # that dispatch atomically along with this stage's Result.
+        progress = self._engine.advance(job, message)
+        if progress.is_last_stage:
             job.status = JobStatus.COMPLETED
             job.completed_at = dt.datetime.now(dt.UTC)
 

@@ -19,17 +19,20 @@ class JobResponse(BaseModel):
     status: str
     workflow: list[str]
     current_stage: int
+    total_stages: int
     attempts: int
     max_attempts: int
     created_at: dt.datetime
 
     @classmethod
     def from_model(cls, job: Job) -> "JobResponse":
+        workflow = job.workflow["workflow"]
         return cls(
             id=job.id,
             status=job.status,
-            workflow=job.workflow["workflow"],
+            workflow=workflow,
             current_stage=job.current_stage,
+            total_stages=len(workflow),
             attempts=job.attempts,
             max_attempts=job.max_attempts,
             created_at=job.created_at,

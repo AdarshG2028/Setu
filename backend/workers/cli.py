@@ -23,8 +23,26 @@ from backend.observability.logging import configure_logging
 from backend.observability.tracing import configure_tracing
 from backend.workers.dummy_worker import DummyWorker
 from backend.workers.runner import WorkerRunner
+from backend.workers.stage_workers import (
+    FrameExtractionWorker,
+    GroundingDinoWorker,
+    ProPainterWorker,
+    RenderingWorker,
+    Sam2Worker,
+    TrackingWorker,
+    VisionDetectionWorker,
+)
 
-WORKERS = {"dummy": DummyWorker}
+WORKERS = {
+    "dummy": DummyWorker,
+    "frame_extraction": FrameExtractionWorker,
+    "vision_detection": VisionDetectionWorker,
+    "grounding_dino": GroundingDinoWorker,
+    "sam2": Sam2Worker,
+    "tracking": TrackingWorker,
+    "propainter": ProPainterWorker,
+    "rendering": RenderingWorker,
+}
 
 
 def main() -> None:

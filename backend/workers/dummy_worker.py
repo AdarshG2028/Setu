@@ -18,7 +18,9 @@ from backend.workers.base import StageMessage, Worker
 class DummyWorker(Worker):
     name = "dummy"
 
-    async def process(self, message: StageMessage) -> dict[str, Any]:
+    async def process(
+        self, message: StageMessage, previous_output: dict[str, Any] | None
+    ) -> dict[str, Any]:
         hang_seconds = float(message.payload.get("_hang_seconds", 0))
         if hang_seconds:
             await asyncio.sleep(hang_seconds)

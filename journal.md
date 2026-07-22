@@ -549,9 +549,178 @@ writing). Session paused here at the user's request (stepping away for a
 few hours) — nothing left mid-air: DB confirmed clean of demo residue,
 all background verification processes stopped, full suite green.
 
-### Next up
+### 2026-07-21 — Phase 4 (part 1): workflow engine, sequential dispatch through the outbox
 
-Phase 4: multi-worker JSON workflow orchestration (per the roadmap —
-Frame Extraction → Vision Detection → Rendering as independent workers,
-with a lightweight sequential workflow engine sitting between the API and
-the workers).
+Reviewed the plan with the user before writing any code (context,
+alternatives considered, and an explicit walk-through of how the engine
+interacts with the outbox, how idempotency prevents double-dispatch, and
+how a new worker gets added without touching orchestration — all now
+written into the plan doc). Core decision: dispatch the next stage as a
+new `OutboxEvent`, written in the *same* Postgres transaction that
+commits the current stage's `Result` — not a separate polling engine,
+not a direct Kafka produce. Reuses every guarantee Phases 1-3 already
+built instead of inventing a second delivery mechanism.
+
+New `backend/workflow/engine.py`: `WorkflowEngine.advance(job, message)`
+owns *workflow position* only — reads `workflow`/`current_stage`, decides
+whether another stage exists, bumps `current_stage`, dispatches the next
+`OutboxEvent` if there is one — and never touches `job.status`; that
+stays `stage_processing_service.py`'s call, since it's a job-lifecycle
+decision, not a workflow-position one. Returns a `WorkflowProgress`
+(`stage`, `total_stages`, `is_last_stage`) that `backend/api/schemas/job.py`'s
+`JobResponse` now also exposes as `total_stages`, so `current_stage`/`total_stages`
+is enough for a client to render "Stage 2/3" — no new endpoint needed.
+`engine.py` imports nothing from `backend/workers/`: adding a worker is a
+new `Worker` subclass plus one line in `cli.py`'s registry, and the
+engine never changes.
+
+**Double-dispatch protection was already there, for free.** The
+existing-`Result` short-circuit at the top of `handle()` makes the
+dispatch code physically unreachable on redelivery; the
+`UNIQUE(job_id, stage)` + rollback-on-`IntegrityError` path (already
+there to protect against a duplicate `Result`) now protects a duplicate
+dispatch too, purely because it's in the same transaction. Verified both
+directly in `tests/test_workflow_engine.py`, not just inferred from
+reading the code: exactly one `OutboxEvent` for stage B after stage A
+succeeds, replaying stage A's message returns `ALREADY_DONE` and does
+*not* create a second one, the job stays `RUNNING` after stage A and only
+reaches `COMPLETED` after stage B, one `Result` row per stage.
+
+**The new test failed on the first few runs, and not for a code reason.**
+`published = await publisher.poll_once(); assert published == 1` kept
+getting `0` — but a debug print right before it showed the row's status
+was already `'published'`. Something else was racing to publish it.
+Traced it to a leftover API process still running on `localhost:8000`
+from the Phase 3 manual-testing session, hours earlier — its own
+`OutboxPublisher` background task had been polling the same shared dev
+Postgres the entire time and kept winning the race to claim the test's
+freshly-dispatched row before the test's own `poll_once()` call did.
+Confirmed by checking that process's response shape (no `total_stages`
+field — it predates this session's schema/API changes). This is the
+outbox pattern's own normal at-least-once behavior working exactly as
+designed, just showing up somewhere a test hadn't accounted for it:
+fixed by polling for the row to reach `published`, from *any* publisher,
+instead of asserting this call's own `poll_once()` did it. Same category
+of finding as Phase 3 part 2's dual-publisher race — a reminder that this
+dev database is shared with whatever's still running locally, not
+exclusive to whichever test or script happens to be talking to it.
+
+**Trace continuity gap found during manual verification, fixed before
+moving to Part 2 (at the user's request).** The two-stage manual test
+showed each stage's "stage processed successfully" log line with a
+*different* `trace_id` — Phase 3's trace-context propagation was wired
+into `job_submission_service.py`'s `OutboxEvent` creation only, not
+`WorkflowEngine`'s. Fixed with the same mechanism: `_dispatch_next_stage`
+now injects the current span context (the `stage.process` span it's
+running inside, per `runner.py`) into the dispatched `OutboxEvent.trace_context`,
+exactly like the original submission does. `outbox_publisher.py` already
+extracted `trace_context` generically for any event, not just
+job-submission ones, so no change was needed there. Verified live: one
+trace now shows all five spans in order for a 2-stage job —
+`job_submission.submit` → `outbox.publish` → `stage.process` →
+`outbox.publish` → `stage.process` — across both services.
+
+**Status: 31 tests passing** (30 + the new workflow-engine test). Part 1
+milestone met: a 2-stage `DummyWorker` workflow reaches `COMPLETED` with
+two `Result` rows from a single submission, no manual republishing, and
+now one connected trace end to end.
+
+### 2026-07-21 — Phase 4 (part 2): named worker plugins — the roadmap milestone
+
+New `backend/workers/stage_workers.py`: `FrameExtractionWorker`,
+`VisionDetectionWorker`, `RenderingWorker` — trivial stand-ins (no real
+AI, that's Phase 5 stretch), same shape as `DummyWorker`, registered in
+`cli.py`'s `WORKERS` dict alongside it. This is the entire diff needed to
+go from "the engine can sequence two `DummyWorker` stages" (part 1) to
+"the engine orchestrates the actual named pipeline" — nothing in
+`engine.py`, `WorkerRunner`, or the API changed, which was the point.
+
+`tests/test_workflow_engine.py` gained a second test,
+`test_three_stage_workflow_with_named_workers`, parallel to part 1's but
+with the three real classes and a 3-stage workflow; factored the
+poll-until-published wait (see below) out into a shared
+`_wait_for_outbox_published` helper both tests use.
+
+**Manual verification hit the same "shared dev environment" class of
+issue as part 1, from a different angle.** Ran three worker processes
+against topics literally named `frame_extraction`/`vision_detection`/`rendering`
+(matching the roadmap's exact naming) — the `frame_extraction` worker
+crashed immediately with `KeyError: 'stage'`. Cause: a topic literally
+named `frame_extraction` already existed with old messages on it from
+early in this session (`{"job_id": ..., "payload": ..., "workflow": [...]}`,
+missing `stage` — an older message shape), and a brand-new consumer
+group defaults to `auto_offset_reset="earliest"`, so the fresh worker
+replayed that old garbage from offset 0 instead of starting clean. Not a
+Phase 4 bug — confirmed by re-running against fresh, uniquely-suffixed
+topic names, which worked immediately. Worth flagging as a real, if
+minor, robustness gap for later: `WorkerRunner._parse()` lets one
+malformed message crash the entire worker process rather than routing it
+to the DLQ or otherwise isolating it — out of scope for what this
+session was asked to do, not fixed here.
+
+Verified live end to end: `workflow: ["frame_extraction", "vision_detection", "rendering"]`
+(clean topic names this time) reached `completed`, `current_stage: 3`,
+`total_stages: 3`; three `Result` rows with `worker_name` values
+`frame_extraction`/`vision_detection`/`rendering` respectively, each
+carrying that worker's own placeholder payload shape; one Jaeger trace
+covering the whole run.
+
+**Status: 32 tests passing** (31 + the new three-stage test). Phase 4's
+roadmap milestone is met: the execution engine orchestrates a complete
+multi-stage workflow using multiple independent workers, and adding a
+worker required zero changes to the orchestration layer — a new `Worker`
+subclass and one registry line, nothing else.
+
+---
+
+## Phase 5 — Stretch: full 6-stage example workflow
+
+### 2026-07-22 — Phase 5: Grounding DINO → SAM2 → Tracking → ProPainter, chained through real outputs
+
+Extended the Phase 4 milestone's 3-stage demo to the roadmap's full stretch
+chain: `frame_extraction → grounding_dino → sam2 → tracking → propainter →
+rendering`. Deliberately no real model weights, no cloud inference, no new
+storage layer (all agreed with the user up front) — the point of this
+phase is proving each stage consumes its predecessor's actual output, not
+simulating computer vision. `WorkflowEngine` and `WorkerRunner` are
+untouched; adding these four workers was exactly "new class + one registry
+line" in `cli.py`, the Phase 4 invariant holding through a second,
+longer chain.
+
+**The one real design change:** `Worker.process()` gained a second
+parameter, `previous_output: dict | None` — the prior stage's `Result`
+payload, fetched by `StageProcessingService.handle()` (`self._results.get(job_id,
+stage - 1)`) and injected before calling the worker. Workers never query
+the database themselves; this keeps them stateless functions of their
+inputs, and keeps `WorkflowEngine` ignorant of artifact schemas entirely
+— the fetch lives one layer below it, in the service that already owned
+the Result-write transaction.
+
+Each new worker in `backend/workers/stage_workers.py` derives its fake
+output from the previous stage's real output: `grounding_dino` invents one
+box per frame from `frame_extraction`'s frame list; `sam2` invents one
+mask per detected box; `tracking` groups masks into tracks by label;
+`propainter` "removes" tracking's actual track_ids and reports an
+`output_reference`; `rendering` cites that exact `output_reference` in its
+own output. `FrameExtractionWorker`/`RenderingWorker` (Phase 4) were
+updated to the new schema; `VisionDetectionWorker` was left as-is since
+Phase 4's original 3-stage milestone workflow still exists and still
+passes its own test.
+
+`tests/test_workflow_engine.py::test_six_stage_workflow_each_stage_consumes_previous_output`
+asserts the consumption chain directly, not just that the job reaches
+`COMPLETED`: `grounding_dino.frame_count == frame_extraction.frame_count`,
+one `sam2` mask-entry per detection frame, `propainter.removed_track_ids`
+equals `tracking`'s actual track_ids, and `rendering.based_on_output_reference`
+equals `propainter`'s own `output_reference` verbatim — the strongest
+assertion in the suite, since a bug that silently dropped the
+`previous_output` wiring would make every one of these fail while the job
+still completed successfully.
+
+**Status: 33 tests passing** (32 + this one). Time-boxed session (4 hours
+available) — skipped a live multi-terminal manual run in favor of trusting
+the automated test's stronger, more precise assertions over eyeballing
+logs; DB confirmed clean of the manual Phase 4 test jobs left over from
+the prior session.
+
+Phase 5 (stretch) complete per the roadmap. All phases 0-5 done.
