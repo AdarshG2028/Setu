@@ -92,7 +92,10 @@ class StageProcessingService:
             job.status = JobStatus.RUNNING
             job.started_at = dt.datetime.now(dt.UTC)
 
-        attempt = job.attempts + 1
+        # Per-stage, not per-job: an earlier stage's successful attempts
+        # must not eat into a later stage's retry budget (see
+        # WorkerExecutionRepository.count_for_stage's docstring).
+        attempt = await self._executions.count_for_stage(message.job_id, message.stage) + 1
 
         previous_output = None
         if message.stage > 0:

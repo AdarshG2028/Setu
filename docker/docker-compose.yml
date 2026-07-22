@@ -98,6 +98,22 @@ services:
       - "16686:16686"
       - "4317:4317"
 
+  # Browser-based Postgres table viewer, for watching Jobs/Results/
+  # OutboxEvents/WorkerExecutions rows live during demos instead of running
+  # queries by hand. ADMINER_DEFAULT_SERVER pre-fills the server field with
+  # the compose service name; still needs the setu/setu login typed in
+  # (unlike Grafana/Console, this one fronts real data, so no anonymous
+  # access here).
+  adminer:
+    image: adminer:4.8.1
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      ADMINER_DEFAULT_SERVER: postgres
+    ports:
+      - "8082:8080"
+
 volumes:
   postgres_data:
   redpanda_data:

@@ -33,6 +33,7 @@ uv run python -m backend.workers.cli <topic>
 | Postgres | `localhost:5432` (`setu` / `setu` / `setu`) |
 | Kafka API | `localhost:19092` from the host, `redpanda:9092` inside compose |
 | Redpanda Console | http://localhost:8081 |
+| Adminer (Postgres UI) | http://localhost:8082 (server `postgres`, user/pass/db `setu`) |
 | Prometheus | http://localhost:9090 |
 | Grafana | http://localhost:3000 ("Setu — Pipeline Overview" dashboard, anonymous admin access) |
 

@@ -27,7 +27,7 @@ from backend.messaging.kafka_producer import build_producer
 from backend.messaging.outbox_publisher import OutboxPublisher
 from backend.models import Job, OutboxEvent, Result
 from backend.services.stage_processing_service import ProcessingOutcome, StageProcessingService
-from backend.workers.base import StageMessage
+from backend.workers.base import StageMessage, Worker
 from backend.workers.dummy_worker import DummyWorker
 from backend.workers.runner import WorkerRunner
 from backend.workers.stage_workers import (
@@ -43,16 +43,34 @@ from backend.workers.stage_workers import (
 pytestmark = pytest.mark.usefixtures("database_url", "kafka_bootstrap_servers")
 
 
-async def _create_committed_job(engine, workflow: list[str]) -> uuid.UUID:
+async def _create_committed_job(
+    engine, workflow: list[str], *, max_attempts: int = 5
+) -> uuid.UUID:
     async with engine.connect() as conn:
         maker = async_sessionmaker(bind=conn, expire_on_commit=False)
         async with maker() as session:
-            job = Job(workflow={"workflow": workflow}, payload={})
+            job = Job(workflow={"workflow": workflow}, payload={}, max_attempts=max_attempts)
             session.add(job)
             await session.commit()
             job_id = job.id
         await conn.commit()
     return job_id
+
+
+class _FailOnStage(Worker):
+    """Fails deterministically on one specific stage index, regardless of
+    payload -- lets a test make an early stage succeed and a later stage
+    fail without both sharing the same job-level payload flag."""
+
+    name = "fail-on-stage"
+
+    def __init__(self, failing_stage: int) -> None:
+        self._failing_stage = failing_stage
+
+    async def process(self, message: StageMessage, previous_output: dict | None) -> dict:
+        if message.stage == self._failing_stage:
+            raise RuntimeError("simulated failure")
+        return {"stage": message.stage}
 
 
 async def _produce_stage_a(topic: str, job_id: uuid.UUID, workflow: list[str]) -> None:
@@ -363,6 +381,83 @@ async def test_six_stage_workflow_each_stage_consumes_previous_output(
     finally:
         for runner in runners:
             await runner.stop()
+        await publisher.stop()
+        await _cleanup(engine, job_id)
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_later_stage_retry_budget_is_not_reduced_by_earlier_stage_successes(
+    database_url: str,
+) -> None:
+    """Regression test: Job.attempts used to be a single cumulative counter
+    incremented on every successful stage too, so a workflow longer than
+    max_attempts stages would arrive at its last stage with the retry
+    budget already exhausted -- a first-ever failure on that stage would
+    dead-letter immediately, with zero retries. The fix scopes the retry
+    budget per-stage (WorkerExecutionRepository.count_for_stage), so stage
+    1's failures here must get the full max_attempts budget even though
+    stage 0 already succeeded once.
+    """
+    engine = create_async_engine(database_url, poolclass=NullPool)
+    stage_a_topic = f"retry-budget-a-{uuid.uuid4()}"
+    stage_b_topic = f"retry-budget-b-{uuid.uuid4()}"
+    workflow = [stage_a_topic, stage_b_topic]
+    max_attempts = 2
+
+    job_id = await _create_committed_job(engine, workflow, max_attempts=max_attempts)
+    await _produce_stage_a(stage_a_topic, job_id, workflow)
+
+    sessionmaker = async_sessionmaker(bind=engine, expire_on_commit=False)
+    worker = _FailOnStage(failing_stage=1)
+    runner_a = WorkerRunner(
+        worker,
+        sessionmaker,
+        bootstrap_servers=get_settings().kafka_bootstrap_servers,
+        topic=stage_a_topic,
+        group_id=f"setu-{stage_a_topic}-workers",
+    )
+    runner_b = WorkerRunner(
+        worker,
+        sessionmaker,
+        bootstrap_servers=get_settings().kafka_bootstrap_servers,
+        topic=stage_b_topic,
+        group_id=f"setu-{stage_b_topic}-workers",
+        retry_base_delay_seconds=0.05,
+        retry_max_delay_seconds=0.2,
+    )
+    publisher = OutboxPublisher(
+        sessionmaker,
+        build_producer(),
+        poll_interval_seconds=1,
+        batch_size=10,
+        max_publish_attempts=5,
+    )
+
+    try:
+        await runner_a.consume_one()  # stage 0 succeeds
+        status, _ = await _job_status_and_stage(engine, job_id)
+        assert status == "running"
+
+        await _wait_for_outbox_published(engine, publisher, job_id, stage_b_topic)
+
+        # First failure on stage 1: with the bug, job.attempts was already 1
+        # from stage 0's success, so this alone would trip
+        # attempt(2) >= max_attempts(2) and dead-letter immediately.
+        await runner_b.consume_one()
+        status, _ = await _job_status_and_stage(engine, job_id)
+        assert status == "running", (
+            "stage 1's first-ever failure must RETRY, not exhaust immediately "
+            "just because stage 0 already succeeded once"
+        )
+
+        # Second failure on stage 1 spends its (correctly-scoped) budget.
+        await runner_b.consume_one()
+        status, _ = await _job_status_and_stage(engine, job_id)
+        assert status == "dead_lettered"
+    finally:
+        await runner_a.stop()
+        await runner_b.stop()
         await publisher.stop()
         await _cleanup(engine, job_id)
         await engine.dispose()
