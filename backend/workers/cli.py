@@ -62,7 +62,8 @@ def main() -> None:
 
     settings = get_settings()
     configure_logging(settings)
-    configure_tracing(settings, service_name="setu-worker")
+    if settings.tracing_enabled:
+        configure_tracing(settings, service_name="setu-worker")
     start_http_server(args.metrics_port)
 
     worker = WORKERS[args.worker]()

@@ -50,6 +50,11 @@ class Settings(BaseSettings):
     # is the host-side address -- the API and workers run on the host via
     # uv, not in compose.
     otel_exporter_otlp_endpoint: str = "localhost:4317"
+    # Off in environments with no Jaeger/OTLP collector reachable (e.g. a
+    # cloud deploy) -- tracing wouldn't crash without one (the exporter
+    # batches in a background thread), but it would spam connection-refused
+    # errors into the logs forever.
+    tracing_enabled: bool = True
 
     log_level: Literal["DEBUG", "INFO", "WARNING", "ERROR"] = "INFO"
 

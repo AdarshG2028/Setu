@@ -59,7 +59,8 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 def create_app(settings: Settings | None = None) -> FastAPI:
     settings = settings or get_settings()
     configure_logging(settings)
-    configure_tracing(settings, service_name="setu-api")
+    if settings.tracing_enabled:
+        configure_tracing(settings, service_name="setu-api")
 
     app = FastAPI(
         title=settings.app_name,
