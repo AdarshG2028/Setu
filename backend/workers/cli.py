@@ -32,6 +32,7 @@ from backend.workers.stage_workers import (
     TrackingWorker,
     VisionDetectionWorker,
 )
+from backend.workers.video_analysis_worker import VideoAnalysisWorker
 
 WORKERS = {
     "dummy": DummyWorker,
@@ -42,6 +43,7 @@ WORKERS = {
     "tracking": TrackingWorker,
     "propainter": ProPainterWorker,
     "rendering": RenderingWorker,
+    "video_analysis": VideoAnalysisWorker,
 }
 
 

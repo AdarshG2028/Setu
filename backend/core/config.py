@@ -58,6 +58,11 @@ class Settings(BaseSettings):
 
     log_level: Literal["DEBUG", "INFO", "WARNING", "ERROR"] = "INFO"
 
+    # Local-disk Storage backend's root directory. Swapping to an
+    # S3-compatible backend later is a new Storage implementation behind
+    # the same interface, not a change to this setting's callers.
+    storage_local_path: str = "./data/storage"
+
 
 @lru_cache
 def get_settings() -> Settings:

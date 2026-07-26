@@ -18,10 +18,23 @@ from sqlalchemy.pool import NullPool
 
 from backend.core.config import get_settings
 from backend.models import Job
+from backend.workers.base import PermanentError, StageMessage, Worker
 from backend.workers.dummy_worker import DummyWorker
 from backend.workers.runner import WorkerRunner
 
 pytestmark = pytest.mark.usefixtures("database_url", "kafka_bootstrap_servers")
+
+
+class _AlwaysPermanentlyFailingWorker(Worker):
+    """Simulates a worker whose input can never succeed (e.g. an
+    unsupported uploaded file) -- every attempt raises PermanentError, so
+    a test can confirm the harness DLQs on attempt 1 instead of spending
+    the full retry budget's backoff on a foregone conclusion."""
+
+    name = "always-permanently-failing"
+
+    async def process(self, message: StageMessage, previous_output: dict | None) -> dict:
+        raise PermanentError("simulated permanent failure")
 
 
 async def _create_committed_job(
@@ -134,6 +147,43 @@ async def test_failing_job_retries_then_dead_letters(database_url: str) -> None:
         await _cleanup(engine, job_id)
         if job_id_2 is not None:
             await _cleanup(engine, job_id_2)
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_permanent_error_dead_letters_on_first_attempt(database_url: str) -> None:
+    """A worker raising PermanentError should skip retries entirely -- DLQ
+    on attempt 1 even though max_attempts leaves budget remaining -- since
+    the same input is guaranteed to fail identically on every redelivery."""
+    engine = create_async_engine(database_url, poolclass=NullPool)
+    topic = f"permanent-error-{uuid.uuid4()}"
+    max_attempts = 5
+    job_id = await _create_committed_job(engine, topic, max_attempts=max_attempts, fail=True)
+    await _produce(topic, job_id, fail=True)
+
+    sessionmaker = async_sessionmaker(bind=engine, expire_on_commit=False)
+    runner = WorkerRunner(
+        _AlwaysPermanentlyFailingWorker(),
+        sessionmaker,
+        bootstrap_servers=get_settings().kafka_bootstrap_servers,
+        topic=topic,
+        group_id=f"setu-{topic}-workers",
+        retry_base_delay_seconds=0.05,
+        retry_max_delay_seconds=0.2,
+    )
+
+    try:
+        await runner.consume_one()  # single delivery should be enough to DLQ
+
+        async with engine.connect() as conn:
+            status, attempts = (
+                await conn.execute(sa.select(Job.status, Job.attempts).where(Job.id == job_id))
+            ).one()
+        assert status == "dead_lettered"
+        assert attempts == 1  # never touched attempts 2-5 of its budget
+    finally:
+        await runner.stop()
+        await _cleanup(engine, job_id)
         await engine.dispose()
 
 

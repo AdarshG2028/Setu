@@ -36,7 +36,7 @@ from backend.repositories.job_repository import JobRepository
 from backend.repositories.outbox_repository import OutboxRepository
 from backend.repositories.result_repository import ResultRepository
 from backend.repositories.worker_execution_repository import WorkerExecutionRepository
-from backend.workers.base import StageMessage, Worker
+from backend.workers.base import PermanentError, StageMessage, Worker
 from backend.workflow.engine import WorkflowEngine
 
 logger = logging.getLogger(__name__)
@@ -130,7 +130,11 @@ class StageProcessingService:
             )
         )
 
-        exhausted = attempt >= job.max_attempts
+        # A PermanentError skips straight to EXHAUSTED regardless of budget
+        # remaining: the worker is telling us this exact input will fail
+        # identically next time too, so spending the retry backoff on it
+        # only delays the DLQ, it never avoids it.
+        exhausted = attempt >= job.max_attempts or isinstance(exc, PermanentError)
         if exhausted:
             job.status = JobStatus.DEAD_LETTERED
             # No dedicated "dead_lettered_at" column; completed_at implies

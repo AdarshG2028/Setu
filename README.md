@@ -8,6 +8,7 @@ plugins that workers run, not the point of the system.
 
 - Python 3.13 and [uv](https://docs.astral.sh/uv/)
 - Docker (for Postgres and the Kafka-compatible broker only)
+- [ffmpeg](https://ffmpeg.org/download.html) (`ffprobe` on PATH) — needed to run the `video_analysis` worker; not required for the API or other workers.
 
 Python runs on the host via uv; Docker is used for backing services.
 
@@ -25,6 +26,18 @@ uv run uvicorn backend.api.main:app --reload
 
 # In another terminal: at least one worker, so submitted jobs get processed.
 uv run python -m backend.workers.cli <topic>
+
+# To process uploaded videos specifically:
+uv run python -m backend.workers.cli video_analysis --worker video_analysis
+```
+
+Upload a video (creates a `videos` row and submits Job #1 — `workflow:
+["video_analysis"]` — through the same `JobSubmissionService` any other job
+uses):
+
+```bash
+curl -F "file=@clip.mp4" http://localhost:8000/videos
+curl http://localhost:8000/videos/<video_id>   # status + metadata once analyzed
 ```
 
 | Service | Address |

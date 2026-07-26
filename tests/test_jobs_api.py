@@ -13,27 +13,12 @@ from fastapi.testclient import TestClient
 from sqlalchemy.ext.asyncio import create_async_engine
 from sqlalchemy.pool import NullPool
 
-from backend.api.main import create_app
 from backend.models import IdempotencyKey, Job, OutboxEvent
 
 pytestmark = pytest.mark.usefixtures("database_url", "kafka_bootstrap_servers")
 
-
-@pytest.fixture(scope="module")
-def client():
-    """One TestClient (one portal event loop) for the whole module.
-
-    backend.database.session.get_engine() is process-wide singleton
-    (@lru_cache), matching production where the app runs once. A
-    function-scoped client would spin a fresh portal thread/event loop per
-    test while reusing that same cached engine's pool across them —
-    connections opened under one test's loop get reused and torn down under
-    a later test's different loop, which asyncpg/SQLAlchemy can't do
-    ("RuntimeError: Event loop is closed", surfacing only after the pool
-    accumulates a stale connection from an earlier test).
-    """
-    with TestClient(create_app()) as c:
-        yield c
+# `client` is a session-scoped fixture shared across every API test module —
+# see its definition in conftest.py for why it can't be module-scoped here.
 
 
 @pytest.fixture

@@ -12,5 +12,8 @@ wheels/
 # Local environment
 .env
 
+# Local-disk storage backend's output (uploaded videos, artifacts)
+data/
+
 # Agent scratch state and worktrees
 .claude/

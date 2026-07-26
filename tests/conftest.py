@@ -1,9 +1,12 @@
 import asyncio
+import shutil
 
 import pytest
 import sqlalchemy as sa
+from fastapi.testclient import TestClient
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
+from backend.api.main import create_app
 from backend.core.config import get_settings
 
 
@@ -93,3 +96,36 @@ def kafka_bootstrap_servers() -> str:
             allow_module_level=True,
         )
     return servers
+
+
+@pytest.fixture(scope="session")
+def client():
+    """One TestClient (one portal event loop) for the *entire test session*,
+    shared by every module that hits the real app (test_jobs_api.py,
+    test_videos_api.py, ...).
+
+    backend.database.session.get_engine() is a process-wide singleton
+    (@lru_cache), matching production where the app runs once. Two
+    module-scoped clients — one per test file — would each spin up their
+    own portal thread/event loop while both still draw connections from
+    that one shared engine's pool: a connection opened under the first
+    module's loop can get reused and torn down under the second module's
+    different loop, which asyncpg/SQLAlchemy can't do ("RuntimeError: Event
+    loop is closed", surfacing only once a second such module exists).
+    Session-scoping this fixture in conftest.py means there is only ever
+    one portal for the whole run, regardless of how many test files use it.
+    """
+    with TestClient(create_app()) as c:
+        yield c
+
+
+@pytest.fixture(scope="session")
+def ffprobe_available() -> None:
+    """VideoAnalysisWorker shells out to a real ffprobe binary — tests that
+    exercise that need it installed and on PATH, same skip-cleanly pattern
+    as the Postgres/Kafka fixtures above."""
+    if shutil.which("ffprobe") is None:
+        pytest.skip(
+            "ffprobe not on PATH — install ffmpeg to run this test",
+            allow_module_level=True,
+        )

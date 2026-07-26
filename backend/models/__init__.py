@@ -10,6 +10,7 @@ from backend.models.idempotency import IdempotencyKey
 from backend.models.job import Job
 from backend.models.outbox import OutboxEvent
 from backend.models.result import Result
+from backend.models.video import Video
 from backend.models.worker_execution import WorkerExecution
 
 __all__ = [
@@ -21,5 +22,6 @@ __all__ = [
     "OutboxEvent",
     "OutboxStatus",
     "Result",
+    "Video",
     "WorkerExecution",
 ]
