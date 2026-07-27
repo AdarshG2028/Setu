@@ -35,6 +35,16 @@ This supersedes the v1 architecture document. Same investigation of the codebase
 - **This confirms the intended product UI flow end to end**: create a project → upload video(s) into it → invite members (Phase 8) → members converse (Phase 2, then Phase 9a once proposals exist) → approved proposal executes the edit (Phase 3/4). Nothing here is a new phase — it's the mapping the phases below already implement.
 - **Multiple videos per project already works** — `videos.project_id` was never unique, unlike `conversations.project_id`. What's *not* built yet: a user-entered display name per video, distinct from the uploaded file's name. Small, additive, deliberately deferred (see Phase 1's Risks).
 
+## Changelog from v6
+
+- **AI architecture principles added** (2026-07-26, before Phase 3 started): a new subsection under §5 sets explicit constraints for Phase 4 onward — single stateless planner (no multi-agent frameworks), ordinary services rather than an agent abstraction, no memory beyond §7's `user_preferences`, no premature conversation-summarization, general complexity discipline (stop and explain before adding orchestration/memory a phase seems to need). Documentation only — no code changed. (§5)
+- **Stale `"plan"` terminology fixed throughout** — §5, §6, §13, Phase 2, Phase 3 (including its heading), Phase 4, and Phase 5a all still said `{"type": "plan", ...}` / "plan validator" / "a plan" even though the actual Phase 2 implementation (`StaticPlanner`) already ships `{"type": "proposal", ...}`, precisely to avoid a rename at Phase 9a. This was drift between the doc and shipped code dating back to Phase 2, not a new decision — now corrected to match what's actually running. Phase 9a's text describing the discriminator "evolving" from `plan` to `proposal` is also corrected: that shape was already `proposal` from Phase 2, so Phase 9a only adds two new fields (`reasoning`, `discussion_summary`) to the existing shape, not a rename.
+
+## Changelog from v7
+
+- **Phase 3's design revised before any code was written** (2026-07-27), for long-term extensibility across the AI planner, multiple editing stages, collaboration, and multiple assets — while keeping Phase 3 itself simple, per the AI architecture principles (§5). "Translator" renamed **"compiler"** throughout (§6, Phase 3, Phase 4, Phase 9a) — its future responsibilities (asset resolution, param normalization, default injection, shorthand expansion) are closer to compilation than plain translation; stays a pure function regardless of name. The module-level `CAPABILITY_REGISTRY` constant becomes a small `CapabilityRegistry` class (`get`/`exists`/`list`/`register`) so the validator depends on an interface, not a global — still backed by a hardcoded dict for V1. Raw dicts inside the validation/compilation pipeline become `Proposal`/`ProposalStage` frozen dataclasses (matching `StageMessage`'s existing convention), explicitly **not** touching `planner.py`/`ConversationService`, which still pass plain dicts until Phase 4 does that conversion for real. The validator returns a `ValidationResult` (collecting every error, not just the first) instead of only raising, since Phase 4's regenerate-and-retry loop needs the full error set to feed back into the LLM prompt. `video_uri` moves into a one-field `ExecutionContext` dataclass alongside the `Proposal`, keeping the compiler's signature stable as more context needs to travel with it later. Duplicate stage names in one proposal are rejected by the validator (a deliberate V1 policy, not a Setu constraint — Setu's engine would mechanically tolerate them). (§19 Phase 3)
+- **`StageCapability` deliberately does not gain speculative fields.** `parameter_schema` (renamed from `params`) and `description` are kept; `worker_name`, `category`, `version`, `supports_batch` were proposed but declined for now — `worker_name` would duplicate the `stage name = topic name = WORKERS key` identity §6 already establishes, and the other three have no consumer anywhere in Phase 4 or Phase 5's plan as written. Each gets added in whichever sub-phase first actually needs it. (§19 Phase 3)
+
 ---
 
 ## 1. General direction (confirmed, unchanged)
@@ -88,23 +98,36 @@ Still a synchronous service in the API process, never a Kafka worker. Inputs:
 
 The planner decides which workers to run, in what order, and with what parameters. It never executes anything — no ffmpeg, no OpenCV, no Kafka access, no video bytes.
 
-Because the planner sometimes needs to keep asking questions before it has enough information to propose anything ("Who is this video for?"), its response needs one more bit of structure than the plan schema alone: a top-level discriminator.
+Because the planner sometimes needs to keep asking questions before it has enough information to propose anything ("Who is this video for?"), its response needs one more bit of structure than the proposal schema alone: a top-level discriminator.
 
 ```json
 { "type": "message", "text": "Who is this video intended for?" }
 ```
 or
 ```json
-{ "type": "plan", "summary": "...", "workflow": [ ... ] }
+{ "type": "proposal", "summary": "...", "workflow": [ ... ] }
 ```
 
-The `"plan"` case's body is exactly the schema you specified — see §6. This discriminator is the one addition beyond what you wrote; flagging it explicitly rather than silently introducing it, since it's necessary for the "assistant asks clarifying questions before proposing anything" behavior in the spec.
+The `"proposal"` case's body is exactly the schema you specified — see §6. This discriminator is the one addition beyond what you wrote; flagging it explicitly rather than silently introducing it, since it's necessary for the "assistant asks clarifying questions before proposing anything" behavior in the spec. (Named `"proposal"` rather than `"plan"` from the start, anticipating Phase 9a's approval workflow — see the principles below and the Phase 9a section; this also matches what actually shipped in Phase 2's `StaticPlanner`.)
+
+---
+
+## AI architecture principles (v6)
+
+Added 2026-07-26, before Phase 3 started, as explicit guidance for Phase 4 onward — nothing below changed any shipped code; it constrains how future phases get built.
+
+1. **Single planner, no multi-agent frameworks.** One LLM call producing one structured response (§6). No LangGraph, CrewAI, reflection loops, planning graphs, or autonomous tool routing, unless a future phase's actual requirement clearly can't be met without one — and if that seems to be happening, **stop and explain the reasoning before implementing**, don't just reach for the framework. This is the literal gate to apply at Phase 4 and Phase 9a specifically — those are the two phases where prompt complexity could tempt one.
+2. **Stateless planner.** Every invocation gets all its context explicitly passed in (project metadata, uploaded videos/assets, conversation history, user preferences, approval policy where relevant, the existing proposal when revising one) and returns a structured response and nothing more. No hidden state, no session carried inside the planner itself between calls.
+3. **Ordinary services, not agents.** The flow is plain backend services calling each other — prompt/context construction, the LLM call itself, and the Phase 3 validator — not an "agent" abstraction. Phase 4's Components list already describes this flow (prompt construction from conversation + preferences + metadata + registry → call the LLM → parse the response, then the Phase-3 validator gates the result); read informally as roles rather than a required class split, that's context-building = the prompt-construction step, planning = the LLM call/parse step, validation = Phase 3's validator, unchanged either way.
+4. **No sophisticated memory.** No vector/semantic/episodic memory, no RAG. §7's `user_preferences` table — one flat row per user, written by one optional lightweight LLM call after a successful edit — is already the full extent of memory for V1, and already satisfies this principle as shipped; nothing there needs to change.
+5. **No premature context-length optimization.** Typical project discussions are expected to fit comfortably in modern context windows; summarization machinery is deferred until real usage actually demonstrates a need. Phase 2's `conversation_context_limit` (fixed at 20 recent messages, already shipped) is the simple cap this principle is fine with, not the kind of premature optimization it warns against — don't read this principle as a reason to rip that cap out.
+6. **General complexity discipline.** Prefer the simplest architecture that solves the current phase's actual requirement. If, while implementing a future phase, it looks like more orchestration or memory than described above is genuinely needed, stop and explain the reasoning before implementing it — don't add it silently.
 
 ---
 
 ## 6. Planner output schema (new — formalized per your request)
 
-Canonical shape for the `"plan"` case:
+Canonical shape for the `"proposal"` case:
 
 ```json
 {
@@ -126,12 +149,12 @@ Canonical shape for the `"plan"` case:
 **Translation into Setu's native shape**, which is what actually gets submitted:
 
 ```python
-workflow = [item["stage"] for item in plan["workflow"]]          # -> Job.workflow
-stage_params = {str(i): item["params"] for i, item in enumerate(plan["workflow"])}
-payload = {"video_uri": ..., "stage_params": stage_params}       # -> Job.payload
+workflow = [item["stage"] for item in proposal["workflow"]]          # -> Job.workflow
+stage_params = {str(i): item["params"] for i, item in enumerate(proposal["workflow"])}
+payload = {"video_uri": ..., "stage_params": stage_params}           # -> Job.payload
 ```
 
-This is the same "index-keyed stage params live inside the existing freeform `payload`" idea from v1, just now explicitly framed as a translation step with the planner's schema as its input — the planner never has to know or care that Setu's `Job.workflow` is a flat string list. **This translation function is the one new piece of code between "planner" and "Setu."** Everything on the Setu side of it (`JobSubmissionService.submit(workflow=..., payload=...)`) is called completely unmodified.
+This is the same "index-keyed stage params live inside the existing freeform `payload`" idea from v1, just now explicitly framed as a compilation step with the planner's schema as its input — the planner never has to know or care that Setu's `Job.workflow` is a flat string list. **This compilation function is the one new piece of code between "planner" and "Setu"** (§19 Phase 3 names it `compile_workflow`, replacing an earlier "translator" working name). Everything on the Setu side of it (`JobSubmissionService.submit(workflow=..., payload=...)`) is called completely unmodified.
 
 **Capability registry** (new, static, lives in code — not a DB table): for every registered worker, its stage name (= topic name = `WORKERS` dict key, same convention Setu already uses), a short description for the LLM prompt, and its accepted parameter keys/types. This is both the LLM's prompt-time contract ("here's what you're allowed to choose from") and the validator's runtime contract ("here's what's actually allowed") — one source of truth for both.
 
@@ -187,8 +210,8 @@ video.uploaded → [outbox] → video_analysis topic → VideoAnalysisWorker →
 
 **Conversational planning (no Kafka):**
 ```
-video has metadata → chat turns → planner → plan proposed → user confirms
-  → plan validated + translated (§6) → Job #2 submitted
+video has metadata → chat turns → planner → proposal produced → user confirms
+  → proposal validated + compiled (§6) → Job #2 submitted
 ```
 
 **Job #2 — Edit:**
@@ -221,7 +244,7 @@ Same state machine, same engine, used identically for both jobs. Not modified in
 - Storage abstraction (§14, first priority — see Phase 0)
 - `videos`, `conversations`, `messages`, `user_preferences` tables
 - Video Analysis Worker + new editing workers (§9)
-- Capability registry (code, not DB) + plan validator/translator (§6)
+- Capability registry (code, not DB) + proposal validator/compiler (§6)
 - Planner service (LLM call + the two-shape response)
 - Chat endpoint(s)
 - ~~Notification delivery mechanism~~ — not needed; `GET /jobs/{id}` polling covers it
@@ -249,7 +272,7 @@ user_preferences(user_id PK, preferred_platform, preferred_export_format,
                   updated_at)
 ```
 
-`Project` is the aggregate root everything above hangs off (v5) — no video, conversation, or message exists independent of one. No `plans` table (a confirmed plan is just what's already on the submitted `Job` row), no vector store, no generic events table.
+`Project` is the aggregate root everything above hangs off (v5) — no video, conversation, or message exists independent of one. No `proposals` table before Phase 9a (a confirmed proposal before then is just what's already on the submitted `Job` row); Phase 9a adds one for the approval workflow (§19). No vector store, no generic events table.
 
 ---
 
@@ -269,7 +292,7 @@ user_preferences(user_id PK, preferred_platform, preferred_export_format,
 
 ## 17. Conversation & memory flow (confirmed, with the trigger question resolved)
 
-Conversation flow unchanged from v1: chat → planner → message-or-plan → confirm → validate/translate (§6) → submit Job #2 → poll for completion.
+Conversation flow unchanged from v1: chat → planner → message-or-proposal → confirm → validate/compile (§6) → submit Job #2 → poll for completion.
 
 Memory flow's open question from v1 — "what triggers the post-success preference-update call, without a Notification Worker?" — is resolved explicitly, not via a side effect on a GET: the frontend polls `GET /jobs/{id}` (read-only, no side effects) and, on observing `status: completed`, calls `POST /jobs/{id}/update-memory` (§19 Phase 6). That endpoint loads the completed conversation, runs the one lightweight preference-update LLM call, upserts `user_preferences` if warranted, and returns. It's idempotent, so the frontend calling it more than once (double-poll, retry, multiple tabs) is harmless. If Setu later gains a real terminal lifecycle event (§20), this same logic moves into a background consumer of that event without changing anything about the endpoint's contract or the overall architecture — only what triggers it changes.
 
@@ -277,7 +300,7 @@ Memory flow's open question from v1 — "what triggers the post-success preferen
 
 ## 18. Failure scenarios (confirmed, unchanged from v1)
 
-Corrupt video / unsupported codec, planner failure, worker crash, export failure, in-flight plan change — all handled exactly as described in v1 (retry/backoff/DLQ for anything inside Setu's Kafka path; local retry+graceful chat message for planner failures, since nothing durable has been submitted yet). Not repeated in full here; nothing about the refinements in this update changes any of those mechanics.
+Corrupt video / unsupported codec, planner failure, worker crash, export failure, in-flight proposal change — all handled exactly as described in v1 (retry/backoff/DLQ for anything inside Setu's Kafka path; local retry+graceful chat message for planner failures, since nothing durable has been submitted yet). Not repeated in full here; nothing about the refinements in this update changes any of those mechanics.
 
 ---
 
@@ -339,7 +362,7 @@ Each phase is independently demoable and none requires reopening a prior phase's
 
 **Why before Phase 3/4.** Decouples "does the conversation plumbing work" from "is the LLM prompt good," so a bad prompt later doesn't also mean debugging persistence at the same time.
 
-**Components.** `conversations`/`messages` tables and repositories; a chat endpoint; a **stub planner** that returns a fixed, hardcoded `{"type": "plan", ...}" response (or a fixed clarifying question on the first turn) regardless of input. `user_preferences` table also created here (empty rows, sensible defaults) so the read-path wiring exists early even though nothing writes to it until Phase 6.
+**Components.** `conversations`/`messages` tables and repositories; a chat endpoint; a **stub planner** that returns a fixed, hardcoded `{"type": "proposal", ...}` response (or a fixed clarifying question on the first turn) regardless of input. `user_preferences` table also created here (empty rows, sensible defaults) so the read-path wiring exists early even though nothing writes to it until Phase 6.
 
 **Database changes.** `conversations`, `messages`, `user_preferences` (§14).
 
@@ -351,55 +374,68 @@ Each phase is independently demoable and none requires reopening a prior phase's
 
 **Testing strategy.** Post several messages, confirm ordering and persistence; confirm the stub planner's fixed response is returned and appended as an assistant message.
 
-**Demo scenario.** A short scripted back-and-forth against the API showing message history growing correctly, with a canned "plan" coming back on cue.
+**Demo scenario.** A short scripted back-and-forth against the API showing message history growing correctly, with a canned "proposal" coming back on cue.
 
 **Risks.** Under-scoping "recent N messages" — pick a concrete number now (e.g. last 20) rather than leaving it open, since that number is a real prompt-budget decision (§4).
 
 ---
 
-### Phase 3 — Capability registry + plan validation/translation (still no real LLM)
+### Phase 3 — Capability registry + proposal validation/compilation (still no real LLM)
 
-**Goal.** Build the registry and the validator/translator from §6, and prove a plan (still hand-authored, not LLM-generated) can be turned into a real Setu Job #2 and executed — using the **existing `dummy` worker already in the codebase** as a stand-in stage, not new throwaway fake workers.
+**Purpose (added 2026-07-27, before implementation).** This phase establishes the proposal validation and workflow compilation pipeline. It intentionally introduces no AI-specific architectural decisions — no orchestration, no memory systems, no multi-agent workflows, no advanced planning (see the AI architecture principles under §5). Its only responsibility is proving that a valid proposal can be converted into an executable Setu workflow.
 
-**Why before Phase 4.** Isolates "is the planner→Setu translation correct" from "is the LLM's output good" — the same reasoning as Phase 2. If Phase 4 later produces a bad job, you'll already know the translation layer isn't the cause.
+**Goal.** Build the registry and the validator/compiler from §6, and prove a proposal (still hand-authored, not LLM-generated) can be turned into a real Setu Job #2 and executed — using the **existing `dummy` worker already in the codebase** as a stand-in stage, not new throwaway fake workers.
 
-**Components.** Capability registry (code); validator (schema/param checks from §6); translator (`plan → workflow/payload`).
+**Why before Phase 4.** Isolates "is the planner→Setu translation correct" from "is the LLM's output good" — the same reasoning as Phase 2. If Phase 4 later produces a bad job, you'll already know the compilation layer isn't the cause.
+
+**Components (revised 2026-07-27 for extensibility, before any code was written — see conversation for full rationale on each):**
+- `CapabilityRegistry` — a small class (`get`/`exists`/`list`/`register`) wrapping an internal dict, not a bare module-level constant. The validator depends on this interface, not a global, so Phase 5 can register real workers one at a time without touching validator logic. Still backed by a hardcoded dict for V1.
+- `StageCapability` — `name`, `description`, `parameter_schema` (renamed from `params` — same meaning, clearer). Deliberately **not** adding `worker_name`, `category`, `version`, or `supports_batch` yet: `worker_name` would duplicate the identity §6 already establishes (`stage name = topic name = WORKERS dict key`), and the other three have no consumer anywhere in Phase 4 or Phase 5's plan as written. Added in whichever sub-phase first needs them — cheap, since this is a dataclass in code, not a migration.
+- `Proposal` / `ProposalStage` — small frozen dataclasses (matching `StageMessage`'s existing convention in `workers/base.py`) replacing raw dicts inside the validation/compilation pipeline. Pydantic stays the API-schema layer only (see `api/schemas/`); these are internal domain objects, not request/response bodies, so a plain dataclass is the convention match, not Pydantic.
+- Validator returns a `ValidationResult` (`valid: bool`, `errors: list[str]`) instead of only raising — and **collects every error found**, not just the first (unregistered stage *and* malformed params in the same proposal both get reported together). This matters concretely at Phase 4: the planner's regenerate-and-retry loop feeds validation errors back into the LLM prompt, and "unknown stage 'crp', unknown param 'britness' on 'color'" is a far better retry signal than one error at a time.
+- `ExecutionContext` — a one-field dataclass (`video_uri: str`) passed alongside the `Proposal` to the compiler, instead of a bare `video_uri=...` keyword. Keeps the compiler's signature stable for Phase 4+, when more than a single URI will need to travel alongside a proposal.
+- The compiler (`compile_workflow(proposal, context) -> (workflow, payload)`, replacing "translator") stays a **pure function** — no DB, no storage, no API calls, no job submission, no state mutation. Renamed from "translator" because its future responsibilities (asset resolution, param normalization, default injection, shorthand expansion) are closer to compilation than plain translation.
+- Registry/validator/compiler are already asset-agnostic — they only ever see `stage` and `params`, never a video — so no video-specific naming needs correcting there. `ExecutionContext.video_uri` stays as-is: `Video` is the only asset-like model that actually exists in this codebase today, so naming the field `asset_uri` would be less accurate, not more, until an `Asset` concept is real.
+
+**Scope boundary — what does NOT change in Phase 3.** `Planner`/`StaticPlanner` (`backend/services/planner.py`) and `ConversationService` still pass and store a plain `dict[str, Any]` (via `json.dumps` into `Message.content`) — Phase 3 has no wiring into the conversation flow at all, so there is nothing there to convert yet. `Proposal`/`ProposalStage` are introduced only inside the new validation/compilation pipeline. Converting the planner's output into these domain models is Phase 4's job, when the real LLM response is parsed for the first time.
+
+**Duplicate stage names.** Rejected for V1. Setu's engine would mechanically tolerate a repeated stage (`stage_params` is index-keyed, `Result` rows are keyed by `(job_id, stage_index)`, dispatch is positional) — so this is a deliberate validator policy, not a hard constraint from Setu, and it's asserted with a test rather than left undefined. Rationale: none of V1's five editing stages (crop/color/audio/subtitle/export) has a legitimate reason to run twice in one job, and a duplicate is far more likely to be an LLM hallucination than an intentional request — easy to loosen later if a real use case shows up.
 
 **Database changes.** None new.
 
-**API changes.** None new — exercised via a direct call/test, or a debug endpoint that accepts a hand-written plan JSON and submits it.
+**API changes.** None new. The optional debug endpoint mentioned in earlier drafts is skipped — the integration test already exercises the full pipeline (proposal → validation → compilation → `JobSubmissionService` → `WorkflowEngine` → `DummyWorker` → completed `Job`), and the real user-facing entry point arrives in Phase 4 when the planner is wired into the conversation flow.
 
 **Worker changes.** None new — reuses the existing `dummy` worker, registered under a stand-in stage name in the registry purely to prove the wiring.
 
 **Frontend changes.** None.
 
-**Testing strategy.** Unit tests: a plan with an unregistered stage is rejected; a plan with malformed params is rejected; a valid plan translates to the exact expected `workflow`/`payload` shape. One integration test: submit a hand-written valid plan through the full path and see the resulting Job complete via the existing engine.
+**Testing strategy.** Unit tests: a proposal with an unregistered stage is rejected; a proposal with malformed params is rejected; a proposal with duplicate stage names is rejected; a proposal with multiple simultaneous errors reports all of them via `ValidationResult`; a valid proposal compiles to the exact expected `workflow`/`payload` shape. One integration test: submit a hand-written valid proposal through the full path and see the resulting Job complete via the existing engine.
 
-**Demo scenario.** Feed a hand-authored `{"summary": ..., "workflow": [...]}` JSON into the validator/translator, show it becomes a real `Job` that runs to completion — with zero changes to `JobSubmissionService`/`WorkflowEngine`/`StageProcessingService`.
+**Demo scenario.** Feed a hand-authored `{"summary": ..., "workflow": [...]}` JSON into the validator/compiler, show it becomes a real `Job` that runs to completion — with zero changes to `JobSubmissionService`/`WorkflowEngine`/`StageProcessingService`.
 
-**Risks.** Over-building the param validator (full JSON-Schema, custom DSL, etc.) — a flat "known keys + basic type check" is enough for V1; tighten only if bad plans actually get through in practice.
+**Risks.** Over-building the param validator (full JSON-Schema, custom DSL, etc.) — a flat "known keys + basic type check" is enough for V1; tighten only if bad proposals actually get through in practice.
 
 ---
 
 ### Phase 4 — Real planner LLM
 
-**Goal.** Replace the stub from Phase 2 with a real LLM call, wired to the registry and validator from Phase 3, producing genuine clarifying questions and genuine plans from real conversation + real video metadata.
+**Goal.** Replace the stub from Phase 2 with a real LLM call, wired to the registry and validator from Phase 3, producing genuine clarifying questions and genuine proposals from real conversation + real video metadata. Built per the AI architecture principles above: one stateless planner call per turn, no agent framework, no memory beyond §7.
 
-**Why before Phase 5.** The planner needs *some* registered stages to plan against; Phase 3 already proved the plumbing against `dummy`, so swapping in the real LLM here is a contained change — only the "what produces the plan JSON" piece moves, nothing around it does.
+**Why before Phase 5.** The planner needs *some* registered stages to plan against; Phase 3 already proved the plumbing against `dummy`, so swapping in the real LLM here is a contained change — only the "what produces the proposal JSON" piece moves, nothing around it does.
 
-**Components.** Planner service (prompt construction from conversation + preferences + metadata + registry; call the LLM; parse the `{"type": ...}` response); wiring the chat endpoint to use it instead of the stub; wiring "user confirms" to call the Phase-3 validator/translator and then `JobSubmissionService.submit()` for real.
+**Components.** Planner service (prompt construction from conversation + preferences + metadata + registry; call the LLM; parse the `{"type": ...}` response); wiring the chat endpoint to use it instead of the stub; wiring "user confirms" to call the Phase-3 validator/compiler and then `JobSubmissionService.submit()` for real; converting the planner's raw dict response into the Phase-3 `Proposal`/`ProposalStage` domain models before it reaches the validator (Phase 3 introduced these models only inside the validation/compilation pipeline, not in `planner.py` — this is where that conversion actually happens). Informally: prompt construction = context-building, the LLM call/parse = the planner itself, Phase 3's validator = proposal validation — plain services calling each other in sequence, not an agent pipeline.
 
 **Database changes.** None new.
 
-**API changes.** Chat endpoint now round-trips through the real planner instead of the stub. A confirm step (either a recognized affirmative message, or an explicit `POST /projects/{id}/confirm-plan`) triggers Job #2 submission.
+**API changes.** Chat endpoint now round-trips through the real planner instead of the stub. A confirm step (either a recognized affirmative message, or an explicit `POST /projects/{id}/confirm-proposal`) triggers Job #2 submission.
 
 **Worker changes.** None new yet — still targets whatever's registered (§9's real workers land in Phase 5; until then, keep `dummy` registered so this phase is fully testable on its own).
 
 **Frontend changes.** None yet, unless useful to demo manually via a REST client.
 
-**Testing strategy.** Prompt-level tests with a handful of representative conversations (vague request → clarifying question; specific request → valid plan; nonsense request → graceful handling); retry/backoff test for a simulated LLM failure/timeout.
+**Testing strategy.** Prompt-level tests with a handful of representative conversations (vague request → clarifying question; specific request → valid proposal; nonsense request → graceful handling); retry/backoff test for a simulated LLM failure/timeout.
 
-**Demo scenario.** The example from the spec, live: "Make this look more professional" → assistant asks who it's for → "LinkedIn" → assistant proposes a concrete plan → user confirms → a real Job #2 is submitted (still against `dummy` until Phase 5).
+**Demo scenario.** The example from the spec, live: "Make this look more professional" → assistant asks who it's for → "LinkedIn" → assistant proposes a concrete workflow → user confirms → a real Job #2 is submitted (still against `dummy` until Phase 5).
 
 **Risks.** LLM hallucinating a stage name or malformed params — this is exactly what Phase 3's validator exists to catch; if it's tripping constantly, that's a prompt problem to fix in the registry's descriptions, not a reason to loosen validation.
 
@@ -420,7 +456,7 @@ Each phase is independently demoable and none requires reopening a prior phase's
 **Phase 5a — Crop Worker**
 
 - **Objective.** Deterministically crop/resize/rotate a video to requested dimensions or aspect ratio.
-- **Implementation tasks.** `CropWorker(Worker)` calling ffmpeg (or OpenCV) with params from the plan (e.g. `{x, y, width, height}` or `{aspect_ratio}`); register in `WORKERS` as `"crop"`; add `crop`'s real param schema to the capability registry, replacing the `dummy` stand-in used in Phases 3–4.
+- **Implementation tasks.** `CropWorker(Worker)` calling ffmpeg (or OpenCV) with params from the proposal (e.g. `{x, y, width, height}` or `{aspect_ratio}`); register in `WORKERS` as `"crop"`; add `crop`'s real param schema to the capability registry, replacing the `dummy` stand-in used in Phases 3–4.
 - **Testing strategy.** Known input video + known crop/aspect params → assert output resolution/aspect ratio matches exactly. Malformed params (out-of-bounds crop rect) → assert a clean failure, not a corrupt output file.
 - **Demo scenario.** Submit a Job #2 with `workflow: ["crop"]` and a 16:9 → 9:16 aspect-ratio request; produce a real vertically-cropped output file.
 - **Acceptance criteria.** Output video has the exact requested dimensions/aspect ratio; job reaches `completed`; a deliberately bad crop rect reaches `dead_lettered` via the existing retry/DLQ path with no changes to that path.
@@ -491,11 +527,11 @@ Each phase is independently demoable and none requires reopening a prior phase's
 
 ### Phase 7 — Frontend integration
 
-**Goal.** A usable UI over everything built so far: upload, chat, plan confirmation, poll-based progress, completed video download.
+**Goal.** A usable UI over everything built so far: upload, chat, proposal confirmation, poll-based progress, completed video download.
 
 **Why last.** Every piece it depends on (upload, chat, planning, execution, memory) is already independently proven by this point — this phase is wiring, not new backend logic.
 
-**Components.** Project creation + upload widget → `POST /projects`, `POST /projects/{id}/videos`; chat UI → the messages endpoints; a confirm affordance for proposed plans; a progress view driven by polling `GET /jobs/{id}` (a simple interval poll is enough for V1, per your instruction — no SSE/WebSocket needed), which on observing `completed` calls `POST /jobs/{id}/update-memory` (Phase 6) once.
+**Components.** Project creation + upload widget → `POST /projects`, `POST /projects/{id}/videos`; chat UI → the messages endpoints; a confirm affordance for proposed workflows; a progress view driven by polling `GET /jobs/{id}` (a simple interval poll is enough for V1, per your instruction — no SSE/WebSocket needed), which on observing `completed` calls `POST /jobs/{id}/update-memory` (Phase 6) once.
 
 **Database changes.** None.
 
@@ -507,7 +543,7 @@ Each phase is independently demoable and none requires reopening a prior phase's
 
 **Testing strategy.** Manual end-to-end walkthrough of the full spec example (upload → "make this more professional" → LinkedIn → confirm → watch progress → download); basic component tests for the chat/upload widgets if the frontend stack has a test setup already.
 
-**Demo scenario.** The full product demo: a real video, a real conversation, a real confirmed plan, real progress, a real output file.
+**Demo scenario.** The full product demo: a real video, a real conversation, a real confirmed proposal, real progress, a real output file.
 
 **Risks.** Polling interval too aggressive (hammering the API) or too slow (feels unresponsive) — pick something reasonable (2–3s) and revisit only if it's actually a problem.
 
@@ -553,7 +589,7 @@ All room endpoints enforce membership; non-members get 403/404.
 - **The socket is pure fanout.** Writes never travel over it — REST remains the only write path. Reconnect = refetch the snapshot via `GET /projects/{id}`, then resume the stream; the `seq` lets a client detect gaps.
 - Message/member/planner events are emitted directly by the API at write time. Job-progress events need a bridge out of Setu: **V1 is a server-side watcher that polls the jobs table for the room's active jobs and pushes diffs** — the same polling decision already made in §9/§19 Phase 7, just moved server-side so N clients don't each poll. The clean upgrade is backlog item 1 (terminal lifecycle events via the outbox) feeding this same fanout — when that lands, only the producer changes; the envelope and event types don't.
 
-**Worker changes.** None. Execution is exactly as before: every confirmed plan still becomes a normal Setu job. `JobSubmissionService`, `WorkflowEngine`, `WorkerRunner`, `StageProcessingService`, workers, retry, DLQ, and outbox are all untouched.
+**Worker changes.** None. Execution is exactly as before: every confirmed proposal still becomes a normal Setu job. `JobSubmissionService`, `WorkflowEngine`, `WorkerRunner`, `StageProcessingService`, workers, retry, DLQ, and outbox are all untouched.
 
 **Frontend changes.** Room create/join flow; shared chat with sender names; member list; progress views driven by the room socket instead of per-client polling.
 
@@ -567,11 +603,11 @@ All room endpoints enforce membership; non-members get 403/404.
 
 ### Phase 9a — Proposals & Approval Workflow
 
-**Goal.** Upgrade the planner from a single-user assistant into a collaborative facilitator that understands a discussion between multiple participants — who said what, when, where they conflict, where they agree — and, instead of a directly-confirmable plan, produces a **Proposal** that must satisfy the room's approval policy before it is translated (Phase 3 machinery, unchanged) and submitted to Setu. Execution still happens through Setu exactly as before; only the planning layer changes, and the collaboration layer sits entirely above the execution engine. **No Setu-core changes in this sub-phase** — that's isolated in 9b.
+**Goal.** Upgrade the planner from a single-user assistant into a collaborative facilitator that understands a discussion between multiple participants — who said what, when, where they conflict, where they agree — and, instead of a directly-confirmable plan, produces a **Proposal** that must satisfy the room's approval policy before it is compiled (Phase 3 machinery, unchanged) and submitted to Setu. Execution still happens through Setu exactly as before; only the planning layer changes, and the collaboration layer sits entirely above the execution engine. **No Setu-core changes in this sub-phase** — that's isolated in 9b.
 
 **Why after Phase 8.** Needs the sender-attributed shared conversation and the room fanout to broadcast proposals and approvals.
 
-**Planner changes (the only "AI" change).** The prompt now renders an attributed transcript — `Alice (10:41): "Crop vertically."` / `Bob (10:42): "Keep landscape."` — instead of anonymous user turns. The response discriminator from §5 evolves: in a room context, `{"type": "plan", ...}` becomes `{"type": "proposal", "summary": ..., "workflow": [...], "reasoning": ..., "discussion_summary": ...}`; `{"type": "message"}` stays as-is and is how the planner facilitates. Facilitation behaviors — detect conflicting requests, detect agreement, summarize the discussion, explain *why* it chose this workflow (the `reasoning` field), and ask for clarification when needed — are **prompt-level capabilities, not code**. In the Alice/Bob example above, the planner must recognize the conflict and return a clarifying `message` to the team, not a proposal. The Phase 3 validator still gates every proposal's `workflow` exactly as before — nothing about multi-user input loosens validation.
+**Planner changes (the only "AI" change).** The prompt now renders an attributed transcript — `Alice (10:41): "Crop vertically."` / `Bob (10:42): "Keep landscape."` — instead of anonymous user turns. The response discriminator's shape is already `{"type": "proposal", ...}` from Phase 2 (§5/§6) — nothing to rename here. What's new in this sub-phase is two additional fields on that same shape: `{"type": "proposal", "summary": ..., "workflow": [...], "reasoning": ..., "discussion_summary": ...}`; `{"type": "message"}` stays as-is and is how the planner facilitates. Facilitation behaviors — detect conflicting requests, detect agreement, summarize the discussion, explain *why* it chose this workflow (the `reasoning` field), and ask for clarification when needed — are **prompt-level capabilities, not code**. In the Alice/Bob example above, the planner must recognize the conflict and return a clarifying `message` to the team, not a proposal. The Phase 3 validator still gates every proposal's `workflow` exactly as before — nothing about multi-user input loosens validation.
 
 The prompt also renders the room's **active approval policy** as context, and is expected to phrase its facilitation messages accordingly — e.g. "The proposal is ready for admin approval." under `admin`, vs "The proposal is ready. Waiting for approval from all team members." under `team`. This is wording only: the planner never decides *whether* a proposal is approved (that's the collaboration layer, below) — it only speaks about the policy that already governs the room. The planner **never executes a workflow directly**; it only ever produces proposals (or messages). The collaboration layer alone is responsible for collecting approvals and submitting a proposal to Setu once the room's approval policy is satisfied.
 
@@ -606,7 +642,7 @@ One vote row per member per proposal; a member may change their vote while the p
 - Proposal *creation* is the planner's job: a `proposal`-shaped planner response is persisted as a `proposals` row and fanned out. No manual-creation endpoint in V1.
 - `GET /projects/{id}/proposals` — list (filterable by status).
 - `GET /proposals/{id}` — full proposal including current approval status/progress (who has voted, what the policy requires).
-- `POST /proposals/{id}/approve` / `POST /proposals/{id}/reject` — member-only. Each approval triggers policy evaluation **inside one transaction with a status guard** (only one `pending → submitted` transition can ever win, and only one `pending → rejected` transition can ever win), then: if satisfied, validate + translate via Phase 3 unchanged → `JobSubmissionService.submit()` → record `job_id`, mark `submitted`; if a `team` proposal just became impossible to satisfy, mark `rejected`.
+- `POST /proposals/{id}/approve` / `POST /proposals/{id}/reject` — member-only. Each approval triggers policy evaluation **inside one transaction with a status guard** (only one `pending → submitted` transition can ever win, and only one `pending → rejected` transition can ever win), then: if satisfied, validate + compile via Phase 3 unchanged → `JobSubmissionService.submit()` → record `job_id`, mark `submitted`; if a `team` proposal just became impossible to satisfy, mark `rejected`.
 - Phase 8's socket gains `proposal.created` and `proposal.updated` event types — same envelope.
 
 **Worker changes.** None.
