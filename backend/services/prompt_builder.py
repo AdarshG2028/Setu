@@ -1,0 +1,79 @@
+"""PromptBuilder (Changelog v8) -- PlannerContext -> Prompt, extracted from
+LLMPlanner so prompt engineering stays separate from the LLM call itself.
+The same `build` (with an optional validation-feedback turn appended) is
+reused for both the first attempt and Phase 4's one semantic retry; future
+prompt types (clarification, revision, summaries) can add their own
+sections here without duplicating context assembly.
+"""
+
+from dataclasses import dataclass
+
+from backend.models import MessageRole
+from backend.services.planner_context import PlannerContext
+
+
+@dataclass(frozen=True)
+class Prompt:
+    system: str
+    messages: list[dict[str, str]]
+
+
+_ROLE_TO_CHAT_ROLE = {
+    MessageRole.USER: "user",
+    MessageRole.ASSISTANT: "assistant",
+}
+
+
+class PromptBuilder:
+    def build(
+        self, context: PlannerContext, *, validation_feedback: list[str] | None = None
+    ) -> Prompt:
+        system = self._build_system(context)
+        messages = [
+            {"role": _ROLE_TO_CHAT_ROLE[m.role], "content": m.content}
+            for m in context.conversation_history
+        ]
+        if validation_feedback:
+            messages.append(
+                {
+                    "role": "user",
+                    "content": (
+                        "Your previous proposal was invalid for these reasons: "
+                        + "; ".join(validation_feedback)
+                        + ". Please produce a corrected proposal, or ask a clarifying "
+                        "question if you're missing information needed to fix it."
+                    ),
+                }
+            )
+        return Prompt(system=system, messages=messages)
+
+    def _build_system(self, context: PlannerContext) -> str:
+        lines = [
+            "You are a video editing assistant. You never edit video yourself -- "
+            "you either ask a clarifying question or propose a workflow of stages "
+            "for a deterministic execution engine to run.",
+            "",
+            "Respond with `{\"type\": \"message\", ...}` if you need more information, "
+            "or `{\"type\": \"proposal\", ...}` once you have enough to propose a "
+            "concrete edit.",
+            "",
+            "Available videos in this project (reference by handle in `video_ids`, "
+            "never by any other identifier):",
+        ]
+        for video in context.videos:
+            lines.append(f"- {video.handle}: {video.display_name}")
+
+        lines.append("")
+        lines.append("Available stages (only use these in `workflow`):")
+        for capability in context.capability_registry.list():
+            lines.append(f"- {capability.name}: {capability.description}")
+
+        if context.preferences is not None:
+            lines.append("")
+            lines.append(f"User preferences: {context.preferences}")
+
+        if context.approval_policy is not None:
+            lines.append("")
+            lines.append(f"Approval policy for this room: {context.approval_policy}")
+
+        return "\n".join(lines)

@@ -20,6 +20,8 @@ from backend.core.config import get_settings
 from backend.models import Conversation, Message, Project
 from backend.services.conversation_service import ConversationService
 from backend.services.planner import Planner
+from backend.services.planner_context import PlannerContext
+from backend.services.planner_response import PlannerResponse
 
 pytestmark = pytest.mark.usefixtures("database_url")
 
@@ -142,9 +144,9 @@ async def test_context_limit_respected(session: AsyncSession) -> None:
         def __init__(self) -> None:
             self.last_seen: list[Message] = []
 
-        async def respond(self, messages, preferences):
-            self.last_seen = messages
-            return {"type": "message", "text": "ok"}
+        async def respond(self, context: PlannerContext) -> PlannerResponse:
+            self.last_seen = context.conversation_history
+            return PlannerResponse(type="message", message="ok")
 
     project = Project(owner_id=uuid.uuid4())
     session.add(project)

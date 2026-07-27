@@ -2,9 +2,13 @@
 
 Routes never touch repositories or the planner directly; this is the one
 place that sequences load/create-conversation -> load-preferences ->
-append-user-message -> Planner.respond -> append-assistant-message ->
-return. Phase 4 swaps StaticPlanner for a real LLMPlanner by passing a
-different Planner in here -- nothing about this sequencing changes.
+append-user-message -> assemble PlannerContext -> Planner.respond ->
+serialize PlannerResponse -> append-assistant-message -> return. Phase 4
+swaps StaticPlanner for a real LLMPlanner by passing a different Planner in
+here -- the sequencing doesn't change, but this service now also owns
+PlannerContext assembly (project/videos/registry/preferences/history) and
+PlannerResponse serialization, since the planner interface itself became
+typed (Changelog v8) rather than passing/returning plain dicts.
 """
 
 import json
@@ -20,7 +24,10 @@ from backend.repositories.conversation_repository import ConversationRepository
 from backend.repositories.message_repository import MessageRepository
 from backend.repositories.project_repository import ProjectNotFoundError, ProjectRepository
 from backend.repositories.user_preference_repository import UserPreferenceRepository
+from backend.repositories.video_repository import VideoRepository
+from backend.services.capability_registry import DEFAULT_CAPABILITY_REGISTRY, CapabilityRegistry
 from backend.services.planner import Planner, StaticPlanner
+from backend.services.planner_context import PlannerContext, build_video_contexts
 
 __all__ = ["ConversationService", "PostMessageResult", "ProjectNotFoundError"]
 
@@ -32,18 +39,27 @@ class PostMessageResult:
 
 
 class ConversationService:
-    def __init__(self, session: AsyncSession, *, planner: Planner | None = None) -> None:
+    def __init__(
+        self,
+        session: AsyncSession,
+        *,
+        planner: Planner | None = None,
+        capability_registry: CapabilityRegistry = DEFAULT_CAPABILITY_REGISTRY,
+    ) -> None:
         self._session = session
         self._projects = ProjectRepository(session)
         self._conversations = ConversationRepository(session)
         self._messages = MessageRepository(session)
         self._preferences = UserPreferenceRepository(session)
+        self._videos = VideoRepository(session)
         self._planner = planner or StaticPlanner()
+        self._capability_registry = capability_registry
 
     async def post_message(
         self, *, project_id: uuid.UUID, sender_id: uuid.UUID, content: str
     ) -> PostMessageResult:
-        if await self._projects.get(project_id) is None:
+        project = await self._projects.get(project_id)
+        if project is None:
             raise ProjectNotFoundError(project_id)
 
         conversation = await self._get_or_create_conversation(project_id)
@@ -65,18 +81,27 @@ class ConversationService:
         history = await self._messages.list_by_conversation(
             conversation.id, limit=get_settings().conversation_context_limit
         )
-        response = await self._planner.respond(history, preferences)
+        videos = await self._videos.list_by_project(project_id)
+        context = PlannerContext(
+            project=project,
+            conversation_history=history,
+            videos=build_video_contexts(videos),
+            preferences=preferences,
+            capability_registry=self._capability_registry,
+        )
+        response = await self._planner.respond(context)
+        response_dict = response.to_dict()
 
         assistant_message = Message(
             conversation_id=conversation.id,
             sender_id=None,
             role=MessageRole.ASSISTANT,
-            content=json.dumps(response),
+            content=json.dumps(response_dict),
         )
         self._messages.add(assistant_message)
         await self._session.commit()
 
-        return PostMessageResult(message_id=user_message.id, response=response)
+        return PostMessageResult(message_id=user_message.id, response=response_dict)
 
     async def get_history(self, project_id: uuid.UUID) -> list[Message]:
         if await self._projects.get(project_id) is None:
