@@ -21,16 +21,26 @@ from backend.services.proposal import Proposal
 class ExecutionContext:
     """Carries whatever a Proposal needs from outside itself to become a
     real job, kept separate so the proposal's own shape stays storage-
-    agnostic. One field for V1 (this project only has Video assets so
-    far); grows without changing compile_workflow's signature."""
+    agnostic. `video_uris` maps a ProposalStage's handle (e.g. "video_1",
+    assigned by PlannerContext/PromptBuilder) to its resolved storage URI --
+    a project can hold several videos, and different stages may reference
+    different ones (Changelog v8). Still just this one field for V1 (only
+    Video assets exist so far); grows without changing compile_workflow's
+    signature."""
 
-    video_uri: str
+    video_uris: dict[str, str]
 
 
 def compile_workflow(
     proposal: Proposal, context: ExecutionContext
 ) -> tuple[list[str], dict[str, Any]]:
     workflow = [item.stage for item in proposal.workflow]
-    stage_params = {str(i): item.params for i, item in enumerate(proposal.workflow)}
-    payload = {"video_uri": context.video_uri, "stage_params": stage_params}
+    stage_params = {
+        str(i): {
+            "params": item.params,
+            "video_uris": [context.video_uris[video_id] for video_id in item.video_ids],
+        }
+        for i, item in enumerate(proposal.workflow)
+    }
+    payload = {"stage_params": stage_params}
     return workflow, payload
