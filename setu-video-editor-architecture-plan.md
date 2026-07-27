@@ -27,6 +27,14 @@ This supersedes the v1 architecture document. Same investigation of the codebase
 - **Proposal rejection is no longer a dead end.** Under `team`, any single reject immediately ends the proposal (unanimity is already impossible — no need to wait out the rest of the vote) and returns the room to open discussion; the planner may then produce a revised proposal as a new row, with the rejected one kept as an audit record. (§19 Phase 9a)
 - **The planner is now approval-policy-aware** — it renders the room's active policy in its prompt context and phrases facilitation messages accordingly (e.g. "ready for admin approval" vs "waiting for approval from all team members"). This is wording only: the planner still never decides approval outcomes or executes workflows, only produces proposals/messages — that stays the collaboration layer's job. (§19 Phase 9a)
 
+## Changelog from v5
+
+- **Project is now the aggregate root, effective immediately rather than at Phase 8.** `Project` was originally going to be introduced by Phase 8 (Collaborative Project Rooms); it actually landed when Phase 2 was implemented (`Conversation` was parented to `Project`, not `Video`, from the start — see the Phase 2 section) and was then extended to `Video` as a deliberate follow-up migration. Every video now belongs to exactly one project; there is no such thing as an orphan video. (§14, §19 Phase 1, Phase 8)
+- **`POST /videos` is gone, replaced by `POST /projects/{id}/videos`.** `GET /videos/{id}` is unchanged (reading by a video's own id is still a reasonable flat lookup) but now returns `project_id`. A new `GET /projects/{id}/videos` lists a project's videos. (§19 Phase 1)
+- **`videos.project_id` and `conversations.project_id` are both `NOT NULL`** (the latter also `UNIQUE` — one shared conversation per project). Phase 8's original text describing a *nullable* `project_id` gained "later" is corrected in place — nullable-then-backfilled was never how this shipped. `videos.project_id` also changed from `ON DELETE SET NULL` to `ON DELETE CASCADE`: deleting a project deletes its videos, matching "no orphan video" above. (§14, §19 Phase 8)
+- **This confirms the intended product UI flow end to end**: create a project → upload video(s) into it → invite members (Phase 8) → members converse (Phase 2, then Phase 9a once proposals exist) → approved proposal executes the edit (Phase 3/4). Nothing here is a new phase — it's the mapping the phases below already implement.
+- **Multiple videos per project already works** — `videos.project_id` was never unique, unlike `conversations.project_id`. What's *not* built yet: a user-entered display name per video, distinct from the uploaded file's name. Small, additive, deliberately deferred (see Phase 1's Risks).
+
 ---
 
 ## 1. General direction (confirmed, unchanged)
@@ -220,23 +228,28 @@ Same state machine, same engine, used identically for both jobs. Not modified in
 
 ---
 
-## 14. Database additions (confirmed, unchanged)
+## 14. Database additions (updated per v5 — see changelog)
 
 ```
-videos(id, user_id, storage_uri, original_filename, status,
-       latest_analysis_result_id FK -> results.id (nullable),
+projects(id, owner_id, name, created_at, updated_at)
+
+videos(id, project_id FK -> projects.id (NOT NULL, CASCADE), storage_uri,
+       original_filename, name (nullable, user-entered display name),
+       latest_analysis_job_id FK -> jobs.id (nullable),
        created_at, updated_at)
 
-conversations(id, video_id FK, created_at, updated_at)
+conversations(id, project_id FK -> projects.id (NOT NULL, UNIQUE),
+              created_at, updated_at)
 
-messages(id, conversation_id FK, role, content, created_at)
+messages(id, conversation_id FK, sender_id (nullable), role, content,
+         created_at)
 
 user_preferences(user_id PK, preferred_platform, preferred_export_format,
                   captions_enabled, preferred_resolution, subtitle_language,
                   updated_at)
 ```
 
-No `plans` table (a confirmed plan is just what's already on the submitted `Job` row), no vector store, no generic events table.
+`Project` is the aggregate root everything above hangs off (v5) — no video, conversation, or message exists independent of one. No `plans` table (a confirmed plan is just what's already on the submitted `Job` row), no vector store, no generic events table.
 
 ---
 
@@ -304,9 +317,9 @@ Each phase is independently demoable and none requires reopening a prior phase's
 
 **Components.** `VideoAnalysisWorker` (new `Worker` subclass, registered in `WORKERS`); upload endpoint that writes to storage (Phase 0) and calls `JobSubmissionService.submit(workflow=["video_analysis"], payload={"video_uri": ...})` **unmodified**.
 
-**Database changes.** `videos` table (§14). `latest_analysis_result_id` populated once the worker succeeds.
+**Database changes.** `videos` table (§14), belonging to a `Project` (v5 — every video requires one; `POST /projects` creates it). `latest_analysis_job_id` populated once the worker succeeds.
 
-**API changes.** `POST /videos` (upload) → creates `videos` row + Job #1, returns `video_id` + `job_id`. `GET /jobs/{id}` already exists and needs no change to report Job #1's progress.
+**API changes.** `POST /projects/{project_id}/videos` (upload) → creates `videos` row + Job #1, returns `video_id` + `job_id` (v5 — was flat `POST /videos`). `GET /videos/{id}` stays flat. `GET /projects/{id}/videos` lists a project's videos — multiple videos per project already works, no unique constraint blocks it. `GET /jobs/{id}` already exists and needs no change to report Job #1's progress.
 
 **Worker changes.** One new worker. Start with a subset of the metadata list (say: duration, fps, resolution, codec) if the full analysis stack (Whisper, scene detection, etc.) isn't ready yet — the point of this phase is proving the *pipeline*, not shipping every metric on day one. Add the rest incrementally without touching anything else.
 
@@ -316,7 +329,7 @@ Each phase is independently demoable and none requires reopening a prior phase's
 
 **Demo scenario.** Upload a video via the API, watch Job #1 go `pending → running → completed`, see real metadata on the video record.
 
-**Risks.** Being tempted to build the full analysis stack (Whisper + scene detection + face detection all at once) before proving the plumbing — resist; ship partial metadata first, expand later, each addition needs no other change.
+**Risks.** Being tempted to build the full analysis stack (Whisper + scene detection + face detection all at once) before proving the plumbing — resist; ship partial metadata first, expand later, each addition needs no other change. `videos.name` — an optional user-entered display name, distinct from `original_filename` — was added the same way this note originally predicted it could be: a nullable column and an optional form field, no restructuring required.
 
 ---
 
@@ -330,7 +343,7 @@ Each phase is independently demoable and none requires reopening a prior phase's
 
 **Database changes.** `conversations`, `messages`, `user_preferences` (§14).
 
-**API changes.** `POST /videos/{id}/messages` (post a chat message, get the assistant's stubbed reply back), `GET /videos/{id}/messages` (history).
+**API changes.** `POST /projects/{id}/messages` (post a chat message, get the assistant's stubbed reply back), `GET /projects/{id}/messages` (history) — project-scoped from the start (v5: `Conversation` belongs to `Project`, not `Video`), matching how this actually shipped.
 
 **Worker changes.** None.
 
@@ -378,7 +391,7 @@ Each phase is independently demoable and none requires reopening a prior phase's
 
 **Database changes.** None new.
 
-**API changes.** Chat endpoint now round-trips through the real planner instead of the stub. A confirm step (either a recognized affirmative message, or an explicit `POST /videos/{id}/confirm-plan`) triggers Job #2 submission.
+**API changes.** Chat endpoint now round-trips through the real planner instead of the stub. A confirm step (either a recognized affirmative message, or an explicit `POST /projects/{id}/confirm-plan`) triggers Job #2 submission.
 
 **Worker changes.** None new yet — still targets whatever's registered (§9's real workers land in Phase 5; until then, keep `dummy` registered so this phase is fully testable on its own).
 
@@ -482,7 +495,7 @@ Each phase is independently demoable and none requires reopening a prior phase's
 
 **Why last.** Every piece it depends on (upload, chat, planning, execution, memory) is already independently proven by this point — this phase is wiring, not new backend logic.
 
-**Components.** Upload widget → `POST /videos`; chat UI → the messages endpoints; a confirm affordance for proposed plans; a progress view driven by polling `GET /jobs/{id}` (a simple interval poll is enough for V1, per your instruction — no SSE/WebSocket needed), which on observing `completed` calls `POST /jobs/{id}/update-memory` (Phase 6) once.
+**Components.** Project creation + upload widget → `POST /projects`, `POST /projects/{id}/videos`; chat UI → the messages endpoints; a confirm affordance for proposed plans; a progress view driven by polling `GET /jobs/{id}` (a simple interval poll is enough for V1, per your instruction — no SSE/WebSocket needed), which on observing `completed` calls `POST /jobs/{id}/update-memory` (Phase 6) once.
 
 **Database changes.** None.
 
@@ -502,39 +515,34 @@ Each phase is independently demoable and none requires reopening a prior phase's
 
 ### Phase 8 — Collaborative Project Rooms
 
-**Goal.** Extend the application from a single-user experience into a shared workspace: multiple users join the same **Project Room** and see the same videos, shared conversation, job progress, and completed exports. This phase is collaboration *infrastructure* only — the planner behaves exactly as it does today (it simply receives the shared conversation as context, per §4), and no approval workflow or AI consensus logic exists yet; that's Phase 9a.
+**Goal.** Extend the application from a single-user experience into a shared workspace: multiple users join an existing **Project** — already created back in Phase 1, already holding its videos and shared conversation (Phase 2) — and see the same videos, shared conversation, job progress, and completed exports. This phase is collaboration *infrastructure* only, and specifically just **membership**: `Project` is already the aggregate root (v5) and `Conversation`/`Video` are already project-scoped, not video- or user-scoped. What's missing is *who else* is allowed in. The planner behaves exactly as it does today (it simply receives the shared conversation as context, per §4), and no approval workflow or AI consensus logic exists yet; that's Phase 9a.
 
 **Why after Phase 7.** Everything a room member observes — upload, chat, planning, progress, download — already works single-user by the end of Phase 7. This phase multiplexes an existing experience; it doesn't build a new one.
 
 **Posture note (applies from here on).** Phases 0–7 treated "no changes to Setu's core" as a hard rule. From Phase 8 onward it is a *default*: prefer building above Setu, but modify it when there's a genuinely good reason, and document that reason at the point of change. Phase 8 and Phase 9a need no such change; Phase 9b makes the one exception (cancellation).
 
-**Core concept.** A Project Room groups: the project, its members, its videos, one shared conversation, its jobs, and its version history. Conversations become project-scoped rather than per-user. Every message preserves sender, timestamp, and ordering.
+**Core concept.** A Project already groups its videos and one shared conversation (Phase 1/2, v5). This phase adds the missing piece: members, turning a single-owner project into a genuine multi-user room. Every message already preserves sender (`Message.sender_id`, nullable, null = assistant), timestamp, and ordering — Phase 2 built that in from the start specifically so this phase wouldn't need to touch it.
 
-**Components.** `projects`/`project_members` models + repositories; project-scoped conversation endpoints; a room-snapshot endpoint; a WebSocket fanout layer (designed below, implemented as thin as possible).
+**Components.** `project_members` model + repository (the only new table — `projects`, `conversations`, `videos` all already exist and are already project-scoped); a room-snapshot endpoint; a WebSocket fanout layer (designed below, implemented as thin as possible).
 
-**Database changes.** New tables, kept minimal:
+**Database changes.** One new table:
 
 ```
-projects(id, name, owner_user_id, created_at, updated_at)
-
 project_members(project_id FK, user_id, role ('owner'|'member'), joined_at,
                 PRIMARY KEY (project_id, user_id))
 ```
 
-Reused tables, minimal additions:
-- `conversations` gains nullable `project_id` — a room's shared conversation is one ordinary `conversations` row; the existing video-scoped path keeps working unchanged.
-- `messages` gains nullable `sender_user_id` (null = assistant). `created_at` + insertion order already provide timestamp and ordering — nothing new needed there.
-- `videos` gains nullable `project_id`.
+`POST /projects` (Phase 1) needs one small addition here: also insert the owner as the first `project_members` row, so a freshly-created project is never memberless. No changes needed to `conversations`, `messages`, or `videos` — all three already carry the `NOT NULL` `project_id`/sender attribution this phase needs (v5).
+
 - **`jobs` stays untouched.** Room↔job linkage lives in a small `project_jobs(project_id, job_id)` mapping table written at submission time by the (non-Setu) submission wrapper. If that join ever proves genuinely annoying, a nullable `project_id` column on `jobs` is the fallback — an acceptable Setu change under the new posture, but not the starting point.
 - **Version history is derived, not stored:** the room's completed export jobs (via `project_jobs` → results/artifacts), ordered by completion time, *are* the version list. No new table until deriving it proves insufficient.
 
 **API changes.**
-- `POST /projects` — create a room; creator becomes owner and first member.
 - `POST /projects/{id}/members` — invite a member (owner-only for V1).
 - `POST /projects/{id}/join` — accept an invite / join the room.
 - `GET /projects/{id}/members` — list members.
-- `POST /projects/{id}/messages` / `GET /projects/{id}/messages` — the shared conversation; same mechanics as Phase 2's endpoints, project-scoped, with sender attribution.
 - `GET /projects/{id}` — room snapshot: videos, recent messages, active jobs, completed exports. This is also the reconnect/recovery path for the socket below.
+- `POST /projects/{id}/videos`, `POST /projects/{id}/messages` / `GET /projects/{id}/messages` **already exist** (Phase 1/2) and need no change — they gain multi-user meaning simply because `project_members` now exists to check against.
 
 All room endpoints enforce membership; non-members get 403/404.
 

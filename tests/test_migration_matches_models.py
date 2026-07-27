@@ -26,26 +26,76 @@ def _normalize(sql: str) -> str:
     return sql.replace("( ", "(").replace(" )", ")").replace(", ", ",")
 
 
+# Fragments that aren't a plain "column_name type ..." definition -- keyed by
+# their own text (self-keyed) rather than a column name, since ALTER COLUMN
+# never targets them and they're never individually replaced, only ever
+# present-or-absent as a whole.
+_CONSTRAINT_KEYWORDS = ("PRIMARY", "FOREIGN", "UNIQUE", "CHECK", "CONSTRAINT")
+
+# Every ALTER TABLE form the migration chain uses to modify a table after its
+# initial CREATE TABLE, matched as one pattern so they're processed in the
+# document order they actually run in -- a DROP CONSTRAINT and a later ADD
+# CONSTRAINT of the same name only resolve correctly if applied in sequence,
+# not as two independent, order-blind passes.
+_ALTER_RE = re.compile(
+    r"ALTER TABLE (?P<add_col_table>\w+) ADD COLUMN (?P<add_col_def>.+?);"
+    r"|ALTER TABLE (?P<add_con_table>\w+) ADD CONSTRAINT (?P<add_con_name>\w+) "
+    r"(?P<add_con_def>FOREIGN KEY.+?);"
+    r"|ALTER TABLE (?P<drop_con_table>\w+) DROP CONSTRAINT (?P<drop_con_name>\w+);"
+    r"|ALTER TABLE (?P<alt_col_table>\w+) ALTER COLUMN (?P<alt_col_name>\w+) "
+    r"SET NOT NULL;",
+    re.DOTALL,
+)
+
+
+def _fragment_key(fragment: str, index: int) -> str:
+    first_word = fragment.split(maxsplit=1)[0] if fragment else ""
+    if first_word.upper() in _CONSTRAINT_KEYWORDS:
+        return fragment
+    return first_word or f"_unnamed{index}"
+
+
 def _parse_create_tables(sql: str) -> dict[str, str]:
-    """Extract {table_name: normalized CREATE TABLE body} from a SQL script."""
-    tables: dict[str, str] = {}
+    """Extract {table_name: normalized CREATE TABLE body} from a SQL script,
+    replaying every ALTER TABLE against the original CREATE TABLE so a
+    column added, renamed-nullability, or constraint dropped/re-added later
+    in the migration chain is reflected exactly once, correctly, rather than
+    just accumulated as extra text."""
+    tables: dict[str, dict[str, str]] = {}
     for match in re.finditer(
         r"CREATE TABLE (\w+) \((.*?)\n\)\s*;", sql, re.DOTALL | re.IGNORECASE
     ):
         name = match.group(1)
         if name == "alembic_version":  # Alembic's own bookkeeping table
             continue
-        tables[name] = _normalize(match.group(2))
+        fragments = _normalize(match.group(2)).split(",")
+        tables[name] = {
+            _fragment_key(frag, i): frag for i, frag in enumerate(fragments)
+        }
 
-    # A later migration can add a column via ALTER TABLE instead of
-    # touching the original CREATE TABLE -- fold those in too, or an
-    # incrementally-added column would silently never be checked here.
-    for match in re.finditer(r"ALTER TABLE (\w+) ADD COLUMN (.+?);", sql):
-        name, column_def = match.group(1), match.group(2)
-        if name in tables:
-            tables[name] = f"{tables[name]},{_normalize(column_def)}"
+    for match in _ALTER_RE.finditer(sql):
+        if match.group("add_col_table") is not None:
+            name, col_def = match.group("add_col_table"), match.group("add_col_def")
+            if name in tables:
+                col_def = _normalize(col_def)
+                tables[name][_fragment_key(col_def, len(tables[name]))] = col_def
+        elif match.group("add_con_table") is not None:
+            name = match.group("add_con_table")
+            con_name, con_def = match.group("add_con_name"), match.group("add_con_def")
+            if name in tables:
+                tables[name][f"constraint:{con_name}"] = _normalize(con_def)
+        elif match.group("drop_con_table") is not None:
+            name, con_name = match.group("drop_con_table"), match.group("drop_con_name")
+            if name in tables:
+                tables[name].pop(f"constraint:{con_name}", None)
+        elif match.group("alt_col_table") is not None:
+            name, col = match.group("alt_col_table"), match.group("alt_col_name")
+            if name in tables and col in tables[name]:
+                current = tables[name][col]
+                if "NOT NULL" not in current:
+                    tables[name][col] = f"{current} NOT NULL"
 
-    return tables
+    return {name: ",".join(frags.values()) for name, frags in tables.items()}
 
 
 def _parse_create_indexes(sql: str) -> dict[str, str]:

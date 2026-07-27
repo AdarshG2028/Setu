@@ -1,5 +1,9 @@
-"""Video upload: store the bytes, create the Video row, and submit Job #1
-(video_analysis) — through JobSubmissionService, completely unmodified.
+"""Video upload: store the bytes, create the Video row under its Project,
+and submit Job #1 (video_analysis) — through JobSubmissionService,
+completely unmodified.
+
+Every video belongs to exactly one project (Video.project_id is NOT NULL,
+see backend/models/video.py); the caller must create the project first.
 
 Job #1's id isn't known until JobSubmissionService.submit() has already
 committed (it assigns Job.id internally, mid-transaction, and this service
@@ -13,11 +17,13 @@ V1, same as the other known gaps called out in the roadmap (e.g. Job
 cancellation), rather than adding complexity to close it.
 """
 
+import uuid
 from dataclasses import dataclass
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from backend.models import Job, Video
+from backend.repositories.project_repository import ProjectNotFoundError, ProjectRepository
 from backend.repositories.video_repository import VideoRepository
 from backend.services.job_submission_service import JobSubmissionService
 from backend.storage import get_storage
@@ -32,12 +38,25 @@ class VideoUploadResult:
 class VideoUploadService:
     def __init__(self, session: AsyncSession) -> None:
         self._session = session
+        self._projects = ProjectRepository(session)
         self._videos = VideoRepository(session)
 
-    async def upload(self, *, data: bytes, filename: str) -> VideoUploadResult:
+    async def upload(
+        self,
+        *,
+        project_id: uuid.UUID,
+        data: bytes,
+        filename: str,
+        name: str | None = None,
+    ) -> VideoUploadResult:
+        if await self._projects.get(project_id) is None:
+            raise ProjectNotFoundError(project_id)
+
         uri = get_storage().put(data, suggested_name=filename)
 
-        video = Video(storage_uri=uri, original_filename=filename)
+        video = Video(
+            project_id=project_id, storage_uri=uri, original_filename=filename, name=name
+        )
         self._videos.add(video)
         await self._session.flush()  # assigns video.id
 

@@ -1,18 +1,22 @@
-"""Video upload and lookup — Job #1 (video_analysis) end to end."""
+"""Video lookup by id — Job #1 (video_analysis) end to end.
+
+Creation lives under /projects/{project_id}/videos (routes/projects.py):
+every video belongs to a project, so it's created there. Reading a video by
+its own id is still a reasonable flat lookup, so GET stays here.
+"""
 
 import uuid
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, File, HTTPException, UploadFile, status
+from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from backend.api.schemas.video import VideoDetailResponse, VideoUploadResponse
+from backend.api.schemas.video import VideoDetailResponse
 from backend.database.session import get_session
 from backend.models import JobStatus
 from backend.repositories.job_repository import JobRepository
 from backend.repositories.result_repository import ResultRepository
 from backend.repositories.video_repository import VideoRepository
-from backend.services.video_upload_service import VideoUploadService
 
 router = APIRouter(prefix="/videos", tags=["videos"])
 
@@ -21,17 +25,6 @@ SessionDep = Annotated[AsyncSession, Depends(get_session)]
 # video_analysis is always stage 0 of Job #1 — a single-stage workflow.
 _ANALYSIS_STAGE = 0
 _TERMINAL_FAILURE_STATUSES = {JobStatus.FAILED, JobStatus.DEAD_LETTERED, JobStatus.CANCELLED}
-
-
-@router.post("", response_model=VideoUploadResponse, status_code=status.HTTP_201_CREATED)
-async def upload_video(
-    session: SessionDep, file: Annotated[UploadFile, File()]
-) -> VideoUploadResponse:
-    data = await file.read()
-    result = await VideoUploadService(session).upload(
-        data=data, filename=file.filename or "upload"
-    )
-    return VideoUploadResponse(video_id=result.video.id, job_id=result.job.id, status="analyzing")
 
 
 @router.get("/{video_id}", response_model=VideoDetailResponse)
@@ -56,7 +49,9 @@ async def get_video(video_id: uuid.UUID, session: SessionDep) -> VideoDetailResp
 
     return VideoDetailResponse(
         id=video.id,
+        project_id=video.project_id,
         original_filename=video.original_filename,
+        name=video.name,
         status=analysis_status,
         analysis=analysis,
         created_at=video.created_at,

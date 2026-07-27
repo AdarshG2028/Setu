@@ -30,3 +30,12 @@ class ExecutionStatus(StrEnum):
     STARTED = "started"
     SUCCEEDED = "succeeded"
     FAILED = "failed"
+
+
+class MessageRole(StrEnum):
+    USER = "user"
+    ASSISTANT = "assistant"
+    # Not produced by anything yet -- reserved for future events like
+    # "Proposal Approved" / "Job Started" / "Export Completed" so those
+    # don't require a schema change when they arrive.
+    SYSTEM = "system"

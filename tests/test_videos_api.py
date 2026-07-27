@@ -1,8 +1,9 @@
-"""End-to-end tests for POST /videos and GET /videos/{id}.
+"""End-to-end tests for POST /projects/{id}/videos and GET /videos/{id}.
 
 Runs the app's real lifespan (Kafka producer + outbox publisher), so both
 Postgres and Kafka must be reachable; skips cleanly otherwise — same
-pattern as test_jobs_api.py.
+pattern as test_jobs_api.py. Every video now belongs to a project (see
+backend/models/video.py), so each test creates one first.
 """
 
 import asyncio
@@ -14,7 +15,7 @@ from fastapi.testclient import TestClient
 from sqlalchemy.ext.asyncio import create_async_engine
 from sqlalchemy.pool import NullPool
 
-from backend.models import IdempotencyKey, Job, OutboxEvent, Result, Video, WorkerExecution
+from backend.models import IdempotencyKey, Job, OutboxEvent, Project, Result, Video, WorkerExecution
 
 pytestmark = pytest.mark.usefixtures("database_url", "kafka_bootstrap_servers")
 
@@ -51,31 +52,99 @@ async def cleanup_video_ids(database_url: str):
     await engine.dispose()
 
 
-def _upload(client: TestClient, *, filename: str = "clip.mp4", data: bytes = b"fake video bytes"):
-    return client.post("/videos", files={"file": (filename, data, "video/mp4")})
+@pytest.fixture
+async def cleanup_project_ids(database_url: str):
+    created: list[uuid.UUID] = []
+    yield created
+    if not created:
+        return
+    engine = create_async_engine(database_url, poolclass=NullPool)
+    async with engine.connect() as conn:
+        # Videos in cleanup_video_ids are already gone by the time this
+        # runs (fixture teardown order is LIFO); this only ever deletes an
+        # empty project.
+        for project_id in created:
+            await conn.execute(sa.delete(Project).where(Project.id == project_id))
+        await conn.commit()
+    await engine.dispose()
+
+
+def _create_project(client: TestClient) -> uuid.UUID:
+    response = client.post("/projects", json={"owner_id": str(uuid.uuid4())})
+    assert response.status_code == 201
+    return uuid.UUID(response.json()["id"])
+
+
+def _upload(
+    client: TestClient,
+    project_id: uuid.UUID,
+    *,
+    filename: str = "clip.mp4",
+    data: bytes = b"fake video bytes",
+    name: str | None = None,
+):
+    return client.post(
+        f"/projects/{project_id}/videos",
+        files={"file": (filename, data, "video/mp4")},
+        data={"name": name} if name is not None else None,
+    )
 
 
 def test_upload_returns_201_with_video_and_job_id(
-    client: TestClient, cleanup_video_ids: list
+    client: TestClient, cleanup_project_ids: list, cleanup_video_ids: list
 ) -> None:
-    response = _upload(client)
+    project_id = _create_project(client)
+    cleanup_project_ids.append(project_id)
+
+    response = _upload(client, project_id)
     assert response.status_code == 201
     body = response.json()
     cleanup_video_ids.append(uuid.UUID(body["video_id"]))
 
+    assert body["project_id"] == str(project_id)
     assert body["status"] == "analyzing"
+    assert body["name"] is None
     uuid.UUID(body["job_id"])  # doesn't raise
 
 
-def test_get_video_returns_analyzing_before_analysis_completes(
-    client: TestClient, cleanup_video_ids: list
+def test_upload_with_display_name_persists_and_is_readable(
+    client: TestClient, cleanup_project_ids: list, cleanup_video_ids: list
 ) -> None:
-    uploaded = _upload(client).json()
+    project_id = _create_project(client)
+    cleanup_project_ids.append(project_id)
+
+    uploaded = _upload(client, project_id, filename="raw_export_final_v3.mp4", name="Intro clip")
+    assert uploaded.status_code == 201
+    body = uploaded.json()
+    cleanup_video_ids.append(uuid.UUID(body["video_id"]))
+    assert body["name"] == "Intro clip"
+
+    detail = client.get(f"/videos/{body['video_id']}").json()
+    assert detail["name"] == "Intro clip"
+    assert detail["original_filename"] == "raw_export_final_v3.mp4"
+
+    listed = client.get(f"/projects/{project_id}/videos").json()["videos"]
+    assert listed[0]["name"] == "Intro clip"
+
+
+def test_upload_to_unknown_project_is_404(client: TestClient) -> None:
+    response = _upload(client, uuid.uuid4())
+    assert response.status_code == 404
+
+
+def test_get_video_returns_analyzing_before_analysis_completes(
+    client: TestClient, cleanup_project_ids: list, cleanup_video_ids: list
+) -> None:
+    project_id = _create_project(client)
+    cleanup_project_ids.append(project_id)
+
+    uploaded = _upload(client, project_id).json()
     cleanup_video_ids.append(uuid.UUID(uploaded["video_id"]))
 
     response = client.get(f"/videos/{uploaded['video_id']}")
     assert response.status_code == 200
     body = response.json()
+    assert body["project_id"] == str(project_id)
     assert body["original_filename"] == "clip.mp4"
     assert body["status"] in ("analyzing", "analyzed", "failed")
     # Whichever it is depends on whether a video_analysis worker happens to
@@ -89,13 +158,39 @@ def test_get_unknown_video_is_404(client: TestClient) -> None:
     assert response.status_code == 404
 
 
+def test_list_videos_returns_uploaded_videos(
+    client: TestClient, cleanup_project_ids: list, cleanup_video_ids: list
+) -> None:
+    project_id = _create_project(client)
+    cleanup_project_ids.append(project_id)
+
+    first = _upload(client, project_id, filename="first.mp4").json()
+    second = _upload(client, project_id, filename="second.mp4").json()
+    cleanup_video_ids.append(uuid.UUID(first["video_id"]))
+    cleanup_video_ids.append(uuid.UUID(second["video_id"]))
+
+    response = client.get(f"/projects/{project_id}/videos")
+    assert response.status_code == 200
+    filenames = [v["original_filename"] for v in response.json()["videos"]]
+    assert filenames == ["first.mp4", "second.mp4"]
+
+
+def test_list_videos_for_unknown_project_is_404(client: TestClient) -> None:
+    response = client.get(f"/projects/{uuid.uuid4()}/videos")
+    assert response.status_code == 404
+
+
 @pytest.mark.asyncio
 async def test_upload_creates_job1_event_published_end_to_end(
-    client: TestClient, cleanup_video_ids: list, database_url: str
+    client: TestClient, cleanup_project_ids: list, cleanup_video_ids: list, database_url: str
 ) -> None:
-    """The full chain: POST /videos -> videos row + Job #1 -> outbox row ->
-    publisher -> Kafka, mirroring test_jobs_api.py's equivalent for /jobs."""
-    uploaded = _upload(client).json()
+    """The full chain: POST /projects/{id}/videos -> videos row + Job #1 ->
+    outbox row -> publisher -> Kafka, mirroring test_jobs_api.py's
+    equivalent for /jobs."""
+    project_id = _create_project(client)
+    cleanup_project_ids.append(project_id)
+
+    uploaded = _upload(client, project_id).json()
     video_id = uuid.UUID(uploaded["video_id"])
     job_id = uuid.UUID(uploaded["job_id"])
     cleanup_video_ids.append(video_id)

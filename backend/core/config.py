@@ -63,6 +63,11 @@ class Settings(BaseSettings):
     # the same interface, not a change to this setting's callers.
     storage_local_path: str = "./data/storage"
 
+    # Most recent N messages passed to the planner as context -- a real
+    # prompt-budget decision (grows the LLM prompt linearly), so it's a
+    # named setting rather than a hardcoded number.
+    conversation_context_limit: int = 20
+
 
 @lru_cache
 def get_settings() -> Settings:
