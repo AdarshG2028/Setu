@@ -56,7 +56,16 @@ class GroqClient(LLMClient):
                     "json_schema": {
                         "name": "planner_response",
                         "schema": response_schema,
-                        "strict": True,
+                        # Not strict: "strict": true requires
+                        # additionalProperties: false on every nested
+                        # object, which can't represent ProposalStage.params
+                        # (deliberately an open dict -- each stage's real
+                        # shape is checked at runtime by validate_proposal
+                        # against the capability registry, not by this
+                        # schema). Confirmed live against Groq, 2026-07-28:
+                        # strict mode 400s on this schema; non-strict still
+                        # guides the model into valid, schema-shaped JSON.
+                        "strict": False,
                     },
                 },
             )

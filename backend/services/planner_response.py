@@ -15,7 +15,11 @@ from backend.services.proposal import Proposal
 # (item 6 -- schema-enforced, not "please return JSON"). Flat rather than a
 # oneOf on `type`, since strict structured-output modes generally require
 # every property to be present (nullable via a ["string", "null"] type)
-# rather than a conditional shape.
+# rather than a conditional shape. Sent with strict: False (see
+# llm_client.py) since ProposalStage.params is deliberately an open dict --
+# strict mode requires additionalProperties: false on every nested object,
+# which can't represent per-stage params whose real shape is checked at
+# runtime by validate_proposal, not by this schema.
 PLANNER_RESPONSE_SCHEMA: dict[str, Any] = {
     "type": "object",
     "properties": {
