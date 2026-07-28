@@ -28,6 +28,7 @@ from backend.models import Project
 from backend.repositories.project_repository import ProjectNotFoundError, ProjectRepository
 from backend.repositories.video_repository import VideoRepository
 from backend.services.conversation_service import ConversationService
+from backend.services.planner_factory import get_default_planner
 from backend.services.proposal_confirmation_service import (
     NoPendingProposalError,
     ProposalConfirmationService,
@@ -57,7 +58,9 @@ async def post_message(
     project_id: uuid.UUID, request: PostMessageRequest, session: SessionDep
 ) -> PostMessageResponse:
     try:
-        result = await ConversationService(session).post_message(
+        result = await ConversationService(
+            session, planner=get_default_planner()
+        ).post_message(
             project_id=project_id, sender_id=request.sender_id, content=request.content
         )
     except ProjectNotFoundError as exc:
