@@ -1,4 +1,5 @@
 import asyncio
+import os
 import shutil
 
 import pytest
@@ -8,6 +9,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_asyn
 
 from backend.api.main import create_app
 from backend.core.config import get_settings
+from backend.services.planner_factory import get_default_planner
 
 
 def _database_reachable(url: str) -> bool:
@@ -98,8 +100,40 @@ def kafka_bootstrap_servers() -> str:
     return servers
 
 
+@pytest.fixture(scope="session", autouse=True)
+def _no_ambient_groq_key():
+    """The test suite must stay deterministic (StaticPlanner) regardless of
+    a developer's local .env -- GROQ_API_KEY there is for manually running
+    the dev server (see planner_factory.get_default_planner), not for
+    pytest, which would otherwise make real Groq calls and break every
+    assertion written against StaticPlanner's fixed output (discovered live,
+    2026-07-28: adding a real key to .env for manual testing silently
+    flipped the whole suite over to LLMPlanner). get_settings and
+    get_default_planner are both @lru_cache, so this only works if it runs
+    before either is ever called -- session-scoped autouse, and `client`
+    below explicitly depends on it to guarantee the ordering.
+    """
+    # Set (not pop!) to an empty string: pydantic-settings' precedence is
+    # environment variable > .env file, so an *unset* os.environ var still
+    # falls through to .env's real key -- only an explicit override in
+    # os.environ actually beats it. Confirmed this the hard way: popping
+    # alone did not stop the suite from using the real key.
+    had_key = "GROQ_API_KEY" in os.environ
+    original = os.environ.get("GROQ_API_KEY")
+    os.environ["GROQ_API_KEY"] = ""
+    get_settings.cache_clear()
+    get_default_planner.cache_clear()
+    yield
+    if had_key:
+        os.environ["GROQ_API_KEY"] = original
+    else:
+        del os.environ["GROQ_API_KEY"]
+    get_settings.cache_clear()
+    get_default_planner.cache_clear()
+
+
 @pytest.fixture(scope="session")
-def client():
+def client(_no_ambient_groq_key):
     """One TestClient (one portal event loop) for the *entire test session*,
     shared by every module that hits the real app (test_jobs_api.py,
     test_videos_api.py, ...).

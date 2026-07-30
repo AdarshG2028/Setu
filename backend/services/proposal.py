@@ -13,6 +13,14 @@ from typing import Any
 @dataclass(frozen=True)
 class ProposalStage:
     stage: str
+    # Which of the project's video(s) this stage acts on, referenced by the
+    # short LLM-facing handle PlannerContext assigns (e.g. "video_1"), never
+    # a raw Video.id -- models are unreliable at echoing UUIDs verbatim.
+    # ConversationService resolves handles to real storage URIs into
+    # ExecutionContext.video_uris when building the ExecutionContext
+    # (Changelog v8). Empty for stages that don't need one yet (Phase 3's
+    # "dummy" stand-in never populated this).
+    video_ids: list[str] = field(default_factory=list)
     params: dict[str, Any] = field(default_factory=dict)
 
 
@@ -31,7 +39,11 @@ class Proposal:
         checks validate_proposal performs against the capability registry.
         """
         workflow = [
-            ProposalStage(stage=item["stage"], params=item.get("params", {}))
+            ProposalStage(
+                stage=item["stage"],
+                video_ids=item.get("video_ids", []),
+                params=item.get("params", {}),
+            )
             for item in data.get("workflow", [])
         ]
         return cls(summary=data.get("summary", ""), workflow=workflow)

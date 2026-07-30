@@ -41,7 +41,7 @@ async def test_valid_proposal_runs_to_completion_through_the_full_pipeline(sessi
     assert validation.valid is True, validation.errors
 
     workflow, payload = compile_workflow(
-        proposal, ExecutionContext(video_uri="local:///videos/test.mp4")
+        proposal, ExecutionContext(video_uris={})
     )
     assert workflow == ["dummy"]
 

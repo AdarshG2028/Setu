@@ -39,6 +39,11 @@ class PostMessageResponse(BaseModel):
     response: PlannerResponse
 
 
+class ConfirmProposalResponse(BaseModel):
+    job_id: uuid.UUID
+    replayed: bool
+
+
 class MessageResponse(BaseModel):
     id: uuid.UUID
     role: str

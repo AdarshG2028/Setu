@@ -15,6 +15,7 @@ from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile, s
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from backend.api.schemas.conversation import (
+    ConfirmProposalResponse,
     ConversationHistoryResponse,
     MessageResponse,
     PostMessageRequest,
@@ -27,6 +28,11 @@ from backend.models import Project
 from backend.repositories.project_repository import ProjectNotFoundError, ProjectRepository
 from backend.repositories.video_repository import VideoRepository
 from backend.services.conversation_service import ConversationService
+from backend.services.planner_factory import get_default_planner
+from backend.services.proposal_confirmation_service import (
+    NoPendingProposalError,
+    ProposalConfirmationService,
+)
 from backend.services.video_upload_service import VideoUploadService
 
 router = APIRouter(prefix="/projects", tags=["projects"])
@@ -52,7 +58,9 @@ async def post_message(
     project_id: uuid.UUID, request: PostMessageRequest, session: SessionDep
 ) -> PostMessageResponse:
     try:
-        result = await ConversationService(session).post_message(
+        result = await ConversationService(
+            session, planner=get_default_planner()
+        ).post_message(
             project_id=project_id, sender_id=request.sender_id, content=request.content
         )
     except ProjectNotFoundError as exc:
@@ -111,6 +119,21 @@ async def upload_video(
         name=result.video.name,
         status="analyzing",
     )
+
+
+@router.post("/{project_id}/confirm-proposal", response_model=ConfirmProposalResponse)
+async def confirm_proposal(project_id: uuid.UUID, session: SessionDep) -> ConfirmProposalResponse:
+    try:
+        result = await ProposalConfirmationService(session).confirm(project_id)
+    except ProjectNotFoundError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="project not found"
+        ) from exc
+    except NoPendingProposalError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT, detail="no pending proposal to confirm"
+        ) from exc
+    return ConfirmProposalResponse(job_id=result.job.id, replayed=result.replayed)
 
 
 @router.get("/{project_id}/videos", response_model=VideoListResponse)

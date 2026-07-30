@@ -68,6 +68,15 @@ class Settings(BaseSettings):
     # named setting rather than a hardcoded number.
     conversation_context_limit: int = 20
 
+    # LLMPlanner's provider (Changelog v8). Model must be on Groq's
+    # structured-outputs supported-models list (response_format=json_schema)
+    # -- see https://console.groq.com/docs/structured-outputs#supported-models.
+    groq_api_key: str = ""
+    # llama-3.3-70b-versatile does NOT support response_format=json_schema
+    # despite being Groq's most commonly used default (confirmed live,
+    # 2026-07-28: 400 invalid_request_error) -- openai/gpt-oss-20b does.
+    groq_model: str = "openai/gpt-oss-20b"
+
 
 @lru_cache
 def get_settings() -> Settings:
