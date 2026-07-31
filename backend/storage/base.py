@@ -37,6 +37,18 @@ class Storage(ABC):
         """Whether this URI refers to something this backend has stored."""
 
     @abstractmethod
+    def size(self, uri: str) -> int:
+        """Size in bytes.
+
+        Needed to serve HTTP range requests: both Content-Length and the
+        total in Content-Range require knowing it up front, and a video
+        element cannot seek without them. An S3-backed implementation gets
+        this from head_object rather than by reading the object.
+
+        Raises StorageObjectNotFoundError if the URI is unknown.
+        """
+
+    @abstractmethod
     def open_stream(self, uri: str) -> BinaryIO:
         """Open the stored object for incremental reading.
 

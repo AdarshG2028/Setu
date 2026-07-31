@@ -34,6 +34,12 @@ class LocalDiskStorage(Storage):
         path = self._path_for(uri)
         return path is not None and path.is_file()
 
+    def size(self, uri: str) -> int:
+        path = self._path_for(uri)
+        if path is None or not path.is_file():
+            raise StorageObjectNotFoundError(uri)
+        return path.stat().st_size
+
     def open_stream(self, uri: str) -> BinaryIO:
         path = self._path_for(uri)
         if path is None or not path.is_file():
