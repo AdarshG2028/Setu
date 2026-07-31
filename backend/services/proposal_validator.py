@@ -92,6 +92,25 @@ def validate_proposal(
         available_kinds.update(capability.produces_asset_kinds)
 
         if known_video_handles is not None:
+            # A stage gets its input either from the stage before it or,
+            # when nothing precedes it, from the video it names. So the
+            # first stage of a workflow must name one -- an empty
+            # video_ids there passes every other check and then dies at
+            # execution time with "no input video", which is precisely
+            # the failure this validator exists to convert into something
+            # the planner can fix. Observed live: a proposal for
+            # [crop, render] with no video_ids validated cleanly and
+            # dead-lettered.
+            #
+            # Gated on known_video_handles because that is what tells us
+            # a project's videos were actually resolvable; callers with
+            # no video context (Phase 3's hand-authored proposals) are
+            # unaffected.
+            if index == 0 and not item.video_ids and "video" in capability.requires_asset_kinds:
+                errors.append(
+                    f"stage '{item.stage}' is first in the workflow and must name the "
+                    f"video it applies to in video_ids"
+                )
             for video_id in item.video_ids:
                 if video_id not in known_video_handles:
                     errors.append(

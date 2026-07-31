@@ -12,6 +12,9 @@ class ConversationRepository:
     def __init__(self, session: AsyncSession) -> None:
         self._session = session
 
+    async def get(self, conversation_id: uuid.UUID) -> Conversation | None:
+        return await self._session.get(Conversation, conversation_id)
+
     def add(self, conversation: Conversation) -> None:
         self._session.add(conversation)
 

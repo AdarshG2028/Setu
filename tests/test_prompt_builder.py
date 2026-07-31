@@ -120,3 +120,61 @@ def test_capabilities_without_parameters_render_no_parameter_line() -> None:
     )
 
     assert "parameters:" not in _system_for(registry)
+
+
+# --- stored preferences (Phase 6) ------------------------------------------
+
+
+def _system_with_preferences(preferences) -> str:
+    context = PlannerContext(
+        project=None,
+        conversation_history=[],
+        videos=[],
+        preferences=preferences,
+        capability_registry=DEFAULT_CAPABILITY_REGISTRY,
+        approval_policy=None,
+    )
+    return PromptBuilder().build(context).system
+
+
+def test_preferences_render_as_readable_facts_not_an_object_repr() -> None:
+    """This branch used to interpolate the ORM object, so the planner was
+    handed `<UserPreference object at 0x...>` and ignored it. The bug
+    survived because nothing wrote preferences until Phase 6 — every prior
+    run had none, so the branch never produced anything meaningful."""
+    from backend.models import UserPreference
+
+    system = _system_with_preferences(
+        UserPreference(
+            user_id=uuid.uuid4(), preferred_platform="linkedin", preferred_export_format="mp4"
+        )
+    )
+
+    assert "object at 0x" not in system
+    assert "linkedin" in system
+    assert "mp4" in system
+
+
+def test_only_set_preferences_are_rendered() -> None:
+    """A line saying a preference is unset is noise that invites the model
+    to treat absence as a decision."""
+    from backend.models import UserPreference
+
+    system = _system_with_preferences(
+        UserPreference(user_id=uuid.uuid4(), preferred_platform="tiktok")
+    )
+
+    assert "tiktok" in system
+    assert "resolution" not in system.lower().split("what this user has told you")[-1]
+
+
+def test_a_user_with_no_preferences_adds_nothing() -> None:
+    from backend.models import UserPreference
+
+    system = _system_with_preferences(UserPreference(user_id=uuid.uuid4()))
+
+    assert "told you before" not in system
+
+
+def test_no_preferences_object_adds_nothing() -> None:
+    assert "told you before" not in _system_with_preferences(None)

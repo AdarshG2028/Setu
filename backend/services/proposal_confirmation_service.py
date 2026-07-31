@@ -30,6 +30,7 @@ from backend.repositories.message_repository import MessageRepository
 from backend.repositories.project_repository import ProjectNotFoundError, ProjectRepository
 from backend.repositories.video_repository import VideoRepository
 from backend.services.job_submission_service import JobSubmissionResult, JobSubmissionService
+from backend.services.memory_update_service import CONVERSATION_ID_KEY
 from backend.services.planner_context import build_video_contexts
 from backend.services.proposal import Proposal
 from backend.services.workflow_compiler import (
@@ -100,6 +101,14 @@ class ProposalConfirmationService:
         workflow, payload = compile_workflow(
             proposal, ExecutionContext(video_uris=video_uris, preview=preview)
         )
+        # Setu's Job is generic infrastructure and carries no link back to
+        # a conversation, so Phase 6's memory update has no way to find the
+        # transcript that produced this job. Stamping it here is the
+        # cheapest bridge; underscore-prefixed to mark it as job metadata
+        # rather than worker input, like the existing _preview flag.
+        # Deterministic, so it does not disturb the idempotency hash.
+        # Phase 8's project_jobs table supersedes this.
+        payload[CONVERSATION_ID_KEY] = str(conversation.id)
 
         # Separate namespaces, so previewing a proposal and then confirming
         # it produce two distinct jobs rather than the confirm replaying the

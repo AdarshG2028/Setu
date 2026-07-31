@@ -6,6 +6,7 @@ need, so this table is never re-parented later.
 """
 
 import uuid
+from datetime import datetime
 
 import sqlalchemy as sa
 from sqlalchemy.orm import Mapped, mapped_column
@@ -20,6 +21,18 @@ class Conversation(Base, TimestampMixin):
 
     project_id: Mapped[uuid.UUID] = mapped_column(
         sa.Uuid, sa.ForeignKey("projects.id", ondelete="CASCADE"), nullable=False
+    )
+
+    # Set the first time POST /jobs/{id}/update-memory runs for this
+    # conversation (Phase 6). Presence is what makes that endpoint
+    # idempotent: a second call returns immediately rather than paying for
+    # another LLM round-trip and re-writing the same preferences.
+    #
+    # A timestamp rather than a boolean because it costs the same and
+    # answers "when did we last learn something from this thread", which
+    # a flag cannot.
+    memory_processed_at: Mapped[datetime | None] = mapped_column(
+        sa.DateTime(timezone=True), nullable=True
     )
 
     __table_args__ = (

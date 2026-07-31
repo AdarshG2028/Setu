@@ -11,7 +11,7 @@ from backend.api.schemas.artifact import (
     JobArtifactsResponse,
     StageArtifactsResponse,
 )
-from backend.api.schemas.job import JobCreateRequest, JobResponse
+from backend.api.schemas.job import JobCreateRequest, JobResponse, MemoryUpdateResponse
 from backend.database.session import get_session
 from backend.repositories.job_repository import JobRepository
 from backend.repositories.result_repository import ResultRepository
@@ -19,6 +19,11 @@ from backend.services.job_submission_service import (
     IdempotencyConflictError,
     JobSubmissionService,
 )
+from backend.services.memory_update_service import (
+    JobNotFoundError,
+    MemoryUpdateService,
+)
+from backend.services.planner_factory import get_default_memory_extractor
 
 # The one canonical parser for the asset payload shape lives in media.py.
 # StageProcessingService deliberately abstains from importing it (Setu's
@@ -91,4 +96,32 @@ async def get_job_artifacts(job_id: uuid.UUID, session: SessionDep) -> JobArtifa
             )
             for result in results
         ],
+    )
+
+
+@router.post("/{job_id}/update-memory", response_model=MemoryUpdateResponse)
+async def update_memory(job_id: uuid.UUID, session: SessionDep) -> MemoryUpdateResponse:
+    """Learn any durable preferences from the conversation behind a
+    finished job.
+
+    Called explicitly by the client once its normal GET /jobs/{id} poll
+    shows `completed` — rather than triggered from that GET, which stays
+    read-only with no hidden side effects.
+
+    Safe to call repeatedly: `conversations.memory_processed_at` gates the
+    work, so a double-poll, a retry or a second browser tab all land on
+    the same outcome and only the first pays for an LLM call. A failed
+    extraction still returns success, because the *job* succeeded and
+    failing to learn from it is not the user's problem.
+    """
+    try:
+        result = await MemoryUpdateService(
+            session, get_default_memory_extractor()
+        ).update_from_job(job_id)
+    except JobNotFoundError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="job not found"
+        ) from exc
+    return MemoryUpdateResponse(
+        processed=result.processed, updated_fields=result.updated_fields
     )

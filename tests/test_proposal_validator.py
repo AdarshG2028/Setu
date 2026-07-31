@@ -329,3 +329,59 @@ def test_string_is_still_rejected_for_a_float_param() -> None:
     )
 
     assert validate_proposal(proposal, _REGISTRY).valid is False
+
+
+def test_first_stage_must_name_the_video_it_applies_to() -> None:
+    """Observed live in Phase 6: the planner proposed [crop, render] with
+    empty video_ids. Every other check passed, then stage 0 dead-lettered
+    with "no input video" — the exact failure this validator exists to
+    turn into something the planner can fix instead."""
+    proposal = Proposal(
+        summary="crop it",
+        workflow=[ProposalStage(stage="crop", video_ids=[], params={"aspect_ratio": "1:1"})],
+    )
+
+    result = validate_proposal(
+        proposal, _REGISTRY, known_video_handles=frozenset({"video_1"})
+    )
+
+    assert result.valid is False
+    assert any("video_ids" in error for error in result.errors)
+
+
+def test_later_stages_need_no_video_ids() -> None:
+    """They take their input from the stage before them, so naming a video
+    is meaningless there — only the first stage has nothing upstream."""
+    proposal = Proposal(
+        summary="crop then grade",
+        workflow=[
+            ProposalStage(stage="crop", video_ids=["video_1"], params={"aspect_ratio": "1:1"}),
+            ProposalStage(stage="color", video_ids=[], params={"brightness": 0.2}),
+        ],
+    )
+
+    result = validate_proposal(
+        proposal, _REGISTRY, known_video_handles=frozenset({"video_1"})
+    )
+
+    assert result.valid is True, result.errors
+
+
+def test_a_first_stage_needing_no_video_is_exempt() -> None:
+    """dummy declares it consumes nothing, so requiring it to name a video
+    would be wrong."""
+    registry = CapabilityRegistry(
+        {
+            "dummy": StageCapability(
+                name="dummy",
+                description="no-op",
+                requires_asset_kinds=(),
+                produces_asset_kinds=(),
+            )
+        }
+    )
+    proposal = Proposal(summary="...", workflow=[ProposalStage(stage="dummy", video_ids=[])])
+
+    assert validate_proposal(
+        proposal, registry, known_video_handles=frozenset({"video_1"})
+    ).valid is True

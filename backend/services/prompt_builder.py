@@ -28,6 +28,50 @@ _ROLE_TO_CHAT_ROLE = {
 # names it actually reasons about.
 _JSON_TYPE_NAMES = {str: "string", int: "integer", float: "number", bool: "boolean"}
 
+# How each stored preference reads to the planner. Phrased as a fact about
+# the user rather than a column name, since that is what the model reasons
+# over.
+_PREFERENCE_LABELS = (
+    ("preferred_platform", "publishes to"),
+    ("preferred_export_format", "wants exports as"),
+    ("preferred_resolution", "wants resolution"),
+    ("subtitle_language", "wants subtitles in"),
+)
+
+
+def _render_preferences(preferences: object | None) -> list[str]:
+    """Standing preferences, as lines the planner can actually read.
+
+    This used to interpolate the ORM object directly, which rendered as
+    `<UserPreference object at 0x...>` -- the model was being handed a
+    Python repr and, unsurprisingly, ignored it. The bug survived because
+    nothing wrote preferences until Phase 6, so every prior run had none
+    and the branch never produced anything meaningful.
+
+    Only fields that are actually set are rendered: a line saying a
+    preference is unset is noise that invites the model to treat absence
+    as a decision.
+    """
+    if preferences is None:
+        return []
+
+    facts = [
+        f"- {label}: {value}"
+        for field, label in _PREFERENCE_LABELS
+        if (value := getattr(preferences, field, None))
+    ]
+    if getattr(preferences, "captions_enabled", False):
+        facts.append("- always wants captions burned in")
+
+    if not facts:
+        return []
+    return [
+        "What this user has told you before, in earlier sessions. Apply these "
+        "unless the current request says otherwise, and do not ask about them "
+        "again:",
+        *facts,
+    ]
+
 
 class PromptBuilder:
     def build(
@@ -86,9 +130,10 @@ class PromptBuilder:
                 )
                 lines.append(f"  parameters: {rendered}")
 
-        if context.preferences is not None:
+        rendered_preferences = _render_preferences(context.preferences)
+        if rendered_preferences:
             lines.append("")
-            lines.append(f"User preferences: {context.preferences}")
+            lines.extend(rendered_preferences)
 
         if context.approval_policy is not None:
             lines.append("")

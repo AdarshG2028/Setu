@@ -37,3 +37,12 @@ class JobResponse(BaseModel):
             max_attempts=job.max_attempts,
             created_at=job.created_at,
         )
+
+
+class MemoryUpdateResponse(BaseModel):
+    """`processed` is False when the call did no work — already processed,
+    the job isn't finished, or the conversation revealed nothing durable.
+    All are successes, not errors."""
+
+    processed: bool
+    updated_fields: list[str]

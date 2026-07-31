@@ -81,6 +81,12 @@ DEFAULT_CAPABILITY_REGISTRY = CapabilityRegistry(
                 "end to end. Not a real editing operation."
             ),
             parameter_schema={},
+            # Genuinely consumes and produces nothing -- the defaults
+            # would claim a video it never reads, which now matters:
+            # validate_proposal requires the first stage to name a video
+            # when it declares that it needs one.
+            requires_asset_kinds=(),
+            produces_asset_kinds=(),
         ),
         # Descriptions here are the planner's entire understanding of a
         # capability -- it never sees the worker. So they say what the stage

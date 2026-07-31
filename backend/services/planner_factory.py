@@ -24,3 +24,25 @@ def get_default_planner() -> Planner:
         return StaticPlanner()
     client = GroqClient(api_key=settings.groq_api_key, model=settings.groq_model)
     return LLMPlanner(client)
+
+
+@lru_cache
+def get_default_memory_extractor() -> "MemoryExtractor | None":
+    """The MemoryExtractor the running API uses, or None when no LLM is
+    configured.
+
+    None rather than a stub: unlike planning, which has StaticPlanner as a
+    genuine fallback that keeps the conversation loop working, there is no
+    meaningful non-LLM way to tell a durable preference from a one-off
+    instruction. MemoryUpdateService treats None as "nothing to learn"
+    and marks the conversation processed, so a checkout without a key
+    still serves the endpoint successfully instead of erroring.
+    """
+    from backend.services.memory_extractor import MemoryExtractor
+
+    settings = get_settings()
+    if not settings.groq_api_key:
+        return None
+    return MemoryExtractor(
+        GroqClient(api_key=settings.groq_api_key, model=settings.groq_model)
+    )
