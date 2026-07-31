@@ -1,3 +1,5 @@
+import pytest
+
 from backend.services.capability_registry import (
     DEFAULT_CAPABILITY_REGISTRY,
     CapabilityRegistry,
@@ -50,3 +52,43 @@ def test_constructor_accepts_a_seed_dict() -> None:
 def test_default_registry_has_the_dummy_stand_in_stage() -> None:
     assert DEFAULT_CAPABILITY_REGISTRY.exists("dummy") is True
     assert DEFAULT_CAPABILITY_REGISTRY.get("dummy").parameter_schema == {}
+
+
+def test_asset_kinds_default_to_video_in_video_out() -> None:
+    """The common case needs no declaration: crop/color/audio/trim/render
+    all take a video and return one. Only the transcript pair diverges."""
+    capability = StageCapability(name="crop", description="crop a video")
+
+    assert capability.requires_asset_kinds == ("video",)
+    assert capability.produces_asset_kinds == ("video",)
+
+
+def test_asset_kinds_can_declare_a_producer_consumer_pair() -> None:
+    """The shape 5F relies on: transcribe emits an srt alongside the video
+    it passes through, and burn_subtitles consumes that srt."""
+    transcribe = StageCapability(
+        name="transcribe",
+        description="transcribe speech",
+        produces_asset_kinds=("video", "transcript", "srt"),
+    )
+    burn = StageCapability(
+        name="burn_subtitles",
+        description="burn captions in",
+        requires_asset_kinds=("video", "srt"),
+    )
+
+    assert "srt" in transcribe.produces_asset_kinds
+    assert "srt" in burn.requires_asset_kinds
+
+
+def test_asset_kind_defaults_are_immutable_and_unshared() -> None:
+    """Tuples rather than lists, so the default can be a plain value: two
+    capabilities can't end up aliasing one mutable default list, and no
+    caller can mutate a capability's declared kinds in place."""
+    first = StageCapability(name="crop", description="crop")
+    second = StageCapability(name="color", description="color")
+
+    assert first.requires_asset_kinds is second.requires_asset_kinds
+    assert isinstance(first.requires_asset_kinds, tuple)
+    with pytest.raises(AttributeError):
+        first.requires_asset_kinds.append("srt")  # type: ignore[attr-defined]

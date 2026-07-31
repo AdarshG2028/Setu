@@ -8,7 +8,7 @@ plugins that workers run, not the point of the system.
 
 - Python 3.13 and [uv](https://docs.astral.sh/uv/)
 - Docker (for Postgres and the Kafka-compatible broker only)
-- [ffmpeg](https://ffmpeg.org/download.html) (`ffprobe` on PATH) — needed to run the `video_analysis` worker; not required for the API or other workers.
+- [ffmpeg](https://ffmpeg.org/download.html) (both `ffmpeg` and `ffprobe` on PATH) — required by `video_analysis` and by every media capability (crop, color, audio, render, …), which shell out to it directly rather than through a Python wrapper. Not needed to run the API itself, and tests that shell out skip cleanly when it's absent.
 
 Python runs on the host via uv; Docker is used for backing services.
 

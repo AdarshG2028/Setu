@@ -21,8 +21,16 @@ from backend.core.config import get_settings
 from backend.database.session import get_sessionmaker
 from backend.observability.logging import configure_logging
 from backend.observability.tracing import configure_tracing
+from backend.workers.color_worker import ColorWorker
+from backend.workers.crop_worker import CropWorker
 from backend.workers.dummy_worker import DummyWorker
 from backend.workers.runner import WorkerRunner
+from backend.workers.transform_workers import (
+    FlipWorker,
+    PadWorker,
+    ResizeWorker,
+    RotateWorker,
+)
 from backend.workers.stage_workers import (
     FrameExtractionWorker,
     GroundingDinoWorker,
@@ -35,8 +43,14 @@ from backend.workers.stage_workers import (
 from backend.workers.video_analysis_worker import VideoAnalysisWorker
 
 WORKERS = {
+    "color": ColorWorker,
+    "crop": CropWorker,
     "dummy": DummyWorker,
+    "flip": FlipWorker,
     "frame_extraction": FrameExtractionWorker,
+    "pad": PadWorker,
+    "resize": ResizeWorker,
+    "rotate": RotateWorker,
     "vision_detection": VisionDetectionWorker,
     "grounding_dino": GroundingDinoWorker,
     "sam2": Sam2Worker,

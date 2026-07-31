@@ -6,6 +6,7 @@ nothing outside this module would change.
 
 import uuid
 from pathlib import Path
+from typing import BinaryIO
 
 from backend.storage.base import Storage, StorageObjectNotFoundError
 
@@ -32,6 +33,12 @@ class LocalDiskStorage(Storage):
     def exists(self, uri: str) -> bool:
         path = self._path_for(uri)
         return path is not None and path.is_file()
+
+    def open_stream(self, uri: str) -> BinaryIO:
+        path = self._path_for(uri)
+        if path is None or not path.is_file():
+            raise StorageObjectNotFoundError(uri)
+        return path.open("rb")
 
     def _path_for(self, uri: str) -> Path | None:
         """Resolves a URI to a filesystem path, or None if it can't possibly

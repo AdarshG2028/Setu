@@ -19,5 +19,14 @@ class ResultRepository:
         )
         return result.scalar_one_or_none()
 
+    async def list_by_job(self, job_id: uuid.UUID) -> list[Result]:
+        """Every stage's result, in execution order — the artifact listing
+        reads this to show what each stage produced, not just the final
+        output."""
+        result = await self._session.execute(
+            select(Result).where(Result.job_id == job_id).order_by(Result.stage)
+        )
+        return list(result.scalars().all())
+
     def add(self, result: Result) -> None:
         self._session.add(result)

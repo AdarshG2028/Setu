@@ -5,6 +5,12 @@ Collects every error found rather than stopping at the first: Phase 4's
 regenerate-and-retry loop feeds the full ValidationResult back into the
 planner's prompt, and "unknown stage 'crp', unknown param 'britness' on
 'color'" is a better retry signal than one error at a time.
+
+Everything checked here is checked *before* a job exists, which is the
+point: a proposal the planner can still fix should fail in this loop,
+not halfway through execution where the only outcome left is a DLQ'd job
+and a user with no output. That's why the asset-availability scan below
+lives here rather than being discovered by a worker at runtime.
 """
 
 from dataclasses import dataclass, field
@@ -22,31 +28,82 @@ class ValidationResult:
     errors: list[str] = field(default_factory=list)
 
 
+def _matches_type(value: object, expected_type: type) -> bool:
+    """Type check for a param, tolerant of how JSON represents numbers.
+
+    A plain isinstance() is wrong at this boundary in two directions:
+
+    - JSON has a single number type, so a planner writes `1` as readily as
+      `1.0` for a float param -- and `isinstance(1, float)` is False. That
+      would reject a perfectly good brightness of 1 and send the planner
+      round the regenerate loop over nothing.
+    - Python's bool is a subclass of int, so `isinstance(True, int)` is
+      True and a param declared int would silently accept `true`.
+
+    Both are handled here rather than by loosening the declared schemas,
+    which stay the honest description of what a capability wants.
+    """
+    if expected_type is float:
+        return isinstance(value, (int, float)) and not isinstance(value, bool)
+    if expected_type is int:
+        return isinstance(value, int) and not isinstance(value, bool)
+    return isinstance(value, expected_type)
+
+
 def validate_proposal(
-    proposal: Proposal, registry: CapabilityRegistry = DEFAULT_CAPABILITY_REGISTRY
+    proposal: Proposal,
+    registry: CapabilityRegistry = DEFAULT_CAPABILITY_REGISTRY,
+    *,
+    known_video_handles: frozenset[str] | None = None,
 ) -> ValidationResult:
     if not proposal.workflow:
         return ValidationResult(valid=False, errors=["workflow must not be empty"])
 
     errors: list[str] = []
-    seen_stages: set[str] = set()
 
-    for item in proposal.workflow:
-        if item.stage in seen_stages:
-            errors.append(f"duplicate stage '{item.stage}' is not allowed")
-        seen_stages.add(item.stage)
+    # Seeded with "video" because every workflow starts from an uploaded
+    # video -- the first stage has one available without any predecessor
+    # having produced it.
+    #
+    # Walked in order and only ever added to, mirroring the monotonic
+    # accumulation workers actually perform (media.forward_assets): a
+    # stage passes on everything it received, so an asset produced at
+    # stage 1 is still available at stage 5 with unrelated stages in
+    # between. That's what makes `transcribe -> color -> burn_subtitles`
+    # valid, and why this can't be a simple "is the previous stage the
+    # right one" adjacency check.
+    available_kinds: set[str] = {"video"}
 
+    for index, item in enumerate(proposal.workflow):
         capability = registry.get(item.stage)
         if capability is None:
             errors.append(f"unknown stage '{item.stage}'")
             continue
+
+        missing = [
+            kind for kind in capability.requires_asset_kinds if kind not in available_kinds
+        ]
+        if missing:
+            errors.append(
+                f"stage '{item.stage}' (position {index}) needs "
+                f"{', '.join(f'{kind!r}' for kind in missing)} but nothing before it "
+                f"produces that"
+            )
+        available_kinds.update(capability.produces_asset_kinds)
+
+        if known_video_handles is not None:
+            for video_id in item.video_ids:
+                if video_id not in known_video_handles:
+                    errors.append(
+                        f"unknown video handle '{video_id}' for stage '{item.stage}'"
+                    )
 
         for key, value in item.params.items():
             if key not in capability.parameter_schema:
                 errors.append(f"unknown param '{key}' for stage '{item.stage}'")
                 continue
             expected_type = capability.parameter_schema[key]
-            if not isinstance(value, expected_type):
+            if not _matches_type(value, expected_type):
                 errors.append(
                     f"param '{key}' for stage '{item.stage}' must be "
                     f"{expected_type.__name__}, got {type(value).__name__}"

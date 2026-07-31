@@ -1,5 +1,6 @@
 import asyncio
 import os
+import re
 import shutil
 
 import pytest
@@ -100,6 +101,61 @@ def kafka_bootstrap_servers() -> str:
     return servers
 
 
+# Every Kafka-touching test names its topic with a fresh uuid4 so runs can't
+# collide. Nothing deleted them, so they accumulated in the dev Redpanda
+# across every run ever made against it -- and Redpanda's compose config
+# (--memory=1G --smp=1) caps it at 256 partitions. Past that limit topic
+# creation starts failing and Kafka tests fail with InvalidPartitionsError:
+# spurious failures that look exactly like a real regression, in tests
+# unrelated to whatever was actually being changed. This has already cost
+# two debugging detours.
+_EPHEMERAL_TOPIC = re.compile(
+    r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", re.IGNORECASE
+)
+
+
+async def _delete_ephemeral_topics(servers: str) -> int:
+    from aiokafka.admin import AIOKafkaAdminClient
+
+    admin = AIOKafkaAdminClient(bootstrap_servers=servers)
+    try:
+        await admin.start()
+    except Exception:
+        return 0  # Kafka isn't up; there's nothing to have cleaned.
+    try:
+        # Matches anywhere in the name, so a "<uuid-topic>.dlq" sibling --
+        # created implicitly by the harness, never named by a test -- is
+        # collected too. Real topics (crop, video_analysis, dummy, ...)
+        # carry no uuid and are never touched.
+        doomed = [topic for topic in await admin.list_topics() if _EPHEMERAL_TOPIC.search(topic)]
+        if doomed:
+            await admin.delete_topics(doomed)
+        return len(doomed)
+    except Exception:
+        return 0
+    finally:
+        await admin.close()
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _purge_ephemeral_kafka_topics():
+    """Delete this run's throwaway Kafka topics once the session ends.
+
+    Session-scoped and pattern-based rather than per-test cleanup: the
+    `.dlq` topics are created by the worker harness, not by the test that
+    named the parent topic, so a test tidying up only what it explicitly
+    created would leave half the mess behind. Silently does nothing when
+    Kafka is unreachable, so the no-Docker workflow is unaffected.
+    """
+    yield
+    try:
+        cleaned = asyncio.run(_delete_ephemeral_topics(get_settings().kafka_bootstrap_servers))
+    except Exception:
+        return
+    if cleaned:
+        print(f"\n[conftest] deleted {cleaned} ephemeral Kafka topic(s)")
+
+
 @pytest.fixture(scope="session", autouse=True)
 def _no_ambient_groq_key():
     """The test suite must stay deterministic (StaticPlanner) regardless of
@@ -161,5 +217,18 @@ def ffprobe_available() -> None:
     if shutil.which("ffprobe") is None:
         pytest.skip(
             "ffprobe not on PATH — install ffmpeg to run this test",
+            allow_module_level=True,
+        )
+
+
+@pytest.fixture(scope="session")
+def ffmpeg_available() -> None:
+    """Phase 5's media capabilities shell out to a real ffmpeg binary.
+    Separate from ffprobe_available because they're separate binaries: a
+    given box can have one without the other, and a test that only probes
+    shouldn't skip because ffmpeg is missing (or vice versa)."""
+    if shutil.which("ffmpeg") is None:
+        pytest.skip(
+            "ffmpeg not on PATH — install ffmpeg to run this test",
             allow_module_level=True,
         )

@@ -8,7 +8,7 @@ from typing import AsyncIterator
 from fastapi import FastAPI
 from prometheus_client import make_asgi_app
 
-from backend.api.routes import health, jobs, projects, videos
+from backend.api.routes import artifacts, health, jobs, projects, videos
 from backend.core.config import Settings, get_settings
 from backend.database.session import get_sessionmaker
 from backend.messaging.kafka_producer import build_producer
@@ -68,6 +68,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         debug=settings.debug,
         lifespan=lifespan,
     )
+    app.include_router(artifacts.router)
     app.include_router(health.router)
     app.include_router(jobs.router)
     app.include_router(videos.router)

@@ -66,6 +66,33 @@ Architectural refinement pass before Phase 4 implementation started (2026-07-27)
 - **Deferred to Phase 8/9**: proposal persistence, proposal version history, proposal revisions, a real approval engine, collaborative proposal editing, proposal ownership, multiple proposal versions, and any `proposals`-table-shaped DB model beyond what Phase 4 needs (which is none — see confirm-proposal above).
 - **General posture note, generalizing the v3/v4 changelog's "Setu core unmodified is a strong default, not absolute, from Phase 8 on":** that posture applies at *any* phase when there's a genuinely good reason, including Phase 4, despite Phase 4's own stated philosophy of "nothing in Setu's execution engine changes." In this pass specifically, no Setu-core change was needed — `Job.payload` is an opaque `dict[str, Any]` never inspected by `JobSubmissionService`/`StageProcessingService`/the workflow engine, so the `ExecutionContext`/`ProposalStage` reshape above is entirely contained to this project's own Phase-3-owned files. Recorded as a posture clarification, not because this pass needed to exercise it.
 
+## Changelog from v9
+
+Prompted by a user question (2026-07-30, after Phase 4's implementation was manually live-tested): since Phases 8 and 9 were bolted on (2026-07-24) after Phases 5–7 were already planned, should the resulting Phase 5→9b sequence be restructured for efficiency? A review of every phase's stated "Why after Phase X" dependency found Phases 5→6→7 and 8→9a both genuine and load-bearing — no change needed there. One dependency was artificial:
+
+- **Phase 9b's dependency on 9a is corrected: it only ever needed job ownership, not the approval/proposal machinery.** `project_jobs` (Phase 8) gains a `submitted_by_user_id` column, captured at submission time regardless of whether that submission came from Phase 4/8's plain `confirm-proposal` or Phase 9a's approval-triggered path. Phase 9b's authorization check now reads this column directly, not `proposals.created_by_user_id` — so 9b's true prerequisite is Phase 8, not 9a. It stays listed after 9a in the roadmap only because both are grouped as the "Phase 9" collaboration-and-execution-control bundle for review purposes (the same reasoning the v4 changelog gave for splitting 9 into 9a/9b), not because of a hard technical dependency. (§19 Phase 8, Phase 9a, Phase 9b)
+- **Deliberately left unchanged:** the macro order 5→6→7→8→9a→9b — a targeted fix was chosen over a broader reorder. Also deliberately not pulled earlier: Phase 8 itself, despite its real technical prerequisites (project-scoping, sender-attributed messages) landing as early as Phase 1/2 — building collaboration on top of the `dummy` stage with no memory loop or frontend would be a weaker demo, and that tradeoff wasn't what was asked for here.
+
+## Changelog from v10
+
+Phase 5 architecture review (2026-07-31), user-directed, before any Phase 5 code was written. Phase 5 is rewritten; Phases 7, 9a, 10 and §20 are updated in consequence.
+
+- **Phase 5 restructured around capabilities on an asset model**, replacing the five-worker Crop/Color/Audio/Subtitle/Export plan with seven sub-phases (5A infrastructure, 5B spatial transforms, 5C adjustments, 5D audio, 5E temporal/structural, 5F transcript/subtitles, 5G render). Stages now produce **typed assets** (`video`/`transcript`/`srt`/…) rather than an implicit single video — necessary because transcription produces no video, and no single `output_uri` key extends to that. (§19 Phase 5)
+- **"Capabilities not workers" required no restructuring — it was already the architecture.** The planner only ever sees `CapabilityRegistry`/`StageCapability` and never imports `backend.workers`; `Worker` already is the internal implementation a capability is expressed through. Recorded because the question was asked and the answer is "already satisfied," not "deferred."
+- **Chaining stays worker-side via `previous_output`, deliberately not moved into `WorkflowEngine`.** The engine documents a real invariant (never imports from `backend/workers/`, treats `message.payload` as opaque); `previous_output` is Setu's existing purpose-built mechanism for stage-to-stage handoff. Implemented as **monotonic asset accumulation**, which also removes any adjacency requirement between a producing and consuming stage. Note this was evaluated on its merits, *not* out of deference to the "don't modify Setu" rule — that rule is treated as a soft default per the v9 posture, and this phase does make one deliberate core change (below).
+- **One deliberate Setu-core change: `Result.artifact_uri` is finally populated**, from the primary video asset, in `StageProcessingService._record_success`. The column has existed unused since it was added; this completes a mechanism the schema already anticipated. Purely additive.
+- **`trim` added — the most consequential single addition in this pass.** No earlier draft of Phase 5, in this document *or* in the review request that prompted it, contained any way to cut a video. Without it the product can enhance video but cannot edit it; "cut out the boring middle" is the most common editing operation there is. One input, one output, no engine change. Time-range params become a cross-cutting convention on other capabilities for the same reason. (§19 Phase 5E)
+- **`merge` added, first-stage only** — free under the existing model, since `compile_workflow` already builds `video_uris` as a list and stage 0's handles are real. **`split` and mid-chain merge are explicitly deferred** to §20 item 6 with their two concrete blockers named (`Result`'s per-stage uniqueness constraint; `previous_output` sourcing stage N-1 only) — a real execution-model change, not a capability.
+- **The duplicate-stage-name check is dropped rather than re-keyed**, reversing v8's planned fix. Asset chaining makes a repeated stage meaningful (`trim → trim` is an ordinary "drop the intro, then the boring middle" workflow), and the proposed `(stage, video_ids)` key wouldn't have worked anyway since only stage 0's handles are real. Corrected in Phase 4's Risks and resolved in Phase 5A.
+- **Transcription split from subtitle burn-in** (`transcribe` / `burn_subtitles`), making the `.srt` a first-class downloadable artifact rather than only burned-in pixels. `validate_proposal` gains a forward-scan asset-availability check so a proposal consuming an asset nothing produces fails *validation* — feeding Phase 4's existing semantic-retry loop — instead of failing at runtime into the DLQ, which is the exact failure class fixed in Phase 4 for video handles.
+- **Overlay and Blur reviewed and deliberately not added.** Under a correct asset model they cost the same later as now, so front-loading them buys risk (new dependencies, new failure modes) with no capability gain, and there is no frontend until Phase 7 to show them in.
+- **Artifact retrieval endpoints pulled into Phase 5A** (`GET /jobs/{id}/artifacts` + byte-serving download). Discovered during review: **no endpoint in the API can serve file bytes at all** — storage URIs are opaque `local://…` strings — so without this there is literally no way to retrieve output, and no way to verify Phase 5's own capabilities except by inspecting the filesystem by hand. Phase 7 already assumed this existed.
+- **Preview mode added (5A), and Phase 7 gains the iteration loop.** A preview is not a new stage — it's the same workflow compiled in a different mode and submitted as an ordinary Job, so it inherits retry/DLQ/idempotency/observability for free; the flag is honored in exactly one place (`run_ffmpeg`). Phase 7's flow becomes *propose → preview → adjust → confirm*, with per-stage artifact inspection for diagnosing which step went wrong. Phase 7's "download the completed video" is corrected to **artifacts, plural**. (§19 Phase 5A, Phase 7)
+- **Phase 10 (semantic video understanding) sketched into the roadmap** — previously referenced only in conversation, absent from this document. Its one structural requirement is recorded now: **assets become video-scoped rather than job-scoped** (a `video_assets` table promoting Phase 5A's `Asset` from per-run to durable per-video), which is cheap precisely because 5A defines `Asset` as a clean value object. Its transcript-caching half is flagged as worth pulling forward early, since transcription is the one preview cost that resolution reduction can't lower. (§19 Phase 10)
+- **Phase 9a's `team` default flagged as an open question**, not changed: unanimous approval fits a final render but may grind against Phase 5's iteration loop. Two candidate resolutions recorded; to be decided with the preview loop in hand rather than speculatively. (§19 Phase 9a)
+- **§20 gains four items:** multi-input/multi-output execution (item 6, the only backlog item requiring an execution-model change), partial re-run / resume-from-stage, artifact retention/GC, and capability filtering at scale (~30+ capabilities degrade prompt quality; the fix is retrieval, explicitly not multi-agent).
+- **Terminology unchanged.** The review used `"stages"`/`"parameters"`; the codebase uses `"workflow"`/`"params"`. Renaming would touch `Proposal.from_dict`, the planner response schema, the prompt, and every existing test for zero behavior change — and this document has already paid for one terminology drift (v6). Keeping existing keys.
+
 ---
 
 ## 1. General direction (confirmed, unchanged)
@@ -205,17 +232,28 @@ Single-stage Job #1 (`["video_analysis"]`). `VideoAnalysisWorker` is a plain `Wo
 
 ## 9. Worker architecture (updated — Notification Worker removed)
 
-| Worker | Stage/topic name | Notes |
-|---|---|---|
-| Video Analysis Worker | `video_analysis` | Job #1, sole stage |
-| Crop Worker | `crop` | ffmpeg/OpenCV crop+resize+rotate |
-| Color Worker | `color` | brightness/contrast/saturation |
-| Audio Worker | `audio` | normalization, silence removal |
-| Subtitle Worker | `subtitle` | Whisper transcription + burn-in |
-| Stabilization Worker | `stabilize` | later, not required for V1 |
-| Compression Worker | `compress` | later, not required for V1 |
-| Export Worker | `export` | final container/resolution/format |
-| Thumbnail Worker | `thumbnail` | later, not required for V1 |
+Updated per v10 — the Phase 5 capability set. One worker per stage name; stage name = topic name = `WORKERS` key throughout.
+
+| Worker | Stage/topic name | Phase | Notes |
+|---|---|---|---|
+| Video Analysis Worker | `video_analysis` | 1 | Job #1, sole stage |
+| Crop Worker | `crop` | 5B | aspect-ratio crop |
+| Resize Worker | `resize` | 5B | target width/height |
+| Rotate Worker | `rotate` | 5B | 90/180/270 |
+| Flip Worker | `flip` | 5B | horizontal/vertical |
+| Pad Worker | `pad` | 5B | letterbox/pillarbox to fit |
+| Color Worker | `color` | 5C | brightness/contrast/saturation/gamma/sharpen |
+| Audio Worker | `audio` | 5D | normalization, silence removal |
+| Trim Worker | `trim` | 5E | cut to a time range |
+| Merge Worker | `merge` | 5E | concatenate clips (first stage only) |
+| Transcribe Worker | `transcribe` | 5F | Whisper `large-v3` → transcript + srt assets |
+| Subtitle Burn Worker | `burn_subtitles` | 5F | burns an srt asset into the video |
+| Render Worker | `render` | 5G | final container/resolution/bitrate |
+| Stabilization Worker | `stabilize` | — | later, not required for V1 (§20 item 4) |
+| Compression Worker | `compress` | — | later, not required for V1 (§20 item 4) |
+| Thumbnail Worker | `thumbnail` | — | later, not required for V1 (§20 item 4) |
+
+Spatial transforms are separate stages rather than one polymorphic `transform` because they are order-sensitive (crop-then-scale ≠ scale-then-crop) and the workflow list is where that order is already expressed. `color`'s adjustments are grouped into one stage for the opposite reason — one filtergraph, no order-sensitivity between them. See §19 Phase 5.
 
 ~~Notification Worker~~ — **removed for V1**. The frontend submits a job, gets a `job_id`, and polls `GET /jobs/{id}` (already implemented, already returns status/progress). This is strictly less to build, and it's honest about what V1 actually needs: nothing currently consumes a "job done" event except a UI that could just as easily ask. Revisit only if polling proves too slow/chatty in practice — see §20.
 
@@ -301,7 +339,7 @@ user_preferences(user_id PK, preferred_platform, preferred_export_format,
 
 ## 15. New Redpanda topics (updated)
 
-`video_analysis`, `crop`, `color`, `audio`, `subtitle`, `export` (+ `.dlq` for each, already generic, no config needed). ~~`job-lifecycle`~~ — dropped for V1 along with the Notification Worker; see §20 if it's ever needed.
+One topic per stage name, matching §9's table (updated per v10): `video_analysis`, `crop`, `resize`, `rotate`, `flip`, `pad`, `color`, `audio`, `trim`, `merge`, `transcribe`, `burn_subtitles`, `render` (+ `.dlq` for each, already generic, no config needed). Topics are created per capability as its sub-phase lands, not all up front. ~~`job-lifecycle`~~ — dropped for V1 along with the Notification Worker; see §20 if it's ever needed.
 
 ---
 
@@ -469,63 +507,82 @@ Each phase is independently demoable and none requires reopening a prior phase's
 
 **Demo scenario.** The example from the spec, live: "Make this look more professional" → assistant asks who it's for → "LinkedIn" → assistant proposes a concrete workflow → user calls `confirm-proposal` → a real Job #2 is submitted (still against `dummy` until Phase 5).
 
-**Risks.** LLM hallucinating a stage name, malformed params, or a video handle that doesn't exist — all caught by Phase 3's unmodified validator plus `ConversationService`'s handle resolution; if it's tripping constantly, that's a prompt/registry-description problem, not a reason to loosen validation. Separately: `validate_proposal`'s duplicate-stage-name rejection is keyed only on stage name, so a future `crop(video_1) → crop(video_2)` workflow will collide once Phase 5 registers `crop` — can't trigger yet (registry only has `dummy`), but Phase 5 will need to change the uniqueness key to `(stage name, video_ids)`.
+**Risks.** LLM hallucinating a stage name, malformed params, or a video handle that doesn't exist — all caught by Phase 3's unmodified validator plus `ConversationService`'s handle resolution; if it's tripping constantly, that's a prompt/registry-description problem, not a reason to loosen validation. Separately: `validate_proposal`'s duplicate-stage-name rejection can't trigger in Phase 4 (registry only has `dummy`) but becomes live in Phase 5. **The fix this document originally proposed — re-keying on `(stage name, video_ids)` — is now known to be wrong**; see Phase 5A, which resolves it differently and explains why.
 
 **Deferred out of this phase (Changelog v8):** richer `StageCapability` fields, any `compile_workflow` responsibility beyond `Proposal → Workflow`, the generic `Asset`/`AssetRegistry`/`AssetResolution` system, and reshaped worker/capability metadata all wait for Phase 5; proposal persistence/versioning/revisions/approval-engine/collaborative-editing/ownership wait for Phase 8/9.
 
 ---
 
-### Phase 5 — Real deterministic editing workers (one worker at a time)
+### Phase 5 — Media capabilities on an asset model (revised per Changelog v10)
 
-**Goal of the phase as a whole.** Swap real Crop/Color/Audio/Subtitle/Export workers in for `dummy`, one at a time, in the order below. Each sub-phase is a complete, shippable milestone on its own — the system is fully working and demoable after every single one, not just at the end. This is the whole point of splitting it this way: if any one worker turns out to be far more complex than expected (subtitle/Whisper is the likely candidate), that complexity is contained to its own sub-phase and never blocks the others from already being done and demoed.
+**Goal of the phase as a whole.** Replace `dummy` with real media processing, one capability at a time. Each sub-phase is a complete, shippable milestone on its own — the system is fully working and demoable after every single one. This containment is the whole point: if any one capability runs far longer than expected (transcription is the known candidate), that risk stays isolated and never blocks the others from already being done.
+
+This phase is where the product starts existing. Everything through Phase 4 is a complete conversational pipeline that produces nothing — the planner proposes correctly, the job executes flawlessly through retry/DLQ/crash-recovery, and `dummy` returns `{"processed_by": "dummy"}`. Phase 5 is what makes that machinery mean something.
 
 **Why before Phase 6.** Memory only has something worth remembering once real edits are actually happening — no point wiring "did the user like this edit" against fake output.
 
-**Shared mechanics across all five (stated once, not repeated per worker).** Each is a new `Worker` subclass + one line in the `WORKERS` registry + one entry in the capability registry (§6) with its real param schema, replacing `dummy` for that stage name. Setu's "adding a worker touches nothing else" guarantee gets exercised five times here and should hold every time — if any sub-phase requires touching `WorkflowEngine`, `StageProcessingService`, or `JobSubmissionService`, that's a signal something's being done wrong, not a signal those components need to change.
+**Philosophy — deterministic execution only.** No AI reasoning happens in this phase. The planner has already decided what to do; Phase 5 executes media operations. Every capability is deterministic, independently testable, composable, free of hidden side effects, and never touches conversations or planner state.
 
-**Database changes** (all five): none new. **API changes** (all five): none new. **Frontend changes** (all five): none yet — Phase 7 is where these become visible in a UI.
+**Capabilities, not workers (already true, restated).** The planner only ever sees `CapabilityRegistry`/`StageCapability` — name, description, param schema. It has zero knowledge of `Worker`, the `WORKERS` registry, or any execution detail, and never imports `backend.workers`. `Worker` already *is* the internal implementation a capability is expressed through. No restructuring is needed to "become capability-oriented"; the existing seam already does it.
+
+**Assets, not just videos (new — the one real model change).** A stage no longer implicitly produces "a video." It produces a list of typed assets: `{"kind": "video" | "transcript" | "srt" | "thumbnail" | "audio" | ..., "uri": ...}`. This is necessary, not decorative — transcription produces a transcript and a subtitle file, not a video, and no single `output_uri` key extends to that. Scope stays deliberately small: a typed value object plus shared helpers, no `AssetRegistry` and no resolution engine (Changelog v8 already anticipated this landing at Phase 5).
+
+**Chaining stays worker-side, via `previous_output`.** `WorkflowEngine` documents a real invariant — it never imports from `backend/workers/` and treats `message.payload` as opaque. `previous_output` (the prior stage's `Result.payload`, injected by `StageProcessingService`) is Setu's existing, purpose-built mechanism for exactly this, already used by the `frame_extraction → … → rendering` chain. Teaching the orchestrator to understand a typed asset list would be a strictly larger coupling for no gain. Chaining is implemented by **monotonic asset accumulation**: every stage forwards every asset it received, replacing the video asset only if it actually edited the video. Once `transcribe` emits an `srt`, every later stage carries it forward — so producer and consumer never need to be adjacent.
+
+**Database changes:** none new in this phase. **API changes:** artifact listing/download and preview submission (5A, below) — the first endpoints that let a client actually retrieve output. **Frontend changes:** none yet; Phase 7 is where these become visible.
 
 ---
 
-**Phase 5a — Crop Worker**
+**Phase 5A — Shared media infrastructure**
 
-- **Objective.** Deterministically crop/resize/rotate a video to requested dimensions or aspect ratio.
-- **Implementation tasks.** `CropWorker(Worker)` calling ffmpeg (or OpenCV) with params from the proposal (e.g. `{x, y, width, height}` or `{aspect_ratio}`); register in `WORKERS` as `"crop"`; add `crop`'s real param schema to the capability registry, replacing the `dummy` stand-in used in Phases 3–4.
-- **Testing strategy.** Known input video + known crop/aspect params → assert output resolution/aspect ratio matches exactly. Malformed params (out-of-bounds crop rect) → assert a clean failure, not a corrupt output file.
-- **Demo scenario.** Submit a Job #2 with `workflow: ["crop"]` and a 16:9 → 9:16 aspect-ratio request; produce a real vertically-cropped output file.
-- **Acceptance criteria.** Output video has the exact requested dimensions/aspect ratio; job reaches `completed`; a deliberately bad crop rect reaches `dead_lettered` via the existing retry/DLQ path with no changes to that path.
+Everything later capabilities reuse. No user-visible capability ships here; this is the foundation that makes the rest small.
 
-**Phase 5b — Color Worker**
+- **`backend/workers/media.py`** (new): `Asset` frozen dataclass (`kind`, `uri` — matching the existing `Proposal`/`ProposalStage`/`StageMessage` convention, serialized at the `Result.payload` boundary); `primary_video(assets)` — the single function every capability uses to select the chainable video, so no two workers can disagree; `forward_assets(previous, produced)` — monotonic accumulation, implemented once rather than restated per worker; `materialize_to_tempfile(uri, suffix)` and `run_ffmpeg(...)` following `video_analysis_worker.py`'s proven pattern (Windows-safe close-before-subprocess, `finally` cleanup).
+- **`run_ffmpeg` takes a filter list, not raw args**, so it owns filtergraph composition — required for preview mode (below) to append its own scale filter without clobbering the caller's.
+- **Error hierarchy**: `MediaProcessingError` (retryable — ffmpeg missing or crashed, an environment problem) and `InvalidMediaParamsError(MediaProcessingError, PermanentError)` (bad params or unusable input — fails identically every retry, so straight to DLQ). Mirrors `VideoAnalysisError`/`UnsupportedVideoError`.
+- **`StageCapability` gains `requires_asset_kinds` / `produces_asset_kinds`** (defaulting to `["video"]`/`["video"]`, so most capabilities need no extra config), and **`validate_proposal` gains a forward-scan check**: it accumulates available asset kinds stage by stage and rejects a proposal whose stage needs an asset nothing before it produces. This routes the failure into Phase 4's existing semantic-retry loop so the LLM self-corrects — rather than letting it become a runtime DLQ, which is the exact failure class fixed in Phase 4 for video handles.
+- **`validate_proposal`'s duplicate-stage-name rejection is dropped, not re-keyed.** Phase 3 introduced it as an explicit V1 policy (Setu's engine tolerates repeats mechanically); Changelog v8 then proposed re-keying it on `(stage, video_ids)` when Phase 5 landed. **Both are now wrong.** Under asset chaining a repeated stage is *meaningful*, not a mistake — each instance operates on the previous one's output. `trim → trim` ("drop the intro, then drop the boring middle") is an ordinary workflow, and `crop → crop` is legitimate too. The proposed re-key also wouldn't have worked: only stage 0's `video_ids` are real, since every later stage takes its input from `previous_output`, so two downstream `trim`s would key identically anyway. Removing the check is the correct resolution; asset-availability validation (below) is what actually guards proposal correctness now.
+- **`StageProcessingService._record_success` populates `Result.artifact_uri`** from the primary video asset. That column has existed since it was added and has never been written — this finishes a mechanism the schema already anticipated, and makes each stage's artifact directly queryable instead of buried in JSON. A deliberate, documented Setu-core touch (posture note, §12/Phase 8): purely additive, existing workers keep getting `NULL` exactly as today.
+- **Artifact retrieval endpoints** — `GET /jobs/{id}/artifacts` (list per stage, by asset kind) and a byte-serving download route validated through `LocalDiskStorage`'s existing path guard. Called out explicitly because **nothing in the API can currently serve file bytes at all**: storage URIs are opaque `local://…` strings, so without this there is no way for any client to retrieve output, and no way to verify 5B–5G except by inspecting the filesystem by hand.
+- **Preview mode** — a preview is not a new stage; it is the *same workflow compiled in a different mode*, submitted as an ordinary Job (inheriting retry/DLQ/idempotency/observability for free). A payload flag is honored in exactly one place, `run_ffmpeg`: cap resolution and swap to a fast encoder preset. `POST /projects/{id}/preview-proposal` mirrors `confirm-proposal` with its own idempotency-key namespace so previews never collide with real submissions. Frame-only preview (`-frames:v 1` at sampled timestamps, no encode) is the near-instant variant for checking framing and color.
+- **Time-range params** are a cross-cutting convention, not a capability: any capability may accept optional `start`/`end` to scope its effect to a segment.
+- **Testing**: `LocalDiskStorage(tmp_path)` + monkeypatched `get_storage`, an `ffmpeg_available` fixture alongside the existing `ffprobe_available` one, `tests/fixtures/sample.mp4` as known input. Verification uses ffmpeg's own `signalstats`/`loudnorm` analysis filters rather than adding Pillow/OpenCV/numpy. 5A's own logic (`forward_assets`, `primary_video`, the validator scan) is pure and testable with no ffmpeg at all.
+- **Fix `test_retry_backoff_increases_between_attempts`'s flakiness** (`tests/test_worker_retry_and_dlq.py`) — pre-existing, surfaced during 5A. It asserts `deltas[0] < deltas[1] < deltas[2]` on wall-clock time between `consume_one()` calls, but the first call also absorbs Kafka consumer-group join and metadata-fetch cost, so under load `deltas[0]` can exceed `deltas[1]` and the test fails intermittently. Nothing is wrong with the backoff itself. Fix by extracting `runner.py`'s inline `min(base * 2 ** (attempt - 1), max)` into a small pure function and asserting the progression on *that* — deterministic, no sleeping — while the integration test keeps only a loose "retries do get slower" check. Scheduled into this sub-phase rather than the backlog because Phase 5's whole build method is "full suite green after every step," and a test that fails at random directly undermines the ability to tell whether a step broke something — which it already did once, costing a diagnosis round to prove a Step 6 failure wasn't Step 6's fault.
 
-- **Objective.** Deterministically adjust brightness/contrast/saturation.
-- **Implementation tasks.** `ColorWorker(Worker)`; register as `"color"`; param schema for brightness/contrast/saturation deltas or targets.
-- **Testing strategy.** Known input + known adjustment → assert measurable output brightness/contrast shifts in the expected direction and rough magnitude (sampled pixel/histogram check, not exact-match, since encoding isn't lossless).
-- **Demo scenario.** Submit `workflow: ["color"]` with a brightness increase; show the output is visibly and measurably brighter.
-- **Acceptance criteria.** Output's measured brightness/contrast moves in the requested direction within a reasonable tolerance; job reaches `completed` on valid input.
+**Phase 5B — Spatial transforms** — `crop`, `resize`, `rotate`, `flip`, `pad`
 
-**Phase 5c — Audio Worker**
+- **Separate capabilities, not one polymorphic `transform`.** These are order-sensitive (crop-then-scale ≠ scale-then-crop), and a flat optional-params bag cannot express order. Separate stages let the proposal's own `workflow` ordering *be* the filter order — explicit, and already solved by existing machinery.
+- `crop` ships first (`aspect_ratio`, matching what Phase 4 already demos conversationally); the rest follow within the same sub-phase on the same skeleton with disjoint simple params (`width`/`height`, `degrees`, `direction`, `pad_color`).
+- **Acceptance.** Requested geometry verified via ffprobe; a malformed param reaches `dead_lettered` through the existing retry/DLQ path, unchanged.
 
-- **Objective.** Normalize loudness and optionally remove silence, while preserving background music where requested.
-- **Implementation tasks.** `AudioWorker(Worker)`; register as `"audio"`; param schema for `normalize`, `remove_silence`, `preserve_music` (or similar); ffmpeg loudnorm filter (or equivalent) for normalization, silencedetect/silenceremove for trimming.
-- **Testing strategy.** Known input with known loudness → assert output loudness lands near the target LUFS; known input with a silent lead-in → assert the silent portion is removed from the output's duration.
-- **Demo scenario.** Submit `workflow: ["audio"]` against a clip with a quiet intro and inconsistent volume; show the output starts immediately and is consistently loud.
-- **Acceptance criteria.** Output loudness within tolerance of target; silence-trimmed output duration reflects the removed segment; job reaches `completed`.
+**Phase 5C — Visual adjustments** — `color`
 
-**Phase 5d — Subtitle Worker**
+- **One grouped capability**, unlike 5B: `brightness`, `contrast`, `saturation`, `gamma`, `sharpen` all map onto a single ffmpeg filtergraph (`eq` + `unsharp`) with no order-sensitivity between them, and users naturally ask for them together ("brighter and more saturated").
+- **Acceptance.** Measured `signalstats` shift in the requested direction (not exact-match — encoding isn't lossless).
 
-- **Objective.** Generate a transcript-based caption track and burn it into the video.
-- **Implementation tasks.** `SubtitleWorker(Worker)`; register as `"subtitle"`; param schema for language/style; reuse the transcript from Video Analysis (§8) if already present rather than re-running Whisper, falling back to running it here if analysis didn't include one. Burn-in via ffmpeg's subtitle filter.
-- **Testing strategy.** Known input with known speech → assert generated captions roughly match expected text (spot-check, not exact-match given ASR variance); assert burned-in captions are actually present in the output frames (e.g. via a frame sample check) rather than silently skipped.
-- **Demo scenario.** Submit `workflow: ["subtitle"]` against a spoken-word clip; show the output with visible burned-in captions matching the speech.
-- **Acceptance criteria.** Output has visible captions synced to speech within a reasonable tolerance; job reaches `completed`; this is flagged going in as the most likely sub-phase to run long (ASR is the least deterministic step in the whole pipeline) — if it does, that risk is contained here and doesn't block 5a–5c, which are already done and demoed.
+**Phase 5D — Audio processing** — `audio`
 
-**Phase 5e — Export Worker**
+- `normalize` (ffmpeg `loudnorm`, EBU R128), `remove_silence` (`silenceremove`), `preserve_music` (skips silence removal — a V1 simplification, no music/speech classification; recorded as a known simplification rather than pretending it's solved).
+- **Acceptance.** Output loudness within tolerance of target; silence-trimmed duration reflects the removed segment.
 
-- **Objective.** Produce the final container/resolution/format/bitrate as the last stage of any edit workflow.
-- **Implementation tasks.** `ExportWorker(Worker)`; register as `"export"`; param schema for target resolution/format/bitrate; writes final output through the storage abstraction (§14) so it's retrievable by the frontend.
-- **Testing strategy.** Known input → assert output container/resolution/format matches requested target and is playable (basic ffprobe sanity check on the result).
-- **Demo scenario.** Chain all five: `workflow: ["crop", "color", "audio", "subtitle", "export"]` — the full LinkedIn example from Phase 4's demo, now producing genuinely edited, exported output end to end.
-- **Acceptance criteria.** Final artifact is a valid, playable video in the requested format; a full multi-stage workflow (all five workers) completes successfully and each intermediate `Result` (from Crop through Subtitle) is still present and correct in Postgres, proving the chain, not just the last stage, actually ran.
+**Phase 5E — Temporal & structural** — `trim`, `merge`
+
+- **`trim`** (`start`, `end`) is the highest-value-per-effort capability in the entire phase and was missing from every earlier draft of this plan. Without it the product can enhance a video but cannot *edit* one — "cut out the boring middle" is the single most common editing operation there is, and its absence is what separates a video enhancer from a video editor. One input, one output, ffmpeg `-ss`/`-to`; no engine changes.
+- **`merge`** (concatenate several clips) works **as a first stage only**, and needs no engine change to do so: `compile_workflow` already builds `video_uris` as a *list* per stage, and stage 0's handles are real, so a first-stage merge reads multiple real inputs today. Mid-chain merge and `split` (one output becoming many) stay out of scope — both are genuinely blocked, by `Result`'s `UniqueConstraint(job_id, stage)` (nowhere for one-to-many output to land) and by `previous_output` sourcing only stage N-1 (nowhere for multi-source input to come from). Lifting those is a real execution-model redesign, deferred to its own architecture pass (§20) rather than hacked around here.
+- **Acceptance.** Trimmed output duration matches the requested range; a first-stage merge of N clips produces one video of ~the summed duration.
+
+**Phase 5F — Transcript & subtitles** — `transcribe`, `burn_subtitles`
+
+- **Split into two capabilities.** `transcribe` produces `transcript` + `srt` assets and passes the video through untouched; `burn_subtitles` consumes video + srt and produces a new video. The split is what makes the `.srt` a first-class downloadable artifact (people upload subtitle files to YouTube directly) rather than only existing as burned-in pixels. Monotonic accumulation (5A) means the two never need to be adjacent.
+- **`faster-whisper` running `large-v3`** — quality is the explicit priority. It is a CTranslate2 reimplementation of the *same* Whisper weights, not a lower-accuracy alternative; it trades nothing on transcription quality and only avoids a full PyTorch install. Accepted costs, flagged going in: a multi-GB first-run download, and meaningfully slow CPU inference. This is the sub-phase most likely to run long — isolated here so it never blocks the others.
+- **Sequenced after 5D** so duration-changing audio edits (`remove_silence`) run *before* transcription, keeping subtitle timing aligned with the final video. Known, accepted, undetected limitation: asset *presence* is validated, asset *timing validity* is not — a future duration-changing capability inserted between `transcribe` and `burn_subtitles` would drift, and nothing catches it. Out of scope for this phase; recorded so it isn't rediscovered as a surprise.
+- **Acceptance.** Transcript spot-checked against known speech (substring, not exact — ASR varies); burn-in presence confirmed by frame comparison rather than OCR.
+
+**Phase 5G — Render & export** — `render`
+
+- **A normal capability, not a special final stage** — `WorkflowEngine` already treats "last stage" generically, so no special-casing is warranted or needed.
+- `resolution`, `format`, `bitrate`; writes the final artifact through the storage abstraction. Its `Result.artifact_uri` is precisely what Phase 7's download link consumes — direct payoff from 5A's infrastructure change.
+- **Acceptance.** Final artifact is valid and playable in the requested format (ffprobe sanity check); a full multi-capability chain completes with every intermediate `Result` present and correctly chained in Postgres, proving the whole chain ran rather than just the last stage.
 
 ---
 
@@ -561,15 +618,19 @@ Each phase is independently demoable and none requires reopening a prior phase's
 
 ### Phase 7 — Frontend integration
 
-**Goal.** A usable UI over everything built so far: upload, chat, proposal confirmation, poll-based progress, completed video download.
+**Goal.** A usable UI over everything built so far: upload, chat, proposal preview and confirmation, poll-based progress, and artifact download.
 
 **Why last.** Every piece it depends on (upload, chat, planning, execution, memory) is already independently proven by this point — this phase is wiring, not new backend logic.
 
 **Components.** Project creation + upload widget → `POST /projects`, `POST /projects/{id}/videos`; chat UI → the messages endpoints; a confirm affordance for proposed workflows; a progress view driven by polling `GET /jobs/{id}` (a simple interval poll is enough for V1, per your instruction — no SSE/WebSocket needed), which on observing `completed` calls `POST /jobs/{id}/update-memory` (Phase 6) once.
 
+**Artifacts, plural (revised per v10).** A finished job yields several assets, not "the video" — the rendered output, the `.srt`, the transcript. The UI lists them from `GET /jobs/{id}/artifacts` (Phase 5A) and offers each for download; a downloadable subtitle file is a real feature that costs nothing extra here, since the asset already exists.
+
+**Preview and the iteration loop (revised per v10).** The confirm affordance is paired with a preview one: `POST /projects/{id}/preview-proposal` renders the same proposal fast and low-res, so the loop becomes *propose → preview → adjust in conversation → preview → confirm for real*. Without this the only way to discover a bad crop is to pay for a full render and start a fresh conversation. **Per-stage inspection** is the debugging affordance on top: intermediate artifacts already exist for every stage, so the UI can show *which step* went wrong rather than only the final result — defaulting to the final output, with per-stage available on demand. Render it per asset kind (frame for visual stages, loudness delta for audio, text for transcript) rather than as N videos; stages that pass the video through untouched are detectable by identical URI and should collapse automatically.
+
 **Database changes.** None.
 
-**API changes.** None, unless a small "list my videos/conversations" convenience endpoint is worth adding for navigation — optional, not required by anything above.
+**API changes.** None new — the artifact-listing, download, and preview endpoints this phase consumes all ship in Phase 5A, where they're needed to verify the capabilities themselves.
 
 **Worker changes.** None.
 
@@ -604,7 +665,7 @@ project_members(project_id FK, user_id, role ('owner'|'member'), joined_at,
 
 `POST /projects` (Phase 1) needs one small addition here: also insert the owner as the first `project_members` row, so a freshly-created project is never memberless. No changes needed to `conversations`, `messages`, or `videos` — all three already carry the `NOT NULL` `project_id`/sender attribution this phase needs (v5).
 
-- **`jobs` stays untouched.** Room↔job linkage lives in a small `project_jobs(project_id, job_id)` mapping table written at submission time by the (non-Setu) submission wrapper. If that join ever proves genuinely annoying, a nullable `project_id` column on `jobs` is the fallback — an acceptable Setu change under the new posture, but not the starting point.
+- **`jobs` stays untouched.** Room↔job linkage lives in a small `project_jobs(project_id, job_id, submitted_by_user_id)` mapping table written at submission time by the (non-Setu) submission wrapper. `submitted_by_user_id` is whoever's request triggered `JobSubmissionService.submit()` — in this phase, whoever called `confirm-proposal`; from Phase 9a on, whichever member's action satisfied the room's approval policy. This column *is* **job ownership** (Phase 9b's `POST /jobs/{id}/cancel` authorizes directly against it) — captured here, at the point a job is first submitted in a room, rather than invented later by 9a's proposal apparatus, so 9b has no real dependency on proposals/approval existing. If the `project_jobs` join ever proves genuinely annoying, a nullable `project_id`/`submitted_by_user_id` pair of columns on `jobs` is the fallback — an acceptable Setu change under the new posture, but not the starting point.
 - **Version history is derived, not stored:** the room's completed export jobs (via `project_jobs` → results/artifacts), ordered by completion time, *are* the version list. No new table until deriving it proves insufficient.
 
 **API changes.**
@@ -652,7 +713,9 @@ The prompt also renders the room's **active approval policy** as context, and is
 - **`admin`** ("Admin Mode") — one designated approver's decision is final; other members' votes, if any, don't count toward the outcome. Suits a lead-driven workflow where one person signs off.
 - **`team`** ("Team Mode", **the V1 default**) — every *active* project member must approve before execution begins; any single rejection ends the proposal (see lifecycle, above). Suits small creative teams making decisions collectively — the framing this default is chosen for.
 
-Note this `admin` policy value is deliberately distinct from **job ownership** (Phase 9b) — a proposal's admin-approver need not be the same person as the job's owner; conflating the two names was a V1-draft mistake, fixed here before either ships.
+**Open question to settle when this phase starts (raised in v10, deliberately not decided now).** `team` as the default may be real friction once Phase 5's preview/iteration loop exists: unanimous approval is right for a final render, but requiring all members to sign off on every exploratory tweak would grind. Two candidate resolutions, neither committed to here — default to `admin` instead, or scope the policy per *action* (previews unapproved and free, real renders governed by policy) rather than per room. The second is more expressive and fits the preview model directly, but adds a dimension to policy evaluation that `is_satisfied`/`is_rejected` don't currently have. Decide with the preview loop actually in hand rather than speculatively.
+
+Note this `admin` policy value is deliberately distinct from **job ownership** (Phase 8's `project_jobs.submitted_by_user_id`, used by Phase 9b) — a proposal's admin-approver need not be the same person as the job's owner; conflating the two names was a V1-draft mistake, fixed here before either ships. When an approval-triggered submission happens, `proposals.created_by_user_id` is the value written into `project_jobs.submitted_by_user_id` — 9a populates an existing Phase-8 column, it doesn't invent the ownership concept.
 
 **Future policies (backlog, not V1).** Majority Approval, Selected Reviewers, Two-Level Approval (Lead + Manager), Custom Approval Rules — see backlog item 5 in §20. `admin`/`team` need only the existing `proposal_approvals` vote rows; Selected Reviewers and Two-Level Approval will likely need to know *which* members are eligible to vote at all, which `admin`/`team` don't — that's new data (a reviewer set or role), not just a new enum branch, so it's deferred rather than stubbed in now.
 
@@ -695,11 +758,11 @@ One vote row per member per proposal; a member may change their vote while the p
 
 **Goal.** Let the job owner stop a running job between stages. The only sub-phase in the entire roadmap that touches Setu's core, isolated here on purpose so the one exception is reviewable, testable, and demoable on its own — independent of whether 9a's approval mechanics are even in place.
 
-**Why after 9a.** Needs a submitted job with a recorded owner (proposal creator, from 9a) to authorize `POST /jobs/{id}/cancel` against. Could in principle ship against any job with a known owner; sequenced after 9a because that's where job ownership first gets recorded.
+**Why sequenced here, not strictly after 9a.** Its only real prerequisite is a submitted job with a recorded owner — and that's `project_jobs.submitted_by_user_id`, captured as early as Phase 8 (see Phase 8's Database changes), not anything from 9a's proposal/approval machinery. This sub-phase is listed after 9a purely because both are grouped under "Phase 9" as the collaboration-and-execution-control bundle for review purposes (per Changelog v4's reasoning for the 9a/9b split) — it could ship right after Phase 8, or in parallel with 9a, without missing anything.
 
-**Task ownership + cancellation.** When execution begins, the proposal's creator becomes the **job owner** — unrelated to the `admin` approval policy from 9a; only the job owner can cancel the running job. Other members keep discussing future edits while the job runs — the room conversation is never blocked by execution. Ownership is queryable from `proposals` (creator + `job_id`) without touching the `jobs` schema. Cancellation is **this sub-phase's one justified Setu change** (backlog item 3, pulled forward): `JobStatus.CANCELLED` exists but is unreachable today. Minimal mechanic — *cooperative cancellation*: `POST /jobs/{id}/cancel` (authorized against the job owner) sets the job's status to `cancelled`; `WorkflowEngine` checks the job's status before dispatching each next stage and stops if cancelled. The in-flight stage runs to completion — no mid-stage kills, no worker changes, no retry/DLQ changes. Reason documented per the posture note: cancellation is inherently engine-state, and faking it above Setu (ignoring results of a job that keeps running) would be dishonest state.
+**Task ownership + cancellation.** The **job owner** is whoever's action triggered submission, recorded in `project_jobs.submitted_by_user_id` as early as Phase 8 — not invented here. In the single-owner world (Phase 4/8) that's trivially whoever called `confirm-proposal`; once 9a's approval workflow exists, it's the proposal's creator (`proposals.created_by_user_id`), copied into that same column when approval-triggered submission happens. Job ownership is unrelated to the `admin` approval policy from 9a; only the job owner can cancel the running job. Other members keep discussing future edits while the job runs — the room conversation is never blocked by execution. Ownership is queryable from `project_jobs.submitted_by_user_id` directly — no dependency on the `proposals` table at all, so cancellation could in principle ship before 9a if ever prioritized that way. Cancellation is **this sub-phase's one justified Setu change** (backlog item 3, pulled forward): `JobStatus.CANCELLED` exists but is unreachable today. Minimal mechanic — *cooperative cancellation*: `POST /jobs/{id}/cancel` (authorized against the job owner) sets the job's status to `cancelled`; `WorkflowEngine` checks the job's status before dispatching each next stage and stops if cancelled. The in-flight stage runs to completion — no mid-stage kills, no worker changes, no retry/DLQ changes. Reason documented per the posture note: cancellation is inherently engine-state, and faking it above Setu (ignoring results of a job that keeps running) would be dishonest state.
 
-**Database changes.** None beyond what 9a already added — `JobStatus.CANCELLED` is an existing enum value, just newly reachable.
+**Database changes.** None beyond what Phase 8 already added (`project_jobs.submitted_by_user_id`) — `JobStatus.CANCELLED` is an existing enum value, just newly reachable.
 
 **API changes.** `POST /jobs/{id}/cancel` — job-owner-only.
 
@@ -715,6 +778,24 @@ One vote row per member per proposal; a member may change their vote while the p
 
 ---
 
+### Phase 10 — Semantic video understanding (sketched in v10, not yet fully specified)
+
+**Goal.** Move from *deterministic execution of stated instructions* to *understanding what is actually in the video* — so the assistant can propose edits nobody explicitly asked for: find the highlights, reframe following the speaker, remove filler words, locate "the part where she talks about pricing."
+
+**Why last.** Every prior phase is about faithfully executing an instruction the user (or the room) already articulated. This is the first phase where the system contributes an opinion about content. It needs the real media pipeline (Phase 5) to act on, and the asset model to store what it learns.
+
+**The one structural change it needs: assets become video-scoped, not job-scoped.** Today all analysis output lives in a `Result` row, reachable only via `videos.latest_analysis_job_id`. That works for a single analysis pass but doesn't survive what this phase needs: re-analysis orphans the previous results, and "which videos contain a dog" means scanning JSON blobs across unrelated jobs. The natural evolution is a `video_assets(video_id, kind, uri, data, created_at)` table — the same `Asset` concept from Phase 5A, promoted from *per-run* to *durable per-video*.
+
+Because Phase 5A defines `Asset` as a clean serializable value object rather than burying `{kind, uri}` inline in each worker's dict, that promotion is a new table plus a write — not a refactor of every capability. This is the specific reason the asset model was worth building properly in Phase 5 rather than threading a single `output_uri` string through.
+
+**Immediate payoff before any of the AI work lands:** caching the transcript against the *video* rather than the job makes Phase 5's preview loop genuinely fast. Transcription is the one expensive step that doesn't get cheaper at preview resolution — it runs on audio — so without caching, any preview containing `transcribe` pays full `large-v3` cost and "fast preview" is a lie for exactly the workflows people most want to check. Transcribe once, reuse across previews, re-runs, and final renders. **This is worth pulling forward ahead of the rest of Phase 10** whenever the preview loop starts feeling slow.
+
+**Likely capabilities** (each still a normal capability under Phase 5's model — new asset kinds, not new machinery): scene/shot detection, speaker diarization, object and face detection, filler-word detection, saliency for auto-reframe, and embeddings for semantic search across a project's footage.
+
+**Explicitly still out of scope even here:** none of this changes the planner's single-call, no-multi-agent posture (§5 AI architecture principles). Richer *context* going into the prompt is not the same as an agent framework, and the gate in principle 1 applies with full force at this phase.
+
+---
+
 ## 20. Backlog — deferred, not required for V1
 
 Kept separate deliberately, per "avoid over-engineering" — these are real, reasoned improvements, but none are load-bearing for the phases above, so none should be pulled forward without a concrete reason:
@@ -725,7 +806,13 @@ Kept separate deliberately, per "avoid over-engineering" — these are real, rea
 4. **Stabilization / Compression / Thumbnail workers** — same mechanism as Phase 5's workers, just not needed for the core "make this more professional for LinkedIn" flow; add exactly the same way (one class, one registry line) whenever they're wanted.
 5. **Additional approval policies** — Majority Approval, Selected Reviewers, Two-Level Approval (Lead + Manager), Custom Approval Rules, beyond Phase 9a's `admin`/`team`. The architecture already supports this cheaply: policies are an enum + a pure `is_satisfied`/`is_rejected` function pair, so each new policy is a new branch, not a schema change or an execution-engine change. Selected Reviewers and Two-Level Approval are the ones that will eventually need real new data (which members are eligible reviewers, or a two-tier role split) rather than just vote-counting logic — worth designing properly when one of these becomes a real requirement, not speculatively now.
 
-None of these require restructuring anything built in Phases 0–7 — that's the point of listing them here instead of folding them in early.
+6. **Multi-input / multi-output execution — `split`, mid-chain `merge`.** The one genuinely blocked capability family, and the only item here that needs a real execution-model change rather than a new worker. Two concrete blockers: `Result`'s `UniqueConstraint(job_id, stage)` means one Result per stage, so a one-to-many `split` has nowhere to put its outputs; and `StageProcessingService` sources `previous_output` from stage N-1 only, so a mid-chain merge has nowhere to draw multiple non-adjacent inputs from. Phase 5E ships first-stage-only `merge` (which needs neither), and defers the rest here. Lifting this properly means either fan-out/fan-in dispatch in `WorkflowEngine` or a real DAG workflow model — a legitimate project, worth its own architecture pass, and explicitly *not* worth hacking around with a special case that undermines the clean single-input/single-output model everything else relies on.
+7. **Partial re-run / resume-from-stage.** Every stage's intermediate artifact already persists, so re-running a workflow after changing only its last capability could reuse the cached stage N-1 output instead of redoing everything upstream. Combined with preview (Phase 5A), this is what would make the iteration loop feel genuinely fast — "re-run the last step" rather than "re-run everything." Needs a cache-validity rule (which params invalidate which downstream stages), which is why it isn't free and isn't in Phase 5.
+8. **Artifact retention / garbage collection.** Nothing deletes anything today. A multi-stage job persists every intermediate plus the final output, forever, and preview jobs add throwaway low-res artifacts on top. Keeping intermediates is the right default (it's what makes item 7 possible), but preview artifacts specifically should be markable and collectable. Becomes a real problem with usage, not before.
+9. **DLQ replay tooling.** The `.dlq` topics are currently write-only — nothing consumes them, and Postgres independently holds the whole failure record (`job.status`, `job.last_error`, a `WorkerExecution` row per attempt), with `JOBS_DEAD_LETTERED_TOTAL` incremented from the Postgres path rather than the topic. Reviewed during Phase 5A and **deliberately kept anyway**, for a reason worth recording so it isn't re-litigated: the permanent-vs-transient split is knowingly coarse (`media.run_ffmpeg` classifies *every* nonzero ffmpeg exit as permanent, which sweeps in genuinely transient OOM/disk-full cases), and the DLQ is the backstop for that misclassification. Phase 5 adds many more such coarse judgments, so the safety net matters more than it did in Phases 0–4, not less. What's missing is a small `replay-dlq <topic>` command re-producing messages to the source topic — worth building once real users can have real dead-lettered jobs, i.e. after Phase 7, not before. Also note the cost side: every stage topic gets a `.dlq` sibling, so Phase 5's 13 capabilities mean ~26 topics against a Redpanda instance running `--memory=1G --smp=1` (its 256-partition cap already bit once, via accumulated test topics).
+10. **Capability filtering at scale.** The planner prompt renders every registered capability with its param schema. Fine at Phase 5's ~10; somewhere past ~30, prompt size and stage-selection accuracy both degrade. The fix when it comes is capability retrieval/filtering — narrowing what's offered per request — and explicitly **not** a multi-agent decomposition, which §5's principles rule out. Noted now so the ceiling is known rather than discovered.
+
+None of these require restructuring anything built in Phases 0–7 — that's the point of listing them here instead of folding them in early. Item 6 is the sole exception and is scoped accordingly: it changes the execution model itself, which is precisely why it's deferred to its own pass rather than absorbed into a capability sub-phase.
 
 ---
 

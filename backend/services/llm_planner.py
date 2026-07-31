@@ -57,7 +57,10 @@ class LLMPlanner(Planner):
             self._log(regenerated=False, validation_success=True)
             return response
 
-        validation = validate_proposal(response.proposal, context.capability_registry)
+        known_handles = frozenset(video.handle for video in context.videos)
+        validation = validate_proposal(
+            response.proposal, context.capability_registry, known_video_handles=known_handles
+        )
         if validation.valid:
             self._log(regenerated=False, validation_success=True)
             return response
@@ -71,12 +74,16 @@ class LLMPlanner(Planner):
             self._log(regenerated=True, validation_success=True)
             return retry_response
 
-        retry_validation = validate_proposal(retry_response.proposal, context.capability_registry)
+        retry_validation = validate_proposal(
+            retry_response.proposal, context.capability_registry, known_video_handles=known_handles
+        )
         if retry_validation.valid:
             self._log(regenerated=True, validation_success=True)
             return retry_response
 
-        self._log(regenerated=True, validation_success=False)
+        self._log(
+            regenerated=True, validation_success=False, errors=retry_validation.errors
+        )
         return PlannerResponse(type="message", message=_COULD_NOT_PLAN_MESSAGE)
 
     async def _complete(self, prompt: Prompt) -> PlannerResponse:
@@ -99,8 +106,29 @@ class LLMPlanner(Planner):
         assert last_error is not None
         raise last_error
 
-    def _log(self, *, regenerated: bool, validation_success: bool) -> None:
-        logger.info(
-            "llm_planner turn completed",
-            extra={"regeneration_used": regenerated, "validation_success": validation_success},
-        )
+    def _log(
+        self,
+        *,
+        regenerated: bool,
+        validation_success: bool,
+        errors: list[str] | None = None,
+    ) -> None:
+        """Logged at WARNING when the loop gives up, INFO otherwise.
+
+        The errors are included because without them a give-up is
+        undiagnosable: the user gets a clarifying message, the proposal
+        that failed is never persisted, and all that survives is
+        `validation_success: false`. Knowing *which* capability the
+        planner keeps getting wrong is what tells you whether to fix a
+        description, a schema, or the prompt.
+        """
+        extra = {
+            "regeneration_used": regenerated,
+            "validation_success": validation_success,
+        }
+        if errors:
+            extra["validation_errors"] = errors
+        if validation_success:
+            logger.info("llm_planner turn completed", extra=extra)
+        else:
+            logger.warning("llm_planner could not produce a valid proposal", extra=extra)

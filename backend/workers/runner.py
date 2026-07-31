@@ -53,6 +53,21 @@ logger = logging.getLogger(__name__)
 tracer = trace.get_tracer(__name__)
 
 
+def retry_delay_seconds(attempt: int, base: float, maximum: float) -> float:
+    """Exponential backoff for the `attempt`th try, capped at `maximum`.
+
+    A module-level pure function rather than an expression inlined in
+    _handle_record so the progression can be asserted directly, without a
+    test having to infer it from wall-clock time around real Kafka calls
+    (which also pay consumer-group join and metadata-fetch cost, and so
+    measure the harness as much as the backoff).
+
+    attempt is 1-based, matching StageProcessingService's counter: the
+    first retry waits `base`, the second 2x that, and so on.
+    """
+    return min(base * (2 ** (attempt - 1)), maximum)
+
+
 def _extract_trace_context(headers: list[tuple[str, bytes]] | None) -> Context:
     """The other half of outbox_publisher.py's _inject_trace_headers():
     pulls the producer's span context back out of the Kafka message
@@ -150,8 +165,9 @@ class WorkerRunner:
             return
 
         if result.outcome is ProcessingOutcome.RETRY:
-            delay = min(
-                self._retry_base_delay_seconds * (2 ** (result.attempt - 1)),
+            delay = retry_delay_seconds(
+                result.attempt,
+                self._retry_base_delay_seconds,
                 self._retry_max_delay_seconds,
             )
             logger.warning(

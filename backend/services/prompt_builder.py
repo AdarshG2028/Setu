@@ -24,6 +24,11 @@ _ROLE_TO_CHAT_ROLE = {
 }
 
 
+# Python type names mean nothing to a planner emitting JSON; these are the
+# names it actually reasons about.
+_JSON_TYPE_NAMES = {str: "string", int: "integer", float: "number", bool: "boolean"}
+
+
 class PromptBuilder:
     def build(
         self, context: PlannerContext, *, validation_feedback: list[str] | None = None
@@ -67,6 +72,19 @@ class PromptBuilder:
         lines.append("Available stages (only use these in `workflow`):")
         for capability in context.capability_registry.list():
             lines.append(f"- {capability.name}: {capability.description}")
+            # The parameter names must come from the schema, not from the
+            # prose above. Before Phase 5 the only capability was `dummy`,
+            # which takes none, so this was invisible; once capabilities
+            # had real params the planner was left inferring key names from
+            # the description -- which worked for `aspect_ratio` and
+            # `brightness` by luck of phrasing, and failed for `rotate`,
+            # where it asked the *user* what the parameter was called.
+            if capability.parameter_schema:
+                rendered = ", ".join(
+                    f"{name} ({_JSON_TYPE_NAMES.get(type_, type_.__name__)})"
+                    for name, type_ in sorted(capability.parameter_schema.items())
+                )
+                lines.append(f"  parameters: {rendered}")
 
         if context.preferences is not None:
             lines.append("")

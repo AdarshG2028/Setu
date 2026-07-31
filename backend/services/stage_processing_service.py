@@ -41,6 +41,37 @@ from backend.workflow.engine import WorkflowEngine
 
 logger = logging.getLogger(__name__)
 
+# Phase 5's capabilities return {"assets": [{"kind": ..., "uri": ...}]}
+# (backend/workers/media.py). Matched here by literal rather than by
+# importing media's Asset/AssetKind: this service is Setu-core and stays
+# deliberately ignorant of what any particular worker does, treating the
+# payload as opaque apart from this one well-known optional convention.
+# A worker that returns no assets -- dummy, video_analysis, and every
+# pre-Phase-5 worker -- simply leaves artifact_uri NULL, exactly as before.
+_ASSETS_KEY = "assets"
+_VIDEO_KIND = "video"
+
+
+def _primary_video_uri(result_payload: dict) -> str | None:
+    """The stage's output video, lifted out of the payload into Result's
+    dedicated artifact_uri column.
+
+    That column has existed since the schema was first written ("pointer
+    into object storage for large artifacts") but was never populated,
+    because until Phase 5 no worker produced an artifact. Filling it in
+    completes what the schema already anticipated and makes each stage's
+    output directly queryable, rather than reachable only by digging
+    through a JSON payload.
+    """
+    assets = result_payload.get(_ASSETS_KEY)
+    if not isinstance(assets, list):
+        return None
+    for asset in assets:
+        if isinstance(asset, dict) and asset.get("kind") == _VIDEO_KIND:
+            uri = asset.get("uri")
+            return uri if isinstance(uri, str) else None
+    return None
+
 
 class ProcessingOutcome(StrEnum):
     SUCCEEDED = "succeeded"
@@ -162,6 +193,7 @@ class StageProcessingService:
                 worker_name=self._worker.name,
                 stage=message.stage,
                 payload=result_payload,
+                artifact_uri=_primary_video_uri(result_payload),
             )
         )
         self._executions.add(

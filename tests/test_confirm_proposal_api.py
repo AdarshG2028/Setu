@@ -93,3 +93,75 @@ def test_confirm_proposal_is_idempotent(client: TestClient, cleanup_project_ids:
     assert first["job_id"] == second["job_id"]
     assert first["replayed"] is False
     assert second["replayed"] is True
+
+
+# --- POST /projects/{id}/preview-proposal (Phase 5A, Step 8) ---------------
+
+
+def test_preview_proposal_submits_a_job(client: TestClient, cleanup_project_ids: list) -> None:
+    project = _create_project(client)
+    cleanup_project_ids.append(uuid.UUID(project["id"]))
+    sender_id = str(uuid.uuid4())
+
+    _post_message(client, project["id"], sender_id, "hi")
+    _post_message(client, project["id"], sender_id, "crop it vertically")
+
+    response = client.post(f"/projects/{project['id']}/preview-proposal")
+
+    assert response.status_code == 200
+    body = response.json()
+    uuid.UUID(body["job_id"])
+    assert body["replayed"] is False
+
+
+def test_preview_and_confirm_produce_different_jobs(
+    client: TestClient, cleanup_project_ids: list
+) -> None:
+    """The reason the idempotency keys are namespaced. Everything else about
+    the two calls is identical by construction, so a shared key would make
+    confirm replay the preview's low-resolution job and hand the user a
+    480p file as their final render."""
+    project = _create_project(client)
+    cleanup_project_ids.append(uuid.UUID(project["id"]))
+    sender_id = str(uuid.uuid4())
+
+    _post_message(client, project["id"], sender_id, "hi")
+    _post_message(client, project["id"], sender_id, "crop it vertically")
+
+    preview = client.post(f"/projects/{project['id']}/preview-proposal").json()
+    confirm = client.post(f"/projects/{project['id']}/confirm-proposal").json()
+
+    assert preview["job_id"] != confirm["job_id"]
+    assert confirm["replayed"] is False
+
+
+def test_preview_proposal_is_idempotent(client: TestClient, cleanup_project_ids: list) -> None:
+    """Re-previewing the same proposal replays rather than re-rendering —
+    the point of a preview is that it's cheap to ask for repeatedly."""
+    project = _create_project(client)
+    cleanup_project_ids.append(uuid.UUID(project["id"]))
+    sender_id = str(uuid.uuid4())
+
+    _post_message(client, project["id"], sender_id, "hi")
+    _post_message(client, project["id"], sender_id, "crop it vertically")
+
+    first = client.post(f"/projects/{project['id']}/preview-proposal").json()
+    second = client.post(f"/projects/{project['id']}/preview-proposal").json()
+
+    assert first["job_id"] == second["job_id"]
+    assert second["replayed"] is True
+
+
+def test_preview_proposal_with_no_proposal_yet_is_409(
+    client: TestClient, cleanup_project_ids: list
+) -> None:
+    project = _create_project(client)
+    cleanup_project_ids.append(uuid.UUID(project["id"]))
+
+    response = client.post(f"/projects/{project['id']}/preview-proposal")
+
+    assert response.status_code == 409
+
+
+def test_preview_proposal_for_unknown_project_is_404(client: TestClient) -> None:
+    assert client.post(f"/projects/{uuid.uuid4()}/preview-proposal").status_code == 404

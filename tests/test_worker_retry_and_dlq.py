@@ -20,7 +20,7 @@ from backend.core.config import get_settings
 from backend.models import Job
 from backend.workers.base import PermanentError, StageMessage, Worker
 from backend.workers.dummy_worker import DummyWorker
-from backend.workers.runner import WorkerRunner
+from backend.workers.runner import WorkerRunner, retry_delay_seconds
 
 pytestmark = pytest.mark.usefixtures("database_url", "kafka_bootstrap_servers")
 
@@ -187,39 +187,30 @@ async def test_permanent_error_dead_letters_on_first_attempt(database_url: str) 
         await engine.dispose()
 
 
-@pytest.mark.asyncio
-async def test_retry_backoff_increases_between_attempts(database_url: str) -> None:
-    """Confirms the delay actually grows (roughly 2x, capped), not just that
-    retries happen at all."""
-    engine = create_async_engine(database_url, poolclass=NullPool)
-    topic = f"backoff-timing-{uuid.uuid4()}"
-    job_id = await _create_committed_job(engine, topic, max_attempts=4, fail=True)
-    await _produce(topic, job_id, fail=True)
+def test_retry_backoff_doubles_each_attempt() -> None:
+    """The backoff progression, asserted on the calculation itself.
 
-    sessionmaker = async_sessionmaker(bind=engine, expire_on_commit=False)
-    runner = WorkerRunner(
-        DummyWorker(),
-        sessionmaker,
-        bootstrap_servers=get_settings().kafka_bootstrap_servers,
-        topic=topic,
-        group_id=f"setu-{topic}-workers",
-        retry_base_delay_seconds=0.3,
-        retry_max_delay_seconds=5.0,
-    )
+    This used to be an integration test measuring wall-clock time between
+    consume_one() calls. It was intermittently failing: the first call
+    also pays Kafka consumer-group join and metadata-fetch cost, so under
+    load the first delta could exceed the second and the assertion flipped
+    even though the backoff was perfectly correct. It was measuring the
+    harness, not the thing under test.
+    """
+    delays = [retry_delay_seconds(attempt, base=0.3, maximum=5.0) for attempt in (1, 2, 3)]
 
-    try:
-        loop = asyncio.get_event_loop()
-        deltas = []
-        last = loop.time()
-        for _ in range(3):  # 3 RETRY outcomes before the 4th (final) attempt
-            await runner.consume_one()
-            now = loop.time()
-            deltas.append(now - last)
-            last = now
+    assert delays == [0.3, 0.6, 1.2]
 
-        # attempt 1 -> ~0.3s, attempt 2 -> ~0.6s, attempt 3 -> ~1.2s
-        assert deltas[0] < deltas[1] < deltas[2]
-    finally:
-        await runner.stop()
-        await _cleanup(engine, job_id)
-        await engine.dispose()
+
+def test_retry_backoff_is_capped() -> None:
+    """The cap is what stops a long retry budget turning into an
+    unbounded wait — worth pinning separately from the doubling."""
+    assert retry_delay_seconds(attempt=10, base=2.0, maximum=30.0) == 30.0
+    assert retry_delay_seconds(attempt=1, base=40.0, maximum=30.0) == 30.0
+
+
+def test_retry_backoff_starts_at_base_on_the_first_attempt() -> None:
+    """attempt is 1-based, matching StageProcessingService's counter. An
+    off-by-one here would either skip the first backoff entirely or double
+    every wait in production."""
+    assert retry_delay_seconds(attempt=1, base=2.0, maximum=30.0) == 2.0

@@ -32,9 +32,13 @@ from backend.repositories.video_repository import VideoRepository
 from backend.services.job_submission_service import JobSubmissionResult, JobSubmissionService
 from backend.services.planner_context import build_video_contexts
 from backend.services.proposal import Proposal
-from backend.services.workflow_compiler import ExecutionContext, compile_workflow
+from backend.services.workflow_compiler import (
+    ExecutionContext,
+    UnknownVideoHandleError,
+    compile_workflow,
+)
 
-__all__ = ["NoPendingProposalError", "ProposalConfirmationService"]
+__all__ = ["NoPendingProposalError", "ProposalConfirmationService", "UnknownVideoHandleError"]
 
 
 class NoPendingProposalError(Exception):
@@ -56,6 +60,24 @@ class ProposalConfirmationService:
         self._jobs = JobSubmissionService(session)
 
     async def confirm(self, project_id: uuid.UUID) -> JobSubmissionResult:
+        """Execute the latest proposal for real."""
+        return await self._submit(project_id, preview=False)
+
+    async def preview(self, project_id: uuid.UUID) -> JobSubmissionResult:
+        """Execute the latest proposal as a fast, low-resolution render.
+
+        Same proposal, same capabilities, same execution path -- only the
+        compilation mode differs. Kept as a sibling of confirm() over one
+        shared body so the two provably cannot diverge in how they locate
+        or compile the proposal; if they did, a preview would stop being
+        evidence about what the real render will produce, which is its
+        entire purpose.
+        """
+        return await self._submit(project_id, preview=True)
+
+    async def _submit(
+        self, project_id: uuid.UUID, *, preview: bool
+    ) -> JobSubmissionResult:
         if await self._projects.get(project_id) is None:
             raise ProjectNotFoundError(project_id)
 
@@ -75,9 +97,17 @@ class ProposalConfirmationService:
             video_context.handle: video.storage_uri
             for video_context, video in zip(build_video_contexts(videos), videos)
         }
-        workflow, payload = compile_workflow(proposal, ExecutionContext(video_uris=video_uris))
+        workflow, payload = compile_workflow(
+            proposal, ExecutionContext(video_uris=video_uris, preview=preview)
+        )
 
-        idempotency_key = f"confirm-proposal:{conversation.id}:{proposal_message.id}"
+        # Separate namespaces, so previewing a proposal and then confirming
+        # it produce two distinct jobs rather than the confirm replaying the
+        # preview's low-resolution result -- which is exactly what a single
+        # shared key would do, since everything else about the two calls is
+        # identical by construction.
+        prefix = "preview-proposal" if preview else "confirm-proposal"
+        idempotency_key = f"{prefix}:{conversation.id}:{proposal_message.id}"
         return await self._jobs.submit(
             idempotency_key=idempotency_key, workflow=workflow, payload=payload
         )

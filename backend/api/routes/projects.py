@@ -32,6 +32,7 @@ from backend.services.planner_factory import get_default_planner
 from backend.services.proposal_confirmation_service import (
     NoPendingProposalError,
     ProposalConfirmationService,
+    UnknownVideoHandleError,
 )
 from backend.services.video_upload_service import VideoUploadService
 
@@ -132,6 +133,41 @@ async def confirm_proposal(project_id: uuid.UUID, session: SessionDep) -> Confir
     except NoPendingProposalError as exc:
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT, detail="no pending proposal to confirm"
+        ) from exc
+    except UnknownVideoHandleError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"proposal references unknown video handle '{exc.video_id}'",
+        ) from exc
+    return ConfirmProposalResponse(job_id=result.job.id, replayed=result.replayed)
+
+
+@router.post("/{project_id}/preview-proposal", response_model=ConfirmProposalResponse)
+async def preview_proposal(project_id: uuid.UUID, session: SessionDep) -> ConfirmProposalResponse:
+    """Render the latest proposal fast and low-resolution, for review.
+
+    Deliberately a sibling of confirm-proposal rather than a flag on it:
+    previewing is a different intent from committing, and Phase 9a will
+    gate the two differently -- a preview is cheap and reversible, a
+    confirm is what the room's approval policy governs.
+
+    Returns the same shape as confirm-proposal: a preview is an ordinary
+    Job, polled and downloaded through exactly the same endpoints.
+    """
+    try:
+        result = await ProposalConfirmationService(session).preview(project_id)
+    except ProjectNotFoundError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="project not found"
+        ) from exc
+    except NoPendingProposalError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT, detail="no pending proposal to preview"
+        ) from exc
+    except UnknownVideoHandleError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"proposal references unknown video handle '{exc.video_id}'",
         ) from exc
     return ConfirmProposalResponse(job_id=result.job.id, replayed=result.replayed)
 

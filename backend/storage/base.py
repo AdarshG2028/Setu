@@ -7,10 +7,12 @@ behind this same interface without touching anything that calls it.
 """
 
 from abc import ABC, abstractmethod
+from typing import BinaryIO
 
 
 class StorageObjectNotFoundError(Exception):
-    """Raised by get()/exists() when a URI isn't one this backend wrote."""
+    """Raised by get()/exists()/open_stream() when a URI isn't one this
+    backend wrote."""
 
 
 class Storage(ABC):
@@ -33,3 +35,18 @@ class Storage(ABC):
     @abstractmethod
     def exists(self, uri: str) -> bool:
         """Whether this URI refers to something this backend has stored."""
+
+    @abstractmethod
+    def open_stream(self, uri: str) -> BinaryIO:
+        """Open the stored object for incremental reading.
+
+        Separate from get() because the objects here are videos: reading a
+        few hundred megabytes into memory to hand them to an HTTP response
+        is fine exactly once and awful under any concurrency. Callers that
+        genuinely want the whole thing in memory (a worker about to feed
+        it to ffmpeg) keep using get().
+
+        The caller owns closing the returned stream.
+
+        Raises StorageObjectNotFoundError if the URI is unknown.
+        """
