@@ -15,9 +15,36 @@ from backend.messaging.kafka_producer import build_producer
 from backend.messaging.outbox_publisher import OutboxPublisher
 from backend.observability.logging import configure_logging
 from backend.observability.metrics import poll_job_lifecycle_gauges
+from backend.services.artifact_cleanup_service import ArtifactCleanupService
 from backend.observability.tracing import configure_tracing
 
 logger = logging.getLogger(__name__)
+
+
+async def _sweep_artifacts_forever(stop_event: asyncio.Event, settings: Settings) -> None:
+    """Periodically drop intermediate artifacts from long-finished jobs.
+
+    Runs in the API rather than a worker because it is storage-wide
+    housekeeping, not per-stage work, and the API is the one process
+    guaranteed to be running. Every failure is swallowed and retried next
+    tick: reclaiming disk is never worth taking the API down for.
+    """
+    if not settings.artifact_cleanup_enabled:
+        return
+    while not stop_event.is_set():
+        try:
+            async with get_sessionmaker()() as session:
+                await ArtifactCleanupService(session).sweep(
+                    retention_hours=settings.artifact_retention_hours
+                )
+        except Exception:
+            logger.exception("artifact cleanup pass failed; will retry")
+        try:
+            await asyncio.wait_for(
+                stop_event.wait(), timeout=settings.artifact_cleanup_interval_seconds
+            )
+        except TimeoutError:
+            continue
 
 
 @asynccontextmanager
@@ -41,6 +68,9 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     )
     stop_event = asyncio.Event()
     publisher_task = asyncio.create_task(publisher.run_forever(stop_event))
+    cleanup_task = asyncio.create_task(
+        _sweep_artifacts_forever(stop_event, settings)
+    )
     metrics_task = asyncio.create_task(
         poll_job_lifecycle_gauges(
             get_sessionmaker(), stop_event, settings.metrics_poll_interval_seconds
@@ -53,6 +83,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         stop_event.set()
         await publisher_task
         await metrics_task
+        await cleanup_task
         await publisher.stop()
 
 

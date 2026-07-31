@@ -91,6 +91,15 @@ class Settings(BaseSettings):
     # ultrafast.
     video_encode_preset: str = "veryfast"
 
+    # Intermediate artifacts are kept this long after a job finishes, then
+    # swept. Not zero: every stage's output is what makes "which step went
+    # wrong" answerable, and a preview is worth re-watching. But nothing
+    # deleted anything at all before this, and each stage stores a full
+    # copy -- a 6-stage job on a 100MB source leaves ~600MB forever.
+    artifact_retention_hours: float = 24.0
+    artifact_cleanup_interval_seconds: float = 900.0
+    artifact_cleanup_enabled: bool = True
+
 
 @lru_cache
 def get_settings() -> Settings:

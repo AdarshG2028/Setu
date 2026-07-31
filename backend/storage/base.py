@@ -44,6 +44,14 @@ class Storage(ABC):
         """
 
     @abstractmethod
+    def delete(self, uri: str) -> bool:
+        """Remove a stored object. Returns whether it was there to remove.
+
+        Idempotent by design: cleanup re-runs, and an object already gone
+        is the desired end state, not an error.
+        """
+
+    @abstractmethod
     def exists(self, uri: str) -> bool:
         """Whether this URI refers to something this backend has stored."""
 

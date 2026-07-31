@@ -42,6 +42,13 @@ class LocalDiskStorage(Storage):
             raise StorageObjectNotFoundError(uri)
         return path.read_bytes()
 
+    def delete(self, uri: str) -> bool:
+        path = self._path_for(uri)
+        if path is None or not path.is_file():
+            return False
+        path.unlink(missing_ok=True)
+        return True
+
     def exists(self, uri: str) -> bool:
         path = self._path_for(uri)
         return path is not None and path.is_file()

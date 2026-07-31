@@ -41,6 +41,14 @@ class Job(Base, TimestampMixin):
     started_at: Mapped[datetime | None] = mapped_column(
         sa.DateTime(timezone=True), nullable=True
     )
+    # Set once this job's intermediate artifacts have been swept
+    # (backend/services/artifact_cleanup_service.py). Nothing else reads
+    # it; it exists so the sweeper can skip jobs it has already handled
+    # rather than rescanning every finished job on every pass.
+    artifacts_cleaned_at: Mapped[datetime | None] = mapped_column(
+        sa.DateTime(timezone=True), nullable=True
+    )
+
     completed_at: Mapped[datetime | None] = mapped_column(
         sa.DateTime(timezone=True), nullable=True
     )
