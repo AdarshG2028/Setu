@@ -308,8 +308,17 @@ def put_asset(path: Path, kind: str = AssetKind.VIDEO) -> Asset:
 # --- subprocess wrappers ---------------------------------------------------
 
 
-async def run_ffmpeg(args: list[str]) -> str:
+async def run_ffmpeg(args: list[str], *, cwd: Path | None = None) -> str:
     """Run ffmpeg and return its stderr.
+
+    `cwd` exists for filters that take a file path as a filter *argument*
+    rather than as an input -- ffmpeg's `subtitles=` being the one that
+    matters here. Those paths are parsed by the filtergraph lexer, where
+    a backslash escapes and a colon separates options, so a Windows path
+    like C:\\Users\\...\\c.srt is mangled beyond rescue (verified: the
+    backslashes vanish and everything after "C" is read as an option).
+    Running from the file's own directory and naming it bare sidesteps
+    the escaping problem entirely, and does so identically on every OS.
 
     stderr is returned rather than discarded because ffmpeg reports its
     analysis filters (signalstats, loudnorm, volumedetect) there -- which
@@ -328,6 +337,7 @@ async def run_ffmpeg(args: list[str]) -> str:
             *args,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
+            cwd=str(cwd) if cwd else None,
         )
     except FileNotFoundError as exc:
         # Environment problem, not input: a redeploy or a retry landing on

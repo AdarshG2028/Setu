@@ -93,6 +93,12 @@ Phase 5 architecture review (2026-07-31), user-directed, before any Phase 5 code
 - **§20 gains four items:** multi-input/multi-output execution (item 6, the only backlog item requiring an execution-model change), partial re-run / resume-from-stage, artifact retention/GC, and capability filtering at scale (~30+ capabilities degrade prompt quality; the fix is retrieval, explicitly not multi-agent).
 - **Terminology unchanged.** The review used `"stages"`/`"parameters"`; the codebase uses `"workflow"`/`"params"`. Renaming would touch `Proposal.from_dict`, the planner response schema, the prompt, and every existing test for zero behavior change — and this document has already paid for one terminology drift (v6). Keeping existing keys.
 
+## Changelog from v11
+
+- **Phase 5F's transcription moves from local `faster-whisper` to Groq's hosted `whisper-large-v3`** (2026-07-31, before 5F was implemented). The same model weights either way, so v10's "no compromise on transcription quality" decision stands unchanged — this only moves where the inference runs. Verified before deciding: `groq>=1.6.0` is already a dependency for the planner, and its SDK already exposes `audio.transcriptions.create` with `timestamp_granularities`, so **5F now adds no new Python dependency at all** (v10 had planned one).
+- **The deployment target shrinks as a direct result.** Whisper was the only component requiring ~3GB of model on disk and 1.5-3GB resident RAM, and the sole reason a single-box deployment needed ~8GB; a 4GB instance is now comfortable. It also loses its status as "the sub-phase most likely to run long", since CPU-bound transcription at roughly 1-2x realtime was what earned it that label.
+- **The cost is a network dependency at job time**, recorded rather than glossed: not a new failure domain (planning already calls Groq), and it maps onto the existing taxonomy without additions — timeouts retry, rejected files DLQ. Groq's ~25MB upload cap is handled by sending extracted 16kHz mono audio (~14MB/hour) instead of the video. (§9, §19 Phase 5F, §19 Phase 10)
+
 ---
 
 ## 1. General direction (confirmed, unchanged)
@@ -246,7 +252,7 @@ Updated per v10 — the Phase 5 capability set. One worker per stage name; stage
 | Audio Worker | `audio` | 5D | normalization, silence removal |
 | Trim Worker | `trim` | 5E | cut to a time range |
 | Merge Worker | `merge` | 5E | concatenate clips (first stage only) |
-| Transcribe Worker | `transcribe` | 5F | Whisper `large-v3` → transcript + srt assets |
+| Transcribe Worker | `transcribe` | 5F | Groq-hosted `whisper-large-v3` → transcript + srt assets |
 | Subtitle Burn Worker | `burn_subtitles` | 5F | burns an srt asset into the video |
 | Render Worker | `render` | 5G | final container/resolution/bitrate |
 | Stabilization Worker | `stabilize` | — | later, not required for V1 (§20 item 4) |
@@ -574,7 +580,9 @@ Everything later capabilities reuse. No user-visible capability ships here; this
 **Phase 5F — Transcript & subtitles** — `transcribe`, `burn_subtitles`
 
 - **Split into two capabilities.** `transcribe` produces `transcript` + `srt` assets and passes the video through untouched; `burn_subtitles` consumes video + srt and produces a new video. The split is what makes the `.srt` a first-class downloadable artifact (people upload subtitle files to YouTube directly) rather than only existing as burned-in pixels. Monotonic accumulation (5A) means the two never need to be adjacent.
-- **`faster-whisper` running `large-v3`** — quality is the explicit priority. It is a CTranslate2 reimplementation of the *same* Whisper weights, not a lower-accuracy alternative; it trades nothing on transcription quality and only avoids a full PyTorch install. Accepted costs, flagged going in: a multi-GB first-run download, and meaningfully slow CPU inference. This is the sub-phase most likely to run long — isolated here so it never blocks the others.
+- **Transcription runs on Groq's hosted `whisper-large-v3`** (revised per Changelog v11; an earlier draft specified running `faster-whisper` locally). Same model weights, so the "no compromise on transcription quality" decision is unchanged — only where the inference happens moves. `groq>=1.6.0` is already a dependency for the planner and its SDK already exposes `audio.transcriptions.create` with `timestamp_granularities`, which is exactly what SRT cue timings need, so **this sub-phase adds no new dependency at all.**
+- **What that removes:** a ~3GB model download, 1.5–3GB of resident RAM during inference, and CPU-bound transcription running at roughly 1–2× realtime on a small instance. Whisper was the single reason the deployment target needed 8GB; without it a 4GB box is comfortable. It also stops being "the sub-phase most likely to run long".
+- **What it costs, stated plainly:** transcription now needs the network at job time. That is not a new failure domain — planning already depends on Groq — and it maps onto the existing error split without inventing anything: a timeout or connection failure is a retryable `MediaProcessingError`, a rejected file is a permanent `InvalidMediaParamsError`. Groq caps upload size (~25MB on the free tier), which is why the worker sends *extracted audio* rather than the video: `-ar 16000 -ac 1 -b:a 32k` is around 14MB per hour of speech, so even long clips fit with room to spare.
 - **Sequenced after 5D** so duration-changing audio edits (`remove_silence`) run *before* transcription, keeping subtitle timing aligned with the final video. Known, accepted, undetected limitation: asset *presence* is validated, asset *timing validity* is not — a future duration-changing capability inserted between `transcribe` and `burn_subtitles` would drift, and nothing catches it. Out of scope for this phase; recorded so it isn't rediscovered as a surprise.
 - **Acceptance.** Transcript spot-checked against known speech (substring, not exact — ASR varies); burn-in presence confirmed by frame comparison rather than OCR.
 
@@ -788,7 +796,7 @@ One vote row per member per proposal; a member may change their vote while the p
 
 Because Phase 5A defines `Asset` as a clean serializable value object rather than burying `{kind, uri}` inline in each worker's dict, that promotion is a new table plus a write — not a refactor of every capability. This is the specific reason the asset model was worth building properly in Phase 5 rather than threading a single `output_uri` string through.
 
-**Immediate payoff before any of the AI work lands:** caching the transcript against the *video* rather than the job makes Phase 5's preview loop genuinely fast. Transcription is the one expensive step that doesn't get cheaper at preview resolution — it runs on audio — so without caching, any preview containing `transcribe` pays full `large-v3` cost and "fast preview" is a lie for exactly the workflows people most want to check. Transcribe once, reuse across previews, re-runs, and final renders. **This is worth pulling forward ahead of the rest of Phase 10** whenever the preview loop starts feeling slow.
+**Immediate payoff before any of the AI work lands:** caching the transcript against the *video* rather than the job makes Phase 5's preview loop genuinely fast. Transcription is the one expensive step that doesn't get cheaper at preview resolution — it runs on audio — so without caching, any preview containing `transcribe` pays the full transcription round-trip (and its per-minute cost) again, and "fast preview" is a lie for exactly the workflows people most want to check. Transcribe once, reuse across previews, re-runs, and final renders. **This is worth pulling forward ahead of the rest of Phase 10** whenever the preview loop starts feeling slow.
 
 **Likely capabilities** (each still a normal capability under Phase 5's model — new asset kinds, not new machinery): scene/shot detection, speaker diarization, object and face detection, filler-word detection, saliency for auto-reframe, and embeddings for semantic search across a project's footage.
 

@@ -1,0 +1,179 @@
+"""TranscribeWorker — speech to a transcript and a subtitle file (5F).
+
+Produces two new assets and passes the video through **untouched**: this
+stage never re-encodes, so its output video is the same stored object it
+was handed. That is what lets `transcribe` sit anywhere in a workflow
+without costing a generation of quality.
+
+Splitting transcription from burn-in (rather than one `subtitle` stage) is
+what makes the `.srt` a first-class artifact a user can download and take
+elsewhere — YouTube and every social platform accept a subtitle file
+directly, and burned-in pixels can never be turned back into one.
+"""
+
+import json
+from typing import Any
+
+from backend.core.config import get_settings
+from backend.services.transcription_client import (
+    GroqTranscriptionClient,
+    TranscriptionClient,
+    TranscriptionError,
+    TranscriptSegment,
+    UnusableAudioError,
+)
+from backend.workers.base import StageMessage, Worker
+from backend.workers.media import (
+    Asset,
+    AssetKind,
+    InvalidMediaParamsError,
+    MediaProcessingError,
+    assets_payload,
+    forward_assets,
+    materialize_to_tempfile,
+    output_tempfile,
+    previous_assets,
+    put_asset,
+    resolve_input_uri,
+    run_ffmpeg,
+    stage_params,
+)
+
+# Whisper works on 16kHz mono; anything richer is discarded by the model
+# anyway. At 32kbps this is roughly 14MB per hour of speech, comfortably
+# inside Groq's upload cap -- which is the reason the video itself is
+# never uploaded.
+_AUDIO_ARGS = ["-vn", "-ar", "16000", "-ac", "1", "-c:a", "libmp3lame", "-b:a", "32k"]
+
+
+class TranscribeWorker(Worker):
+    name = "transcribe"
+
+    def __init__(self, client: TranscriptionClient | None = None) -> None:
+        # Injectable so tests exercise the real audio extraction and SRT
+        # building without calling a paid API over the network.
+        self._client = client
+
+    def _resolve_client(self) -> TranscriptionClient:
+        if self._client is not None:
+            return self._client
+        settings = get_settings()
+        if not settings.groq_api_key:
+            raise MediaProcessingError(
+                "transcription needs GROQ_API_KEY; the worker cannot transcribe "
+                "without it"
+            )
+        return GroqTranscriptionClient(
+            api_key=settings.groq_api_key, model=settings.groq_transcription_model
+        )
+
+    async def process(
+        self, message: StageMessage, previous_output: dict[str, Any] | None
+    ) -> dict[str, Any]:
+        params = stage_params(message)
+        unknown = set(params) - {"language"}
+        if unknown:
+            raise InvalidMediaParamsError(
+                f"transcribe got unknown parameter(s): {', '.join(sorted(unknown))}"
+            )
+        language = params.get("language")
+        if language is not None and (not isinstance(language, str) or not language.strip()):
+            raise InvalidMediaParamsError(
+                f"transcribe's 'language' must be a language code like 'en'; got {language!r}"
+            )
+
+        source_uri = resolve_input_uri(message, previous_output)
+        audio = await _extract_audio(source_uri)
+
+        try:
+            result = await self._resolve_client().transcribe(
+                audio, filename="audio.mp3", language=language
+            )
+        except UnusableAudioError as exc:
+            # The audio is the problem; identical bytes will fail the same
+            # way, so this belongs in the DLQ rather than the retry queue.
+            raise InvalidMediaParamsError(str(exc)) from exc
+        except TranscriptionError as exc:
+            raise MediaProcessingError(str(exc)) from exc
+
+        if not result.segments:
+            raise InvalidMediaParamsError(
+                "no speech found in this video, so there is nothing to transcribe"
+            )
+
+        transcript = put_asset_bytes(
+            json.dumps(
+                {
+                    "text": result.text,
+                    "language": result.language,
+                    "segments": [
+                        {"start": s.start, "end": s.end, "text": s.text}
+                        for s in result.segments
+                    ],
+                },
+                ensure_ascii=False,
+                indent=2,
+            ).encode("utf-8"),
+            "transcript.json",
+            AssetKind.TRANSCRIPT,
+        )
+        srt = put_asset_bytes(
+            build_srt(result.segments).encode("utf-8"), "captions.srt", AssetKind.SRT
+        )
+
+        # The video asset is forwarded exactly as received -- same URI, no
+        # re-upload, no re-encode.
+        carried = previous_assets(previous_output)
+        produced = [transcript, srt]
+        if not carried:
+            produced.insert(0, Asset(kind=AssetKind.VIDEO, uri=source_uri))
+        return assets_payload(forward_assets(carried, produced))
+
+
+def put_asset_bytes(data: bytes, filename: str, kind: str) -> Asset:
+    """Store generated bytes as an asset.
+
+    media.put_asset takes a local path because every other capability
+    produces a file on disk; these two artifacts are built in memory.
+    """
+    from backend.storage import get_storage
+
+    return Asset(kind=kind, uri=get_storage().put(data, suggested_name=filename))
+
+
+async def _extract_audio(source_uri: str) -> bytes:
+    with materialize_to_tempfile(source_uri) as source:
+        with output_tempfile(".mp3") as destination:
+            await run_ffmpeg(["-i", str(source), *_AUDIO_ARGS, str(destination)])
+            if not destination.is_file() or destination.stat().st_size == 0:
+                raise InvalidMediaParamsError(
+                    "this video has no audio track to transcribe"
+                )
+            return destination.read_bytes()
+
+
+def build_srt(segments: list[TranscriptSegment]) -> str:
+    """Render segments as SubRip.
+
+    Cues are 1-indexed with `HH:MM:SS,mmm` timestamps and a blank line
+    between them; ffmpeg's subtitles filter and every player are strict
+    about that shape, including the trailing newline.
+    """
+    blocks = []
+    for index, segment in enumerate(segments, start=1):
+        blocks.append(
+            f"{index}\n{_timestamp(segment.start)} --> {_timestamp(segment.end)}\n"
+            f"{segment.text}\n"
+        )
+    return "\n".join(blocks)
+
+
+def _timestamp(seconds: float) -> str:
+    seconds = max(0.0, seconds)
+    whole = int(seconds)
+    milliseconds = int(round((seconds - whole) * 1000))
+    if milliseconds == 1000:  # rounding carried into the next second
+        whole, milliseconds = whole + 1, 0
+    hours, remainder = divmod(whole, 3600)
+    minutes, secs = divmod(remainder, 60)
+    return f"{hours:02d}:{minutes:02d}:{secs:02d},{milliseconds:03d}"

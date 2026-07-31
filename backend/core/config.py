@@ -76,6 +76,11 @@ class Settings(BaseSettings):
     # despite being Groq's most commonly used default (confirmed live,
     # 2026-07-28: 400 invalid_request_error) -- openai/gpt-oss-20b does.
     groq_model: str = "openai/gpt-oss-20b"
+    # Speech-to-text runs on the same provider as planning but a different
+    # model. whisper-large-v3 is the same checkpoint one would run locally
+    # (Changelog v11) -- hosting it removes the model download and the RAM
+    # it needs, without trading transcription quality.
+    groq_transcription_model: str = "whisper-large-v3"
 
 
 @lru_cache

@@ -157,5 +157,87 @@ DEFAULT_CAPABILITY_REGISTRY = CapabilityRegistry(
             ),
             parameter_schema={"aspect_ratio": str, "pad_color": str},
         ),
+        "audio": StageCapability(
+            name="audio",
+            description=(
+                "Clean up the soundtrack. 'normalize' evens out inconsistent "
+                "volume and brings the clip to a standard loudness for online "
+                "video -- use it whenever audio is too quiet, too loud, or jumps "
+                "around. 'remove_silence' trims dead air from the start and end "
+                "of the clip, so it begins the moment something happens. Set "
+                "'preserve_music' when the audio is musical and its pauses are "
+                "intentional; that turns silence trimming off. At least one of "
+                "normalize or remove_silence must be true."
+            ),
+            parameter_schema={
+                "normalize": bool,
+                "remove_silence": bool,
+                "preserve_music": bool,
+            },
+        ),
+        "trim": StageCapability(
+            name="trim",
+            description=(
+                "Cut the video down to a time range, given in seconds. 'start' "
+                "alone drops everything before it; 'end' alone drops everything "
+                "after it; both together keep only what lies between. Use for "
+                "removing a slow intro, cutting a rambling tail, or keeping one "
+                "section of a longer recording. Can be used more than once in a "
+                "workflow -- each trim applies to the result of the one before."
+            ),
+            parameter_schema={"start": float, "end": float},
+        ),
+        "merge": StageCapability(
+            name="merge",
+            description=(
+                "Join several videos end to end into a single clip, in the order "
+                "listed in video_ids. Requires at least two videos, and must be "
+                "the FIRST stage of the workflow -- later stages operate on one "
+                "video, so a merge cannot be placed after other edits. To edit "
+                "the joined result, put merge first and the other stages after "
+                "it. Clips of different sizes are fitted onto the first clip's "
+                "frame; clips without sound are joined with silence."
+            ),
+            parameter_schema={},
+        ),
+        "transcribe": StageCapability(
+            name="transcribe",
+            description=(
+                "Listen to the speech in the video and produce a text transcript "
+                "plus a subtitle (.srt) file. Does not change the video itself. "
+                "Use it whenever captions or a transcript are wanted -- and note "
+                "it must come BEFORE 'burn_subtitles', which needs the subtitle "
+                "file this produces. 'language' is an optional hint like 'en' or "
+                "'es'; leave it out to detect the language automatically."
+            ),
+            parameter_schema={"language": str},
+            produces_asset_kinds=("video", "transcript", "srt"),
+        ),
+        "burn_subtitles": StageCapability(
+            name="burn_subtitles",
+            description=(
+                "Draw captions permanently into the picture, so they show without "
+                "the viewer turning subtitles on -- which is what social video "
+                "needs, since most of it is watched muted. Requires a 'transcribe' "
+                "stage earlier in the workflow to supply the subtitle file. "
+                "'style' is one of default, large, small."
+            ),
+            parameter_schema={"style": str},
+            requires_asset_kinds=("video", "srt"),
+        ),
+        "render": StageCapability(
+            name="render",
+            description=(
+                "Produce the final file in a chosen format, resolution and "
+                "quality. 'format' is mp4 (plays everywhere, the safe default), "
+                "mov, webm, or gif (silent, short loops). 'resolution' is a "
+                "shorthand like '1080p' or '720p' -- width follows automatically "
+                "so nothing is stretched. 'bitrate' like '5M' or '2500k' trades "
+                "file size against quality. Usually the last stage, but it does "
+                "not have to be: rendering a master and then trimming a short "
+                "clip from it is perfectly valid."
+            ),
+            parameter_schema={"resolution": str, "format": str, "bitrate": str},
+        ),
     }
 )
