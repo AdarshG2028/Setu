@@ -7,6 +7,7 @@ behind this same interface without touching anything that calls it.
 """
 
 from abc import ABC, abstractmethod
+from os import PathLike
 from typing import BinaryIO
 
 
@@ -23,6 +24,16 @@ class Storage(ABC):
         suggested_name is a hint (e.g. for preserving a file extension) —
         the backend decides the actual key, so callers never assume the
         returned URI resembles the suggested name.
+        """
+
+    @abstractmethod
+    def put_file(self, path: "PathLike[str] | str", *, suggested_name: str | None = None) -> str:
+        """Persist a file already on disk, without reading it into memory.
+
+        Every capability writes its output to a temp file and then stores
+        it, so put(path.read_bytes()) meant holding the whole render in
+        RAM purely to hand it over. An S3 backend maps this onto
+        upload_file, which also gets multipart uploads for free.
         """
 
     @abstractmethod

@@ -340,3 +340,42 @@ async def test_preview_still_overrides_with_ultrafast(
     await process_video(_message(video_uris=[source], preview=True), None)
 
     assert captured[0][captured[0].index("-preset") + 1] == "ultrafast"
+
+
+@pytest.mark.parametrize("megabytes", [1, 8, 32])
+def test_materialising_holds_constant_memory_regardless_of_size(storage, megabytes) -> None:
+    """Measured before this was streamed: a 200MB video meant a 200MB
+    resident spike, per worker, per stage — enough to OOM a small
+    instance running several workers, for bytes that were only ever going
+    straight to disk."""
+    import tracemalloc
+
+    uri = storage.put(b"\0" * (megabytes * 1024 * 1024), suggested_name="big.mp4")
+
+    tracemalloc.start()
+    with materialize_to_tempfile(uri) as path:
+        written = path.stat().st_size
+    _, peak = tracemalloc.get_traced_memory()
+    tracemalloc.stop()
+
+    assert written == megabytes * 1024 * 1024, "must still copy the file faithfully"
+    assert peak < 4 * 1024 * 1024, (
+        f"held {peak / 1024 / 1024:.1f}MB for a {megabytes}MB file — not streaming"
+    )
+
+
+def test_storing_an_output_holds_constant_memory(storage, tmp_path) -> None:
+    """The same waste on the write side: put(path.read_bytes()) read a
+    whole render into memory purely to hand it to storage."""
+    import tracemalloc
+
+    source = tmp_path / "render.mp4"
+    source.write_bytes(b"\0" * (32 * 1024 * 1024))
+
+    tracemalloc.start()
+    asset = put_asset(source)
+    _, peak = tracemalloc.get_traced_memory()
+    tracemalloc.stop()
+
+    assert storage.size(asset.uri) == 32 * 1024 * 1024
+    assert peak < 4 * 1024 * 1024

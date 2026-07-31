@@ -71,6 +71,10 @@ __all__ = [
 # entire encode log into Job.last_error.
 _STDERR_TAIL = 500
 
+# Streaming copy size. Big enough that syscall overhead is irrelevant,
+# small enough that resident memory stays flat regardless of file size.
+_COPY_CHUNK_SIZE = 1024 * 1024
+
 # Preview caps output height rather than width so portrait and landscape
 # both shrink, and never upscales a source already smaller than the cap.
 # -2 keeps the other dimension even, which h264 requires. The comma inside
@@ -273,7 +277,7 @@ def materialize_to_tempfile(uri: str, suffix: str | None = None) -> Iterator[Pat
     flushed. Same reasoning as video_analysis_worker.py.
     """
     try:
-        data = get_storage().get(uri)
+        source = get_storage().open_stream(uri)
     except StorageObjectNotFoundError as exc:
         # The object won't materialize on a later attempt, so retrying
         # would burn the budget for nothing.
@@ -281,7 +285,14 @@ def materialize_to_tempfile(uri: str, suffix: str | None = None) -> Iterator[Pat
 
     tmp = tempfile.NamedTemporaryFile(suffix=suffix or Path(uri).suffix or ".mp4", delete=False)
     try:
-        tmp.write(data)
+        # Copied in chunks rather than via storage.get(), which returns the
+        # whole object as bytes. This runs for every stage of every job, so
+        # a 200MB video meant a 200MB resident spike per worker per stage
+        # (measured) -- enough to OOM a small instance running several
+        # workers, for a file that is only ever going straight to disk.
+        with source:
+            while chunk := source.read(_COPY_CHUNK_SIZE):
+                tmp.write(chunk)
         tmp.close()
         yield Path(tmp.name)
     finally:
@@ -303,7 +314,10 @@ def output_tempfile(suffix: str = ".mp4") -> Iterator[Path]:
 
 def put_asset(path: Path, kind: str = AssetKind.VIDEO) -> Asset:
     """Upload a locally-produced file and describe it as an Asset."""
-    return Asset(kind=kind, uri=get_storage().put(path.read_bytes(), suggested_name=path.name))
+    # put_file rather than put(path.read_bytes()): the output of a render
+    # can be hundreds of megabytes, and reading it into memory purely to
+    # hand it to storage is the same waste as on the read side.
+    return Asset(kind=kind, uri=get_storage().put_file(path, suggested_name=path.name))
 
 
 # --- subprocess wrappers ---------------------------------------------------

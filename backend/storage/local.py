@@ -4,6 +4,7 @@ would swap in an S3-compatible backend behind the same Storage interface;
 nothing outside this module would change.
 """
 
+import shutil
 import uuid
 from pathlib import Path
 from typing import BinaryIO
@@ -11,6 +12,7 @@ from typing import BinaryIO
 from backend.storage.base import Storage, StorageObjectNotFoundError
 
 _SCHEME = "local://"
+_COPY_CHUNK_SIZE = 1024 * 1024
 
 
 class LocalDiskStorage(Storage):
@@ -22,6 +24,16 @@ class LocalDiskStorage(Storage):
         suffix = Path(suggested_name).suffix if suggested_name else ""
         key = f"{uuid.uuid4().hex}{suffix}"
         (self._base_dir / key).write_bytes(data)
+        return f"{_SCHEME}{key}"
+
+    def put_file(self, path, *, suggested_name: str | None = None) -> str:
+        key = f"{uuid.uuid4().hex}{Path(suggested_name or path).suffix}"
+        destination = self._base_dir / key
+        # Copied rather than moved: the caller owns its temp file and
+        # deletes it in a finally block, and a move would pull the ground
+        # out from under that.
+        with open(path, "rb") as source, open(destination, "wb") as target:
+            shutil.copyfileobj(source, target, _COPY_CHUNK_SIZE)
         return f"{_SCHEME}{key}"
 
     def get(self, uri: str) -> bytes:
