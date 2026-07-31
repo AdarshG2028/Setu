@@ -99,6 +99,13 @@ Phase 5 architecture review (2026-07-31), user-directed, before any Phase 5 code
 - **The deployment target shrinks as a direct result.** Whisper was the only component requiring ~3GB of model on disk and 1.5-3GB resident RAM, and the sole reason a single-box deployment needed ~8GB; a 4GB instance is now comfortable. It also loses its status as "the sub-phase most likely to run long", since CPU-bound transcription at roughly 1-2x realtime was what earned it that label.
 - **The cost is a network dependency at job time**, recorded rather than glossed: not a new failure domain (planning already calls Groq), and it maps onto the existing taxonomy without additions — timeouts retry, rejected files DLQ. Groq's ~25MB upload cap is handled by sending extracted 16kHz mono audio (~14MB/hour) instead of the video. (§9, §19 Phase 5F, §19 Phase 10)
 
+## Changelog from v12
+
+- **Object storage promoted out of the backlog into Phase 5H** (2026-07-31, user-directed), targeting **Cloudflare R2**. Chosen for egress rather than storage cost — R2 charges nothing to serve, S3 roughly $0.09/GB, and serving video is where that compounds. Since R2 speaks the S3 API, `boto3` covers R2, B2 and MinIO equally, so this is a provider choice rather than a lock-in.
+- **Sequenced before Phase 6/7, not after.** The trigger is not that single-host storage has failed — it hasn't. It is that Phase 7 builds its download/preview UI against `GET /artifacts`, and this phase changes that endpoint from streaming bytes to redirecting to a presigned URL. Doing it after would mean reworking freshly-written frontend code. It also keeps migration free: with no real users the bucket can simply start empty, which stops being true once uploads are real.
+- **Local disk is not removed.** `STORAGE_BACKEND` selects it, and it stays the default for tests and no-credentials checkouts.
+- **Recorded as the phase's main risk:** `GET /artifacts` delegates path-traversal defence to the storage backend rather than duplicating it, so `S3Storage` must implement its own key validation. `uri` is attacker-controlled; a backend that passes it straight through reopens the hole `LocalDiskStorage._path_for` closes. (§19 Phase 5H, §20 item 11)
+
 ---
 
 ## 1. General direction (confirmed, unchanged)
@@ -594,6 +601,32 @@ Everything later capabilities reuse. No user-visible capability ships here; this
 
 ---
 
+### Phase 5H — Object storage (Cloudflare R2)
+
+**Goal.** Move media out of the API host's filesystem and into an S3-compatible bucket, so storage stops being tied to one machine's disk.
+
+**Why now, ahead of Phase 6/7.** Not because a single box has stopped working — it hasn't, and on EBS local disk is perfectly serviceable. It's sequencing: Phase 7 builds the download and preview UI against whatever `GET /artifacts` returns, and this phase changes that from *streamed bytes* to a *redirect*. Doing it afterwards means reworking frontend code written days earlier. Ten minutes of ordering now avoids that.
+
+**Why R2 specifically.** Egress, which is the cost that actually scales for video: storage is pennies, but serving a 100MB file 500 times is 50GB of transfer. R2 charges **nothing** for egress and includes 10GB of storage free; S3 charges roughly $0.09/GB out. R2 speaks the S3 API, so `boto3` covers R2, Backblaze B2 and MinIO alike — this is not a lock-in decision.
+
+**What actually changes.** Less than it looks, because the `Storage` ABC has been honoured: nothing outside `backend/storage/` parses or constructs a URI (verified — the only `local://` mentions elsewhere are a comment and an OpenAPI example), and there are exactly six call sites, all going through `get_storage()`.
+
+- **`backend/storage/s3.py`** (new): `S3Storage` implementing `put`/`get`/`exists`/`open_stream` against any S3-compatible endpoint, plus `presigned_url()`. `boto3` is a new dependency.
+- **`get_storage()` selects on config** (`STORAGE_BACKEND=local|s3`). Local disk stays the default and stays supported — it is what the test suite and a no-credentials checkout run on.
+- **`GET /artifacts` returns a 307 redirect to a presigned URL** when the backend supports one, instead of streaming bytes through the API. That is the whole point: the client pulls from Cloudflare and the API never touches the video. Falls back to the existing streaming path for local disk, so both backends work.
+
+**The security detail that must not be lost.** `GET /artifacts` deliberately does *not* re-check path traversal; it delegates to `LocalDiskStorage._path_for`, which rejects any key containing a separator or a relative segment. `uri` is attacker-controlled. **`S3Storage` therefore needs its own key validation** — a naive implementation that passes the key straight to `get_object` re-opens exactly the hole the local backend closes. This is the single highest-risk part of this phase.
+
+**Migration.** Effectively none, and deliberately so: with no real users the cheapest path is to start the bucket empty. The alternative — copying `./data/storage` and rewriting `local://` URIs across `videos.storage_uri`, `results.artifact_uri` and every `results.payload` asset list — is real work that buys nothing today (5 video rows, 10 result rows at time of writing). Doing this before Phase 7 is what keeps it that way; after real uploads exist, it becomes a genuine migration script.
+
+**Testing.** MinIO added to `docker/docker-compose.yml` — it speaks the S3 API, so the real `S3Storage` code path is exercised locally and in CI without a Cloudflare account or credentials in the repo. Gated by a `minio_available` fixture that skips cleanly when absent, matching the existing `ffmpeg_available`/`database_url` pattern. Traversal and key-validation tests run against it specifically.
+
+**R2 quirks worth knowing going in.** `region_name="auto"` and a custom `endpoint_url`; R2 rejects some S3 ACL parameters, since buckets are private by default and access is granted via presigned URLs rather than object ACLs. Neither is difficult, both surprise anyone expecting drop-in S3.
+
+**Worker changes.** None. **Database changes.** None — URIs stay opaque strings in the same columns.
+
+---
+
 ### Phase 6 — Memory / preference loop
 
 **Goal.** Close the loop described in §7/§17: preferences are actually read before planning (already true since Phase 2/4) and actually written after a successful real edit — via an explicit action, not a side effect hidden inside a read.
@@ -818,7 +851,7 @@ Kept separate deliberately, per "avoid over-engineering" — these are real, rea
 7. **Partial re-run / resume-from-stage.** Every stage's intermediate artifact already persists, so re-running a workflow after changing only its last capability could reuse the cached stage N-1 output instead of redoing everything upstream. Combined with preview (Phase 5A), this is what would make the iteration loop feel genuinely fast — "re-run the last step" rather than "re-run everything." Needs a cache-validity rule (which params invalidate which downstream stages), which is why it isn't free and isn't in Phase 5.
 8. **Artifact retention / garbage collection.** Nothing deletes anything today. A multi-stage job persists every intermediate plus the final output, forever, and preview jobs add throwaway low-res artifacts on top. Keeping intermediates is the right default (it's what makes item 7 possible), but preview artifacts specifically should be markable and collectable. Becomes a real problem with usage, not before.
 9. **DLQ replay tooling.** The `.dlq` topics are currently write-only — nothing consumes them, and Postgres independently holds the whole failure record (`job.status`, `job.last_error`, a `WorkerExecution` row per attempt), with `JOBS_DEAD_LETTERED_TOTAL` incremented from the Postgres path rather than the topic. Reviewed during Phase 5A and **deliberately kept anyway**, for a reason worth recording so it isn't re-litigated: the permanent-vs-transient split is knowingly coarse (`media.run_ffmpeg` classifies *every* nonzero ffmpeg exit as permanent, which sweeps in genuinely transient OOM/disk-full cases), and the DLQ is the backstop for that misclassification. Phase 5 adds many more such coarse judgments, so the safety net matters more than it did in Phases 0–4, not less. What's missing is a small `replay-dlq <topic>` command re-producing messages to the source topic — worth building once real users can have real dead-lettered jobs, i.e. after Phase 7, not before. Also note the cost side: every stage topic gets a `.dlq` sibling, so Phase 5's 13 capabilities mean ~26 topics against a Redpanda instance running `--memory=1G --smp=1` (its 256-partition cap already bit once, via accumulated test topics).
-11. **Object storage for media.** `LocalDiskStorage` is correct for the current shape -- API and workers on one host, sharing a filesystem -- and the `Storage` ABC (`put`/`get`/`exists`/`open_stream`) maps onto S3 in roughly fifty lines, so nothing outside `backend/storage/` changes. **The hard trigger is workers running on a different machine from the API**: at that point local disk doesn't degrade, it stops working, because a worker on one box cannot read what another wrote. Everything else is softer -- ephemeral platforms losing the disk on restart (an EC2 volume does not), and disk filling up, which is really backlog item 8. Worth doing alongside Phase 8, where multi-user collaboration makes both the volume and the multi-machine question real. **One design note for whoever does it:** the right pattern for S3 is not proxying bytes through `open_stream`, it is issuing a presigned URL and having `GET /artifacts` return a 307 redirect, so the client pulls straight from the bucket and the API never touches the video. That is a small change to `backend/api/routes/artifacts.py`, best made at the same time.
+11. **~~Object storage for media~~ — no longer backlog: scheduled as Phase 5H** (§19), pulled forward ahead of Phase 7 so the frontend is built against the final artifact-delivery shape rather than one that changes underneath it. Kept in this list so the numbering and the original reasoning stay traceable.
 12. **Capability filtering at scale.** The planner prompt renders every registered capability with its param schema. Fine at Phase 5's ~10; somewhere past ~30, prompt size and stage-selection accuracy both degrade. The fix when it comes is capability retrieval/filtering — narrowing what's offered per request — and explicitly **not** a multi-agent decomposition, which §5's principles rule out. Noted now so the ceiling is known rather than discovered.
 
 None of these require restructuring anything built in Phases 0–7 — that's the point of listing them here instead of folding them in early. Item 6 is the sole exception and is scoped accordingly: it changes the execution model itself, which is precisely why it's deferred to its own pass rather than absorbed into a capability sub-phase.
