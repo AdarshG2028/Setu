@@ -178,3 +178,52 @@ def test_a_user_with_no_preferences_adds_nothing() -> None:
 
 def test_no_preferences_object_adds_nothing() -> None:
     assert "told you before" not in _system_with_preferences(None)
+
+
+# --- video facts from analysis (found by live testing) ---------------------
+
+
+def _system_with_videos(videos) -> str:
+    context = PlannerContext(
+        project=None,
+        conversation_history=[],
+        videos=videos,
+        preferences=None,
+        capability_registry=DEFAULT_CAPABILITY_REGISTRY,
+        approval_policy=None,
+    )
+    return PromptBuilder().build(context).system
+
+
+def test_measured_video_facts_reach_the_planner() -> None:
+    """Found by using it: asked to "trim the last 10 seconds", the planner
+    replied asking how long the video was — despite video_analysis having
+    measured and stored exactly that on upload. It was only ever shown the
+    handle and a display name."""
+    system = _system_with_videos(
+        [
+            VideoContext(
+                handle="video_1",
+                video_id="x",
+                display_name="my clip",
+                duration_seconds=140.8,
+                resolution="1280x720",
+                orientation="landscape",
+            )
+        ]
+    )
+
+    assert "140.8s" in system
+    assert "1280x720" in system
+    assert "landscape" in system
+
+
+def test_a_video_without_analysis_still_renders() -> None:
+    """Analysis may still be running or may have failed. A planner that can
+    still propose something beats one that refuses."""
+    system = _system_with_videos(
+        [VideoContext(handle="video_1", video_id="x", display_name="unanalysed")]
+    )
+
+    assert "- video_1: unanalysed" in system
+    assert "(" not in system.split("- video_1: unanalysed")[1].split("\n")[0]

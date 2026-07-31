@@ -28,5 +28,20 @@ class ResultRepository:
         )
         return list(result.scalars().all())
 
+    async def get_many(
+        self, job_ids: list[uuid.UUID], stage: int = 0
+    ) -> dict[uuid.UUID, Result]:
+        """One query for several jobs' results at a given stage.
+
+        Used to attach each video's analysis to the planner's context; a
+        per-video lookup would mean N queries on every single message.
+        """
+        if not job_ids:
+            return {}
+        rows = await self._session.execute(
+            select(Result).where(Result.job_id.in_(job_ids), Result.stage == stage)
+        )
+        return {result.job_id: result for result in rows.scalars().all()}
+
     def add(self, result: Result) -> None:
         self._session.add(result)

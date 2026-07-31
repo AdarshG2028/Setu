@@ -39,6 +39,24 @@ _PREFERENCE_LABELS = (
 )
 
 
+def _video_facts(video: object) -> str:
+    """What analysis measured about this video, appended to its line.
+
+    Rendered inline rather than as a separate block so a handle and its
+    facts can never drift apart in a multi-video project. Duration is
+    given in seconds because every time-based capability (trim) takes
+    seconds, so the planner needs no conversion to use it.
+    """
+    facts = []
+    duration = getattr(video, "duration_seconds", None)
+    if duration:
+        facts.append(f"{duration:g}s long")
+    if resolution := getattr(video, "resolution", None):
+        orientation = getattr(video, "orientation", None)
+        facts.append(f"{resolution}{f' {orientation}' if orientation else ''}")
+    return f" ({', '.join(facts)})" if facts else ""
+
+
 def _render_preferences(preferences: object | None) -> list[str]:
     """Standing preferences, as lines the planner can actually read.
 
@@ -110,7 +128,7 @@ class PromptBuilder:
             "never by any other identifier):",
         ]
         for video in context.videos:
-            lines.append(f"- {video.handle}: {video.display_name}")
+            lines.append(f"- {video.handle}: {video.display_name}{_video_facts(video)}")
 
         lines.append("")
         lines.append("Available stages (only use these in `workflow`):")

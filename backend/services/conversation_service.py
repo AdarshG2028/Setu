@@ -22,6 +22,7 @@ from backend.core.config import get_settings
 from backend.models import Conversation, Message, MessageRole
 from backend.repositories.conversation_repository import ConversationRepository
 from backend.repositories.message_repository import MessageRepository
+from backend.repositories.result_repository import ResultRepository
 from backend.repositories.project_repository import ProjectNotFoundError, ProjectRepository
 from backend.repositories.user_preference_repository import UserPreferenceRepository
 from backend.repositories.video_repository import VideoRepository
@@ -85,7 +86,7 @@ class ConversationService:
         context = PlannerContext(
             project=project,
             conversation_history=history,
-            videos=build_video_contexts(videos),
+            videos=build_video_contexts(videos, await self._video_analysis(videos)),
             preferences=preferences,
             capability_registry=self._capability_registry,
         )
@@ -113,6 +114,29 @@ class ConversationService:
         # Unbounded: this is a user reading the transcript, not the planner's
         # bounded context window -- those are deliberately different limits.
         return await self._messages.list_by_conversation(conversation.id)
+
+    async def _video_analysis(self, videos: list) -> dict[str, dict]:
+        """Each video's measured metadata, keyed by video id.
+
+        The video_analysis worker records duration, resolution and
+        orientation on upload (§8), but the planner was never shown any of
+        it -- so asked to "trim the last 10 seconds" it had to ask how long
+        the video was, and asked to "make it vertical" it could not tell
+        that it already was.
+
+        Missing entries are normal, not errors: analysis may still be
+        running, or may have failed on an unusual file. The planner simply
+        gets less to work with.
+        """
+        job_ids = [v.latest_analysis_job_id for v in videos if v.latest_analysis_job_id]
+        if not job_ids:
+            return {}
+        results = await ResultRepository(self._session).get_many(job_ids)
+        return {
+            str(video.id): results[video.latest_analysis_job_id].payload
+            for video in videos
+            if video.latest_analysis_job_id in results
+        }
 
     async def _get_or_create_conversation(self, project_id: uuid.UUID) -> Conversation:
         conversation = await self._conversations.get_by_project(project_id)

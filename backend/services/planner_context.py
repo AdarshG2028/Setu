@@ -21,8 +21,23 @@ class VideoContext:
     video_id: str
     display_name: str
 
+    # Measured by the video_analysis worker on upload (§8) and stored on
+    # its Result. Optional because analysis may still be running, or may
+    # have failed, and a planner that can still propose *something* is
+    # better than one that refuses.
+    #
+    # Without these the planner is blind to facts the system already
+    # knows: asked to "trim the last 10 seconds" it has to ask how long
+    # the video is, and asked to "make it vertical" it cannot tell that it
+    # already is.
+    duration_seconds: float | None = None
+    resolution: str | None = None
+    orientation: str | None = None
 
-def build_video_contexts(videos: list[Video]) -> list[VideoContext]:
+
+def build_video_contexts(
+    videos: list[Video], analysis: dict[str, dict] | None = None
+) -> list[VideoContext]:
     """Assigns stable handles ("video_1", "video_2", ...) in the given
     order. Callers must pass videos in a consistent order (VideoRepository
     .list_by_project already orders by created_at) -- confirm-proposal
@@ -32,11 +47,15 @@ def build_video_contexts(videos: list[Video]) -> list[VideoContext]:
     "no proposal persistence in Phase 4" deferral; revisit if that
     assumption ever breaks in practice.
     """
+    analysis = analysis or {}
     return [
         VideoContext(
             handle=f"video_{i}",
             video_id=str(video.id),
             display_name=video.name or video.original_filename,
+            duration_seconds=analysis.get(str(video.id), {}).get("duration_seconds"),
+            resolution=analysis.get(str(video.id), {}).get("resolution"),
+            orientation=analysis.get(str(video.id), {}).get("orientation"),
         )
         for i, video in enumerate(videos, start=1)
     ]
