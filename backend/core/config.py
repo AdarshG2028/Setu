@@ -82,6 +82,15 @@ class Settings(BaseSettings):
     # it needs, without trading transcription quality.
     groq_transcription_model: str = "whisper-large-v3"
 
+    # x264 speed/size trade for full-quality renders. libx264's own default
+    # is "medium"; measured on a 140s 1080p clip, "veryfast" halved the
+    # encode (42s -> 23s) and produced a *smaller* file (2.6M -> 2.4M),
+    # so the usual speed-for-size trade doesn't apply at this point on the
+    # curve. Ignored by encoders that don't take it (vp9, gif), so it is
+    # safe to pass unconditionally. Preview mode overrides it with
+    # ultrafast.
+    video_encode_preset: str = "veryfast"
+
 
 @lru_cache
 def get_settings() -> Settings:

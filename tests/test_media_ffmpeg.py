@@ -15,6 +15,7 @@ from pathlib import Path
 
 import pytest
 
+import backend.workers.media as media
 from backend.storage.local import LocalDiskStorage
 from backend.workers.base import PermanentError, StageMessage
 from backend.workers.media import (
@@ -295,3 +296,47 @@ async def test_process_video_reports_a_missing_input_rather_than_running_ffmpeg(
 
     with pytest.raises(InvalidMediaParamsError, match="no input video"):
         await process_video(message, None)
+
+
+@pytest.mark.asyncio
+async def test_full_quality_encodes_use_the_configured_preset(
+    ffmpeg_available, storage, monkeypatch
+) -> None:
+    """libx264's own default is `medium`. Measured on a 140s 1080p clip,
+    `veryfast` halved the encode *and* produced a smaller file, so leaving
+    the default in place was costing time for nothing."""
+    captured: list[list[str]] = []
+    real = media.run_ffmpeg
+
+    async def spy(args, **kwargs):
+        captured.append(args)
+        return await real(args, **kwargs)
+
+    monkeypatch.setattr("backend.workers.media.run_ffmpeg", spy)
+    source = storage.put(_SAMPLE.read_bytes(), suggested_name="s.mp4")
+
+    await process_video(_message(video_uris=[source]), None, video_filters=["scale=160:-2"])
+
+    assert "-preset" in captured[0]
+    assert captured[0][captured[0].index("-preset") + 1] == "veryfast"
+
+
+@pytest.mark.asyncio
+async def test_preview_still_overrides_with_ultrafast(
+    ffmpeg_available, storage, monkeypatch
+) -> None:
+    """Preview optimises for turnaround, not size — it must not silently
+    inherit the full-quality preset."""
+    captured: list[list[str]] = []
+    real = media.run_ffmpeg
+
+    async def spy(args, **kwargs):
+        captured.append(args)
+        return await real(args, **kwargs)
+
+    monkeypatch.setattr("backend.workers.media.run_ffmpeg", spy)
+    source = storage.put(_SAMPLE.read_bytes(), suggested_name="s.mp4")
+
+    await process_video(_message(video_uris=[source], preview=True), None)
+
+    assert captured[0][captured[0].index("-preset") + 1] == "ultrafast"

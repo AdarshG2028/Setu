@@ -40,6 +40,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from backend.core.config import get_settings
 from backend.storage import StorageObjectNotFoundError, get_storage
 from backend.workers.base import PermanentError, StageMessage
 
@@ -454,6 +455,10 @@ async def process_video(
 
         if preview:
             args += list(_PREVIEW_OUTPUT_ARGS)
+        else:
+            # Placed before output_args so a capability that needs a
+            # specific preset can still override it -- later flags win.
+            args += ["-preset", get_settings().video_encode_preset]
         args += list(output_args or [])
 
         with output_tempfile(suffix) as destination:
