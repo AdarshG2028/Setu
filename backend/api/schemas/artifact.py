@@ -19,13 +19,24 @@ class ArtifactResponse(BaseModel):
     download_url: str
 
     @classmethod
-    def from_asset(cls, kind: str, uri: str) -> "ArtifactResponse":
+    def from_asset(cls, kind: str, uri: str, job_id: uuid.UUID) -> "ArtifactResponse":
         # The URI is passed back whole as a query parameter rather than
         # being split into a path segment: backend/storage/base.py's
         # contract is that callers store a URI and hand it back untouched,
         # never parse or construct one. Keeping that true here means an
         # S3-backed Storage needs no change to this route.
-        return cls(kind=kind, uri=uri, download_url=f"/artifacts?uri={quote(uri, safe='')}")
+        #
+        # job_id rides along because the download is authorized against
+        # the room that job belongs to (Phase 8). The route stays flat
+        # rather than nested under /jobs/{id}: the URI is still the
+        # address, the job is only the authorization context -- which
+        # matters because forwarded assets mean one object legitimately
+        # belongs to several jobs.
+        return cls(
+            kind=kind,
+            uri=uri,
+            download_url=f"/artifacts?uri={quote(uri, safe='')}&job_id={job_id}",
+        )
 
 
 class StageArtifactsResponse(BaseModel):

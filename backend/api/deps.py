@@ -33,17 +33,19 @@ out of a body.
 import uuid
 from typing import Annotated
 
-from fastapi import Depends, Header, HTTPException, status
+from fastapi import Depends, Header, HTTPException, Query, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from backend.database.session import get_session
 
 __all__ = [
+    "ArtifactAccessDep",
     "CurrentUserDep",
     "ProjectMemberDep",
     "SessionDep",
     "ProjectOwnerDep",
     "current_user_id",
+    "require_artifact_access",
     "require_project_member",
     "require_project_owner",
 ]
@@ -139,3 +141,44 @@ async def require_project_owner(
 
 
 ProjectOwnerDep = Annotated[uuid.UUID, Depends(require_project_owner)]
+
+
+async def require_artifact_access(
+    session: SessionDep,
+    user_id: CurrentUserDep,
+    uri: Annotated[str, Query(description="Opaque storage URI of the artifact to fetch.")],
+    job_id: Annotated[
+        uuid.UUID,
+        Query(
+            description=(
+                "The job this artifact was listed under -- from a "
+                "`download_url` in `GET /jobs/{job_id}/artifacts` or in a "
+                "room snapshot's exports. Required: it is the room context "
+                "the download is authorized against."
+            )
+        ),
+    ],
+) -> str:
+    """Confirm the caller may download this artifact, and return its URI.
+
+    A guard rather than an inline check, following the architecture doc's
+    own warning about membership checks scattered ad hoc across
+    endpoints.
+
+    **404 for every refusal**, matching require_project_member: not a
+    member, not that job's artifact, no such job and no such object are
+    deliberately indistinguishable. Any other code would confirm that a
+    given URI exists, which is the fact worth hiding.
+    """
+    from backend.services.artifact_access_service import ArtifactAccessService
+
+    if not await ArtifactAccessService(session).is_visible_to(
+        uri=uri, job_id=job_id, user_id=user_id
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="artifact not found"
+        )
+    return uri
+
+
+ArtifactAccessDep = Annotated[str, Depends(require_artifact_access)]

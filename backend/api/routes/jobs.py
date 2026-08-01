@@ -88,7 +88,7 @@ async def get_job_artifacts(job_id: uuid.UUID, session: SessionDep) -> JobArtifa
                 stage=result.stage,
                 worker_name=result.worker_name,
                 artifacts=[
-                    ArtifactResponse.from_asset(kind=asset.kind, uri=asset.uri)
+                    ArtifactResponse.from_asset(kind=asset.kind, uri=asset.uri, job_id=job.id)
                     for asset in previous_assets(result.payload)
                 ],
             )

@@ -132,7 +132,9 @@ async def get_room(
                 workflow=export.job.workflow["workflow"],
                 completed_at=export.job.completed_at,
                 artifacts=[
-                    ArtifactResponse.from_asset(kind=asset.kind, uri=asset.uri)
+                    ArtifactResponse.from_asset(
+                        kind=asset.kind, uri=asset.uri, job_id=export.job.id
+                    )
                     for asset in export.artifacts
                 ],
             )

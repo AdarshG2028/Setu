@@ -676,7 +676,9 @@ async def test_a_finished_job_leaves_active_and_appears_as_an_export(
         {
             "kind": "video",
             "uri": "local://final.mp4",
-            "download_url": "/artifacts?uri=local%3A%2F%2Ffinal.mp4",
+            # Carries the job so the download can be authorized against
+            # the room it belongs to (step 7).
+            "download_url": f"/artifacts?uri=local%3A%2F%2Ffinal.mp4&job_id={job_id}",
         }
     ]
 

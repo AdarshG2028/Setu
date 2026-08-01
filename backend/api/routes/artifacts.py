@@ -19,11 +19,12 @@ the entire point of reviewing output -- silently does nothing.
 import mimetypes
 import re
 from pathlib import Path
-from typing import Annotated, BinaryIO
+from typing import BinaryIO
 
-from fastapi import APIRouter, HTTPException, Query, Request, status
+from fastapi import APIRouter, HTTPException, Request, status
 from fastapi.responses import StreamingResponse
 
+from backend.api.deps import ArtifactAccessDep
 from backend.storage import StorageObjectNotFoundError, get_storage
 
 router = APIRouter(tags=["artifacts"])
@@ -105,23 +106,14 @@ def _stream(handle: BinaryIO, start: int, length: int):
 
 
 @router.get("/artifacts")
-def download_artifact(
-    request: Request,
-    uri: Annotated[
-        str,
-        Query(
-            # Spelled out because the natural mistake is to paste a job id
-            # here: this takes a storage URI, which only ever comes from a
-            # download_url in GET /jobs/{id}/artifacts.
-            description=(
-                "Opaque storage URI, taken from an artifact's `download_url` in "
-                "`GET /jobs/{job_id}/artifacts`. Not a job id."
-            ),
-            examples=["local://c4d46b7c4b2f4dbbaa6428fe06737f7f.mp4"],
-        ),
-    ],
-) -> StreamingResponse:
+async def download_artifact(request: Request, uri: ArtifactAccessDep) -> StreamingResponse:
     """Stream a stored artifact, honouring Range requests.
+
+    Both the `uri` and the `job_id` it is authorized against are declared
+    by require_artifact_access (backend/api/deps.py), which returns the
+    URI once the caller is confirmed to be a member of the room that job
+    belongs to. Phase 8: before this, anyone who could name a URI could
+    fetch its bytes.
 
     The URI arrives whole, exactly as the listing handed it out — this
     route never parses or reconstructs one, per backend/storage/base.py's
@@ -131,7 +123,9 @@ def download_artifact(
     LocalDiskStorage._path_for rejects any key containing a separator or
     a relative segment before it ever touches the filesystem, so a hostile
     `uri` fails the same way an unknown one does. Duplicating that check
-    here would risk the two drifting apart.
+    here would risk the two drifting apart. The guard runs first, so
+    reaching that code now also requires a hostile URI to have been
+    recorded as a real asset of a room's job.
     """
     storage = get_storage()
     try:

@@ -8,6 +8,7 @@ unambiguously crop's fault, not the download route's.
 """
 
 import uuid
+from types import SimpleNamespace
 from urllib.parse import quote
 
 import pytest
@@ -15,14 +16,23 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from sqlalchemy.pool import NullPool
 
-from backend.models import Job, JobStatus, Result
+from backend.models import Job, JobStatus, ProjectJob, Result
 from backend.storage.local import LocalDiskStorage
 from backend.workers.media import Asset, AssetKind, assets_payload
+from tests.conftest import as_user
 
 pytestmark = pytest.mark.usefixtures("database_url")
 
 
-async def _seed_job(engine, *, results: list[Result] | None = None) -> uuid.UUID:
+async def _seed_job(
+    engine, *, results: list[Result] | None = None, project_id: uuid.UUID | None = None
+) -> uuid.UUID:
+    """A completed job with hand-written stage results.
+
+    `project_id` binds it to a room the way a real submission would
+    (Phase 8's project_jobs). Left None it models a raw POST /jobs
+    submission, which belongs to no room by design.
+    """
     job_id = uuid.uuid4()
     sm = async_sessionmaker(bind=engine, expire_on_commit=False)
     async with sm() as session:
@@ -37,6 +47,12 @@ async def _seed_job(engine, *, results: list[Result] | None = None) -> uuid.UUID
             )
         )
         await session.flush()
+        if project_id is not None:
+            session.add(
+                ProjectJob(
+                    job_id=job_id, project_id=project_id, submitted_by_user_id=uuid.uuid4()
+                )
+            )
         for result in results or []:
             result.job_id = job_id
             session.add(result)
@@ -107,7 +123,10 @@ async def test_lists_assets_per_stage_with_download_urls(client, engine) -> None
         assert kinds == ["video", "srt"]
 
         srt = body["stages"][1]["artifacts"][1]
-        assert srt["download_url"] == f"/artifacts?uri={quote('local://c.srt', safe='')}"
+        assert (
+            srt["download_url"]
+            == f"/artifacts?uri={quote('local://c.srt', safe='')}&job_id={job_id}"
+        )
     finally:
         await _cleanup(engine, job_id)
 
@@ -138,42 +157,130 @@ async def test_listing_unknown_job_is_404(client) -> None:
 
 
 # --- download --------------------------------------------------------------
+#
+# Every download is now authorized against a room (Phase 8, step 7): the
+# URL carries the job the artifact was listed under, and the caller must
+# be a member of that job's project. So these tests, which are really
+# about streaming and Range handling, each need a room to publish into --
+# which is closer to production than the bare storage objects they used
+# before, where no artifact exists outside a job.
 
 
-def test_downloads_the_stored_bytes(client, artifact_storage) -> None:
-    uri = artifact_storage.put(b"pretend this is an mp4", suggested_name="clip.mp4")
+class _Published:
+    """A stored artifact plus the authorized URL and identity to fetch it."""
 
-    response = client.get("/artifacts", params={"uri": uri})
+    def __init__(self, client, url: str, headers: dict, job_id: uuid.UUID, uri: str) -> None:
+        self._client = client
+        self.url = url
+        self.headers = headers
+        self.job_id = job_id
+        self.uri = uri
+
+    def get(self, *, headers: dict | None = None, **kwargs):
+        return self._client.get(self.url, headers={**self.headers, **(headers or {})}, **kwargs)
+
+
+@pytest.fixture
+async def room(client, engine, artifact_storage):
+    """A project with one member, and `publish(...)` to put an artifact in it.
+
+    The project is created through the API rather than by insert, so the
+    owner really is a member by the same path production uses.
+    """
+    owner = uuid.uuid4()
+    project = client.post(
+        "/projects", json={"name": "artifacts"}, headers=as_user(owner)
+    ).json()
+    project_id = uuid.UUID(project["id"])
+    seeded: list[uuid.UUID] = []
+
+    async def publish_uri(uri: str, *, project: uuid.UUID | None = None) -> _Published:
+        """Record `uri` as an artifact of a fresh job in this room."""
+        job_id = await _seed_job(
+            engine,
+            project_id=project_id if project is None else project,
+            results=[
+                Result(
+                    worker_name="crop",
+                    stage=0,
+                    payload=assets_payload([Asset(kind=AssetKind.VIDEO, uri=uri)]),
+                )
+            ],
+        )
+        seeded.append(job_id)
+        return _Published(
+            client,
+            f"/artifacts?uri={quote(uri, safe='')}&job_id={job_id}",
+            as_user(owner),
+            job_id,
+            uri,
+        )
+
+    async def publish(data: bytes, name: str) -> _Published:
+        return await publish_uri(artifact_storage.put(data, suggested_name=name))
+
+    room = SimpleNamespace(
+        owner=owner,
+        project_id=project_id,
+        publish=publish,
+        publish_uri=publish_uri,
+        seeded=seeded,
+    )
+    yield room
+
+    for job_id in seeded:
+        await _cleanup(engine, job_id)
+    async with engine.begin() as conn:
+        await conn.execute(text("DELETE FROM projects WHERE id = :p"), {"p": project_id})
+
+
+@pytest.mark.asyncio
+async def test_downloads_the_stored_bytes(room) -> None:
+    published = await room.publish(b"pretend this is an mp4", "clip.mp4")
+
+    response = published.get()
 
     assert response.status_code == 200
     assert response.content == b"pretend this is an mp4"
     assert response.headers["content-type"].startswith("video/mp4")
 
 
-def test_download_url_from_the_listing_actually_resolves(client, artifact_storage) -> None:
-    """The listing's download_url is built by quoting the URI; this is the
-    round-trip proving that encoding is one a client can use directly."""
-    uri = artifact_storage.put(b"bytes", suggested_name="clip.mp4")
+@pytest.mark.asyncio
+async def test_download_url_from_the_listing_actually_resolves(client, room) -> None:
+    """The listing builds download_url by quoting the URI and appending the
+    job; this is the round trip proving a client can use it verbatim."""
+    published = await room.publish(b"bytes", "clip.mp4")
 
-    response = client.get(f"/artifacts?uri={quote(uri, safe='')}")
+    listed = client.get(f"/jobs/{published.job_id}/artifacts").json()
+    url = listed["stages"][0]["artifacts"][0]["download_url"]
 
+    response = client.get(url, headers=as_user(room.owner))
+
+    assert url == published.url
     assert response.status_code == 200
     assert response.content == b"bytes"
 
 
-def test_content_type_follows_the_extension(client, artifact_storage) -> None:
-    srt_uri = artifact_storage.put(b"1\n00:00:00,000 --> 00:00:01,000\nhi\n", suggested_name="c.srt")
+@pytest.mark.asyncio
+async def test_content_type_follows_the_extension(room) -> None:
+    published = await room.publish(b"1\n00:00:00,000 --> 00:00:01,000\nhi\n", "c.srt")
 
-    response = client.get("/artifacts", params={"uri": srt_uri})
+    response = published.get()
 
     assert response.status_code == 200
     assert response.content.startswith(b"1\n")
 
 
-def test_unknown_artifact_is_404(client, artifact_storage) -> None:
-    assert client.get("/artifacts", params={"uri": "local://nope.mp4"}).status_code == 404
+@pytest.mark.asyncio
+async def test_unknown_artifact_is_404(room) -> None:
+    """Recorded as an asset but never stored — the guard passes and the
+    storage backend is what refuses."""
+    published = await room.publish_uri("local://nope.mp4")
+
+    assert published.get().status_code == 404
 
 
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     "hostile",
     [
@@ -185,56 +292,174 @@ def test_unknown_artifact_is_404(client, artifact_storage) -> None:
         "local://",
     ],
 )
-def test_traversal_and_foreign_schemes_are_rejected(client, artifact_storage, hostile: str) -> None:
-    """The `uri` parameter is attacker-controlled. LocalDiskStorage's key
-    guard is what rejects these; this asserts the route surfaces that as a
-    clean 404 rather than reading an arbitrary file or 500ing."""
-    response = client.get("/artifacts", params={"uri": hostile})
+async def test_traversal_and_foreign_schemes_are_rejected(room, hostile: str) -> None:
+    """The `uri` parameter is attacker-controlled. Registered here as a
+    genuine asset of the caller's own job, so the membership guard passes
+    and LocalDiskStorage's key guard is what actually rejects these --
+    which also models the sharper threat now that a guard exists: a
+    compromised worker writing a hostile URI into its own result payload.
+    """
+    published = await room.publish_uri(hostile)
 
-    assert response.status_code == 404
+    assert published.get().status_code == 404
 
 
-def test_download_streams_rather_than_buffering(client, artifact_storage) -> None:
+@pytest.mark.asyncio
+async def test_download_streams_rather_than_buffering(room) -> None:
     """A whole video in memory per request is the thing open_stream exists
     to avoid — assert a large object comes back byte-exact through the
     chunked path."""
     payload = bytes(range(256)) * 8192  # 2 MiB, larger than the 64 KiB chunk
-    uri = artifact_storage.put(payload, suggested_name="big.mp4")
+    published = await room.publish(payload, "big.mp4")
 
-    response = client.get("/artifacts", params={"uri": uri})
+    response = published.get()
 
     assert response.status_code == 200
     assert response.content == payload
+
+
+# --- authorization (step 7) ------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_a_stranger_cannot_download_a_rooms_artifact(room) -> None:
+    """The hole this step closes. URIs are opaque and effectively
+    unguessable, but they travel: every artifact listing and every room
+    snapshot hands them out, and they outlive the membership of whoever
+    saw them."""
+    published = await room.publish(b"bytes", "clip.mp4")
+
+    response = published.get(headers=as_user(uuid.uuid4()))
+
+    assert response.status_code == 404
+    assert response.content != b"bytes"
+
+
+@pytest.mark.asyncio
+async def test_an_anonymous_download_is_rejected(client, room) -> None:
+    published = await room.publish(b"bytes", "clip.mp4")
+
+    assert client.get(published.url).status_code == 422
+
+
+@pytest.mark.asyncio
+async def test_a_job_id_from_your_own_room_does_not_unlock_another_rooms_uri(
+    client, room, artifact_storage
+) -> None:
+    """Membership alone is not enough: without checking that the job
+    actually produced this artifact, a member could pair a job id from
+    their own room with any URI they had ever seen."""
+    theirs = uuid.uuid4()
+    other = client.post("/projects", json={"name": "theirs"}, headers=as_user(theirs)).json()
+    foreign = await room.publish_uri(
+        artifact_storage.put(b"private", suggested_name="secret.mp4"),
+        project=uuid.UUID(other["id"]),
+    )
+    mine = await room.publish(b"mine", "mine.mp4")
+
+    response = client.get(
+        f"/artifacts?uri={quote(foreign.uri, safe='')}&job_id={mine.job_id}",
+        headers=as_user(room.owner),
+    )
+
+    assert response.status_code == 404
+    assert response.content != b"private"
+
+
+@pytest.mark.asyncio
+async def test_an_unmapped_jobs_artifacts_are_not_downloadable(
+    client, engine, artifact_storage
+) -> None:
+    """A raw POST /jobs submission belongs to no room, and nobody is a
+    member of no room. Deliberately stricter than before, when unmapped
+    meant world-readable."""
+    uri = artifact_storage.put(b"orphan", suggested_name="orphan.mp4")
+    job_id = await _seed_job(
+        engine,
+        results=[
+            Result(
+                worker_name="crop",
+                stage=0,
+                payload=assets_payload([Asset(kind=AssetKind.VIDEO, uri=uri)]),
+            )
+        ],
+    )
+    try:
+        response = client.get(
+            f"/artifacts?uri={quote(uri, safe='')}&job_id={job_id}",
+            headers=as_user(uuid.uuid4()),
+        )
+
+        assert response.status_code == 404
+    finally:
+        await _cleanup(engine, job_id)
+
+
+@pytest.mark.asyncio
+async def test_an_intermediate_stages_artifact_is_downloadable_too(
+    client, room, engine, artifact_storage
+) -> None:
+    """The per-stage listing exists so a client can see which step went
+    wrong, so its URLs have to resolve — the guard checks every stage's
+    assets, not only the final one."""
+    early = artifact_storage.put(b"stage one", suggested_name="one.mp4")
+    late = artifact_storage.put(b"stage two", suggested_name="two.mp4")
+    job_id = await _seed_job(
+        engine,
+        project_id=room.project_id,
+        results=[
+            Result(
+                worker_name="crop",
+                stage=0,
+                payload=assets_payload([Asset(kind=AssetKind.VIDEO, uri=early)]),
+            ),
+            Result(
+                worker_name="audio",
+                stage=1,
+                payload=assets_payload([Asset(kind=AssetKind.VIDEO, uri=late)]),
+            ),
+        ],
+    )
+    room.seeded.append(job_id)
+
+    response = client.get(
+        f"/artifacts?uri={quote(early, safe='')}&job_id={job_id}",
+        headers=as_user(room.owner),
+    )
+
+    assert response.status_code == 200
+    assert response.content == b"stage one"
 
 
 # --- range requests (what <video> seeking needs) ---------------------------
 
 
 @pytest.fixture
-def ranged(client, artifact_storage):
+async def ranged(room):
     """A stored object with byte-identifiable content, so a partial
     response can be checked against the exact expected slice."""
     payload = bytes(range(256)) * 40  # 10240 bytes
-    uri = artifact_storage.put(payload, suggested_name="clip.mp4")
-    return payload, f"/artifacts?uri={quote(uri, safe='')}"
+    return payload, await room.publish(payload, "clip.mp4")
 
 
-def test_full_request_advertises_range_support(client, ranged) -> None:
+@pytest.mark.asyncio
+async def test_full_request_advertises_range_support(ranged) -> None:
     """Without Accept-Ranges a browser assumes it must download the whole
     file to play it, and never attempts to seek."""
-    payload, url = ranged
+    payload, published = ranged
 
-    response = client.get(url)
+    response = published.get()
 
     assert response.status_code == 200
     assert response.headers["accept-ranges"] == "bytes"
     assert response.headers["content-length"] == str(len(payload))
 
 
-def test_explicit_range_returns_exactly_that_slice(client, ranged) -> None:
-    payload, url = ranged
+@pytest.mark.asyncio
+async def test_explicit_range_returns_exactly_that_slice(ranged) -> None:
+    payload, published = ranged
 
-    response = client.get(url, headers={"Range": "bytes=100-199"})
+    response = published.get(headers={"Range": "bytes=100-199"})
 
     assert response.status_code == 206
     assert response.content == payload[100:200]
@@ -242,68 +467,74 @@ def test_explicit_range_returns_exactly_that_slice(client, ranged) -> None:
     assert response.headers["content-length"] == "100"
 
 
-def test_open_ended_range_runs_to_the_end(client, ranged) -> None:
+@pytest.mark.asyncio
+async def test_open_ended_range_runs_to_the_end(ranged) -> None:
     """`bytes=N-` is what a video element sends when the user seeks."""
-    payload, url = ranged
+    payload, published = ranged
 
-    response = client.get(url, headers={"Range": "bytes=10000-"})
+    response = published.get(headers={"Range": "bytes=10000-"})
 
     assert response.status_code == 206
     assert response.content == payload[10000:]
     assert response.headers["content-range"] == f"bytes 10000-{len(payload) - 1}/{len(payload)}"
 
 
-def test_suffix_range_returns_the_last_n_bytes(client, ranged) -> None:
+@pytest.mark.asyncio
+async def test_suffix_range_returns_the_last_n_bytes(ranged) -> None:
     """Used to read an MP4's trailing metadata when the index isn't at the
     front of the file."""
-    payload, url = ranged
+    payload, published = ranged
 
-    response = client.get(url, headers={"Range": "bytes=-500"})
+    response = published.get(headers={"Range": "bytes=-500"})
 
     assert response.status_code == 206
     assert response.content == payload[-500:]
 
 
-def test_range_past_the_end_is_rejected_not_silently_widened(client, ranged) -> None:
+@pytest.mark.asyncio
+async def test_range_past_the_end_is_rejected_not_silently_widened(ranged) -> None:
     """A malformed range must not quietly return the whole file — the
     client would treat it as a successful seek to the wrong place."""
-    payload, url = ranged
+    payload, published = ranged
 
-    response = client.get(url, headers={"Range": "bytes=999999-"})
+    response = published.get(headers={"Range": "bytes=999999-"})
 
     assert response.status_code == 416
     assert response.headers["content-range"] == f"bytes */{len(payload)}"
 
 
-def test_range_end_beyond_the_file_is_clamped(client, ranged) -> None:
+@pytest.mark.asyncio
+async def test_range_end_beyond_the_file_is_clamped(ranged) -> None:
     """A start inside the file with an end past it is satisfiable — serve
     what exists rather than refusing."""
-    payload, url = ranged
+    payload, published = ranged
 
-    response = client.get(url, headers={"Range": "bytes=10000-999999"})
+    response = published.get(headers={"Range": "bytes=10000-999999"})
 
     assert response.status_code == 206
     assert response.content == payload[10000:]
 
 
-def test_a_malformed_range_header_is_ignored(client, ranged) -> None:
+@pytest.mark.asyncio
+async def test_a_malformed_range_header_is_ignored(ranged) -> None:
     """Not an error: the spec says an unparseable Range is ignored and the
     full representation returned."""
-    payload, url = ranged
+    payload, published = ranged
 
-    response = client.get(url, headers={"Range": "furlongs=1-2"})
+    response = published.get(headers={"Range": "furlongs=1-2"})
 
     assert response.status_code == 200
     assert response.content == payload
 
 
-def test_ranged_reads_reassemble_into_the_original(client, ranged) -> None:
+@pytest.mark.asyncio
+async def test_ranged_reads_reassemble_into_the_original(ranged) -> None:
     """The property that actually matters: a player fetching a file in
     pieces must be able to reconstruct it byte for byte."""
-    payload, url = ranged
+    payload, published = ranged
 
     chunks = [
-        client.get(url, headers={"Range": f"bytes={start}-{start + 2047}"}).content
+        published.get(headers={"Range": f"bytes={start}-{start + 2047}"}).content
         for start in range(0, len(payload), 2048)
     ]
 
