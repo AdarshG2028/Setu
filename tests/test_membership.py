@@ -1,4 +1,4 @@
-"""Identity and membership (Phase 8, steps 1-3).
+"""Identity and membership (Phase 8, steps 1-5).
 
 Before this, five of the seven /projects endpoints — including
 confirm-proposal, which spends real compute — took no caller identity at
@@ -359,3 +359,126 @@ def test_a_second_member_sees_the_same_conversation(
         user_turns = [m for m in history if m["role"] == "user"]
         assert [m["content"] for m in user_turns] == ["from the owner", "from the invitee"]
         assert [m["sender_id"] for m in user_turns] == [str(owner), str(invitee)]
+
+
+# --- project_jobs (step 5) -------------------------------------------------
+
+
+async def _project_job_row(database_url: str, job_id: str) -> dict | None:
+    engine = create_async_engine(database_url, poolclass=NullPool)
+    try:
+        async with engine.connect() as conn:
+            row = (
+                await conn.execute(
+                    sa.text(
+                        "SELECT project_id, submitted_by_user_id FROM project_jobs "
+                        "WHERE job_id = :j"
+                    ),
+                    {"j": job_id},
+                )
+            ).first()
+        return {"project_id": str(row[0]), "submitted_by": str(row[1])} if row else None
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_a_confirmed_job_is_bound_to_its_room_and_submitter(
+    client: TestClient, cleanup_project_ids: list, database_url: str
+) -> None:
+    """Before this there was no path at all from a job back to a project,
+    so nothing could be scoped to a room — including its artifacts."""
+    owner = uuid.uuid4()
+    project = _create_project(client, owner)
+    cleanup_project_ids.append(uuid.UUID(project["id"]))
+    for content in ("hi", "crop it vertically"):
+        client.post(
+            f"/projects/{project['id']}/messages",
+            json={"content": content},
+            headers=as_user(owner),
+        )
+
+    job_id = client.post(
+        f"/projects/{project['id']}/confirm-proposal", headers=as_user(owner)
+    ).json()["job_id"]
+
+    row = await _project_job_row(database_url, job_id)
+    assert row == {"project_id": project["id"], "submitted_by": str(owner)}
+
+
+@pytest.mark.asyncio
+async def test_job_ownership_records_who_actually_submitted(
+    client: TestClient, cleanup_project_ids: list, database_url: str
+) -> None:
+    """submitted_by_user_id IS job ownership (Changelog v9) — Phase 9b
+    authorizes cancellation against exactly this. A member who is not the
+    owner submitting must be recorded as that job's owner, not the room's."""
+    owner, member = uuid.uuid4(), uuid.uuid4()
+    project = _create_project(client, owner)
+    cleanup_project_ids.append(uuid.UUID(project["id"]))
+    _invite(client, project["id"], owner, member)
+    client.post(f"/projects/{project['id']}/join", headers=as_user(member))
+    for content in ("hi", "crop it vertically"):
+        client.post(
+            f"/projects/{project['id']}/messages",
+            json={"content": content},
+            headers=as_user(member),
+        )
+
+    job_id = client.post(
+        f"/projects/{project['id']}/confirm-proposal", headers=as_user(member)
+    ).json()["job_id"]
+
+    row = await _project_job_row(database_url, job_id)
+    assert row["submitted_by"] == str(member), "recorded the room owner, not the submitter"
+
+
+@pytest.mark.asyncio
+async def test_a_replayed_submission_keeps_its_original_owner(
+    client: TestClient, cleanup_project_ids: list, database_url: str
+) -> None:
+    """Setu's idempotency key returns the original job for a repeat
+    submission. The mapping must not be rewritten to whoever asked second
+    — that would silently transfer cancellation rights."""
+    owner, member = uuid.uuid4(), uuid.uuid4()
+    project = _create_project(client, owner)
+    cleanup_project_ids.append(uuid.UUID(project["id"]))
+    _invite(client, project["id"], owner, member)
+    client.post(f"/projects/{project['id']}/join", headers=as_user(member))
+    for content in ("hi", "crop it vertically"):
+        client.post(
+            f"/projects/{project['id']}/messages",
+            json={"content": content},
+            headers=as_user(owner),
+        )
+
+    first = client.post(
+        f"/projects/{project['id']}/confirm-proposal", headers=as_user(owner)
+    ).json()
+    second = client.post(
+        f"/projects/{project['id']}/confirm-proposal", headers=as_user(member)
+    ).json()
+
+    assert first["job_id"] == second["job_id"] and second["replayed"] is True
+    row = await _project_job_row(database_url, first["job_id"])
+    assert row["submitted_by"] == str(owner), "a replay reassigned job ownership"
+
+
+@pytest.mark.asyncio
+async def test_an_upload_binds_its_analysis_job_to_the_room(
+    client: TestClient, cleanup_project_ids: list, database_url: str
+) -> None:
+    """Analysis jobs are jobs too — they belong in the room snapshot and
+    their progress is worth broadcasting."""
+    owner = uuid.uuid4()
+    project = _create_project(client, owner)
+    cleanup_project_ids.append(uuid.UUID(project["id"]))
+
+    job_id = client.post(
+        f"/projects/{project['id']}/videos",
+        files={"file": ("clip.mp4", b"bytes", "video/mp4")},
+        headers=as_user(owner),
+    ).json()["job_id"]
+
+    row = await _project_job_row(database_url, job_id)
+    assert row == {"project_id": project["id"], "submitted_by": str(owner)}

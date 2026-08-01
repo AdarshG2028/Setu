@@ -131,7 +131,11 @@ async def upload_video(
     data = await file.read()
     try:
         result = await VideoUploadService(session).upload(
-            project_id=project_id, data=data, filename=file.filename or "upload", name=name
+            project_id=project_id,
+            data=data,
+            filename=file.filename or "upload",
+            name=name,
+            uploaded_by=user_id,
         )
     except ProjectNotFoundError as exc:
         raise HTTPException(
@@ -151,7 +155,7 @@ async def confirm_proposal(
     project_id: uuid.UUID, session: SessionDep, user_id: ProjectMemberDep
 ) -> ConfirmProposalResponse:
     try:
-        result = await ProposalConfirmationService(session).confirm(project_id)
+        result = await ProposalConfirmationService(session).confirm(project_id, user_id=user_id)
     except ProjectNotFoundError as exc:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND, detail="project not found"
@@ -183,7 +187,7 @@ async def preview_proposal(
     Job, polled and downloaded through exactly the same endpoints.
     """
     try:
-        result = await ProposalConfirmationService(session).preview(project_id)
+        result = await ProposalConfirmationService(session).preview(project_id, user_id=user_id)
     except ProjectNotFoundError as exc:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND, detail="project not found"

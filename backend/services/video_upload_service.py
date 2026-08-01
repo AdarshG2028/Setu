@@ -23,6 +23,7 @@ from dataclasses import dataclass
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from backend.models import Job, Video
+from backend.repositories.project_job_repository import ProjectJobRepository
 from backend.repositories.project_repository import ProjectNotFoundError, ProjectRepository
 from backend.repositories.video_repository import VideoRepository
 from backend.services.job_submission_service import JobSubmissionService
@@ -48,6 +49,10 @@ class VideoUploadService:
         data: bytes,
         filename: str,
         name: str | None = None,
+        # Required, not optional: every video belongs to exactly one
+        # project, and an unmapped analysis job is a job the artifact
+        # guard cannot authorize. There is no caller without a room.
+        uploaded_by: uuid.UUID,
     ) -> VideoUploadResult:
         if await self._projects.get(project_id) is None:
             raise ProjectNotFoundError(project_id)
@@ -70,6 +75,16 @@ class VideoUploadService:
         )
 
         video.latest_analysis_job_id = submission.job.id
+        # The analysis job belongs to the room as well, so it shows up in
+        # the room snapshot and its progress can be broadcast. Rides the
+        # same follow-up commit as latest_analysis_job_id -- submit()
+        # already committed the job itself, so both of these are a second
+        # transaction either way.
+        await ProjectJobRepository(self._session).add(
+            project_id=project_id,
+            job_id=submission.job.id,
+            submitted_by_user_id=uploaded_by,
+        )
         await self._session.commit()
 
         return VideoUploadResult(video=video, job=submission.job)

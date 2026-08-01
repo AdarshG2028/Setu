@@ -27,6 +27,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from backend.models import Message, MessageRole
 from backend.repositories.conversation_repository import ConversationRepository
 from backend.repositories.message_repository import MessageRepository
+from backend.repositories.project_job_repository import ProjectJobRepository
 from backend.repositories.project_repository import ProjectNotFoundError, ProjectRepository
 from backend.repositories.video_repository import VideoRepository
 from backend.services.job_submission_service import JobSubmissionResult, JobSubmissionService
@@ -60,11 +61,15 @@ class ProposalConfirmationService:
         self._videos = VideoRepository(session)
         self._jobs = JobSubmissionService(session)
 
-    async def confirm(self, project_id: uuid.UUID) -> JobSubmissionResult:
+    async def confirm(
+        self, project_id: uuid.UUID, *, user_id: uuid.UUID
+    ) -> JobSubmissionResult:
         """Execute the latest proposal for real."""
-        return await self._submit(project_id, preview=False)
+        return await self._submit(project_id, user_id=user_id, preview=False)
 
-    async def preview(self, project_id: uuid.UUID) -> JobSubmissionResult:
+    async def preview(
+        self, project_id: uuid.UUID, *, user_id: uuid.UUID
+    ) -> JobSubmissionResult:
         """Execute the latest proposal as a fast, low-resolution render.
 
         Same proposal, same capabilities, same execution path -- only the
@@ -74,10 +79,10 @@ class ProposalConfirmationService:
         evidence about what the real render will produce, which is its
         entire purpose.
         """
-        return await self._submit(project_id, preview=True)
+        return await self._submit(project_id, user_id=user_id, preview=True)
 
     async def _submit(
-        self, project_id: uuid.UUID, *, preview: bool
+        self, project_id: uuid.UUID, *, user_id: uuid.UUID, preview: bool
     ) -> JobSubmissionResult:
         if await self._projects.get(project_id) is None:
             raise ProjectNotFoundError(project_id)
@@ -117,9 +122,25 @@ class ProposalConfirmationService:
         # identical by construction.
         prefix = "preview-proposal" if preview else "confirm-proposal"
         idempotency_key = f"{prefix}:{conversation.id}:{proposal_message.id}"
-        return await self._jobs.submit(
+        result = await self._jobs.submit(
             idempotency_key=idempotency_key, workflow=workflow, payload=payload
         )
+        # Binds the job to its room and records who set it running.
+        # Idempotent, so a replayed submission keeps its original owner
+        # rather than being reassigned to whoever asked second.
+        #
+        # Deliberately a *second* transaction: JobSubmissionService.submit()
+        # commits the Job/OutboxEvent/IdempotencyKey trio itself, so making
+        # this atomic with job creation would mean reaching into Setu's
+        # submission service. A crash in the gap leaves a job with no room,
+        # which is exactly the shape the project_jobs migration's backfill
+        # repairs (payload._conversation_id -> project), so the recovery
+        # path already exists and costs nothing to reuse.
+        await ProjectJobRepository(self._session).add(
+            project_id=project_id, job_id=result.job.id, submitted_by_user_id=user_id
+        )
+        await self._session.commit()
+        return result
 
     def _latest_proposal_message(self, history: list[Message]) -> Message | None:
         for message in reversed(history):
