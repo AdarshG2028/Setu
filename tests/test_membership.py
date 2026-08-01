@@ -10,6 +10,7 @@ through is easy; one that actually keeps strangers out is the only part
 worth having.
 """
 
+import datetime as dt
 import uuid
 
 import pytest
@@ -489,13 +490,23 @@ async def test_an_upload_binds_its_analysis_job_to_the_room(
 # --- the room snapshot (step 6) --------------------------------------------
 
 
-async def _finish_job(database_url: str, job_id: str, *, assets: list[Asset] | None) -> None:
+async def _finish_job(
+    database_url: str,
+    job_id: str,
+    *,
+    assets: list[Asset] | None,
+    completed_at: dt.datetime | None = None,
+) -> None:
     """Drive a job to `completed` with a final stage result.
 
     Workers are not running in these tests, so the terminal state has to
     be written directly. `assets=None` models a stage that produces
     nothing (video_analysis, dummy) -- precisely the case the export
     filter is supposed to drop.
+
+    `completed_at` is explicit rather than `now()` wherever ordering is
+    under test: Postgres' now() is *transaction start* time, so two calls
+    in quick succession are not reliably distinct.
     """
     engine = create_async_engine(database_url, poolclass=NullPool)
     try:
@@ -503,13 +514,16 @@ async def _finish_job(database_url: str, job_id: str, *, assets: list[Asset] | N
             await conn.execute(
                 sa.update(Job)
                 .where(Job.id == uuid.UUID(job_id))
-                .values(status=JobStatus.COMPLETED.value, completed_at=sa.func.now())
+                .values(
+                    status=JobStatus.COMPLETED.value,
+                    completed_at=completed_at if completed_at is not None else sa.func.now(),
+                )
             )
             await conn.execute(
                 sa.insert(Result).values(
                     id=uuid.uuid4(),
                     job_id=uuid.UUID(job_id),
-                    worker_name="render",
+                    worker_name="render" if assets else "video_analysis",
                     stage=0,
                     payload=assets_payload(assets) if assets else {"measured": True},
                 )
@@ -714,6 +728,53 @@ async def test_a_completed_analysis_job_is_not_an_export(
 
     assert body["exports"] == []
     assert body["active_jobs"] == []
+
+
+@pytest.mark.asyncio
+async def test_exports_are_ordered_by_completion_not_submission(
+    client: TestClient, cleanup_project_ids: list, database_url: str
+) -> None:
+    """The version list is "what finished, newest first". Jobs do not
+    finish in the order they were submitted — a short second edit can
+    overtake a long first one — so ordering by created_at would present
+    the wrong render as the latest version."""
+    owner = uuid.uuid4()
+    project = _create_project(client, owner)
+    cleanup_project_ids.append(uuid.UUID(project["id"]))
+
+    _propose(client, project["id"], owner)
+    first = client.post(
+        f"/projects/{project['id']}/confirm-proposal", headers=as_user(owner)
+    ).json()["job_id"]
+    # A fresh proposal message, so this confirm gets its own idempotency
+    # key rather than replaying the one above.
+    client.post(
+        f"/projects/{project['id']}/messages",
+        json={"content": "now rotate it"},
+        headers=as_user(owner),
+    )
+    second = client.post(
+        f"/projects/{project['id']}/confirm-proposal", headers=as_user(owner)
+    ).json()["job_id"]
+    assert first != second
+
+    # Submitted first, finished last.
+    await _finish_job(
+        database_url,
+        second,
+        assets=[Asset(kind=AssetKind.VIDEO, uri="local://second.mp4")],
+        completed_at=dt.datetime(2026, 1, 1, tzinfo=dt.UTC),
+    )
+    await _finish_job(
+        database_url,
+        first,
+        assets=[Asset(kind=AssetKind.VIDEO, uri="local://first.mp4")],
+        completed_at=dt.datetime(2026, 1, 2, tzinfo=dt.UTC),
+    )
+
+    body = client.get(f"/projects/{project['id']}", headers=as_user(owner)).json()
+
+    assert [e["job_id"] for e in body["exports"]] == [first, second]
 
 
 def test_the_snapshot_never_leaks_another_rooms_jobs(
