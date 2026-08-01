@@ -168,6 +168,18 @@ def stage_video_uris(message: StageMessage) -> list[str]:
     return _stage_entry(message).get("video_uris", [])
 
 
+def stage_video_ids(message: StageMessage) -> list[str]:
+    """The Video row ids backing stage_video_uris, same order.
+
+    Absent (empty string per entry, or the whole list missing) for any
+    payload that predates this convention or was built by hand rather
+    than through compile_workflow -- callers that use this for cache
+    keys must already treat "" as "no id" the same way they treat an
+    empty list, never assume a positional entry is real.
+    """
+    return _stage_entry(message).get("video_ids", [])
+
+
 def previous_assets(previous_output: dict[str, Any] | None) -> list[Asset]:
     """The prior stage's assets, or [] when there is no prior stage.
 

@@ -25,6 +25,7 @@ from backend.models.proposal_approval import ProposalApproval
 from backend.models.result import Result
 from backend.models.user_preference import UserPreference
 from backend.models.video import Video
+from backend.models.video_asset import VideoAsset
 from backend.models.worker_execution import WorkerExecution
 
 __all__ = [
@@ -48,5 +49,6 @@ __all__ = [
     "Result",
     "UserPreference",
     "Video",
+    "VideoAsset",
     "WorkerExecution",
 ]

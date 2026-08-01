@@ -52,8 +52,10 @@ class FakeTranscriber(TranscriptionClient):
         self._error = error
         self.received_audio: bytes | None = None
         self.received_language: str | None = None
+        self.calls = 0
 
     async def transcribe(self, audio, *, filename, language=None):
+        self.calls += 1
         if self._error:
             raise self._error
         self.received_audio = audio
@@ -65,6 +67,32 @@ class FakeTranscriber(TranscriptionClient):
         )
 
 
+class FakeTranscriptCache:
+    """In-memory TranscriptCache double -- no database in these tests."""
+
+    def __init__(self) -> None:
+        self.store: dict[str, tuple[Asset, Asset]] = {}
+        self.put_calls: list[str] = []
+        self.get_calls: list[str] = []
+        self._put_error: Exception | None = None
+
+    def seed(self, video_id: str, transcript: Asset, srt: Asset) -> None:
+        self.store[video_id] = (transcript, srt)
+
+    def fail_puts_with(self, error: Exception) -> None:
+        self._put_error = error
+
+    async def get(self, video_id: str) -> tuple[Asset, Asset] | None:
+        self.get_calls.append(video_id)
+        return self.store.get(video_id)
+
+    async def put(self, video_id: str, transcript: Asset, srt: Asset) -> None:
+        self.put_calls.append(video_id)
+        if self._put_error:
+            raise self._put_error
+        self.store[video_id] = (transcript, srt)
+
+
 @pytest.fixture
 def storage(tmp_path, monkeypatch) -> LocalDiskStorage:
     disk = LocalDiskStorage(tmp_path)
@@ -73,12 +101,17 @@ def storage(tmp_path, monkeypatch) -> LocalDiskStorage:
     return disk
 
 
-def _message(uris: list[str], params: dict, stage: int = 0) -> StageMessage:
+def _message(
+    uris: list[str], params: dict, stage: int = 0, video_ids: list[str] | None = None
+) -> StageMessage:
+    entry = {"params": params, "video_uris": uris}
+    if video_ids is not None:
+        entry["video_ids"] = video_ids
     return StageMessage(
         job_id=uuid.uuid4(),
         stage=stage,
         workflow=["transcribe", "burn_subtitles"],
-        payload={"stage_params": {str(stage): {"params": params, "video_uris": uris}}},
+        payload={"stage_params": {str(stage): entry}},
     )
 
 
@@ -245,6 +278,146 @@ async def test_transcribe_rejects_bad_params(storage) -> None:
             await TranscribeWorker(FakeTranscriber()).process(
                 _message([source], params), None
             )
+
+
+# --- transcript caching (Phase 10 foundation) ------------------------------
+
+
+@pytest.mark.asyncio
+async def test_cache_hit_skips_transcription_and_still_forwards_video_asset(
+    ffmpeg_available, storage
+) -> None:
+    """The discriminating case: a cache hit must still assemble the exact
+    same result shape a real transcription would (video + transcript +
+    srt). The early-return path shares _finish with the real path
+    specifically so this cannot regress."""
+    source = storage.put(_WITH_AUDIO.read_bytes(), suggested_name="clip.mp4")
+    video_id = str(uuid.uuid4())
+    cache = FakeTranscriptCache()
+    cached_transcript = Asset(kind=AssetKind.TRANSCRIPT, uri="local://cached-transcript.json")
+    cached_srt = Asset(kind=AssetKind.SRT, uri="local://cached-captions.srt")
+    cache.seed(video_id, cached_transcript, cached_srt)
+    fake = FakeTranscriber()
+
+    payload = await TranscribeWorker(fake, cache=cache).process(
+        _message([source], {}, video_ids=[video_id]), None
+    )
+
+    assert fake.calls == 0, "a cache hit must never call the transcription provider"
+    assets = previous_assets(payload)
+    assert primary_video(assets).uri == source
+    assert next(a for a in assets if a.kind == AssetKind.TRANSCRIPT).uri == cached_transcript.uri
+    assert next(a for a in assets if a.kind == AssetKind.SRT).uri == cached_srt.uri
+
+
+@pytest.mark.asyncio
+async def test_cache_miss_writes_through_after_transcribing(
+    ffmpeg_available, storage
+) -> None:
+    source = storage.put(_WITH_AUDIO.read_bytes(), suggested_name="clip.mp4")
+    video_id = str(uuid.uuid4())
+    cache = FakeTranscriptCache()
+    fake = FakeTranscriber()
+
+    payload = await TranscribeWorker(fake, cache=cache).process(
+        _message([source], {}, video_ids=[video_id]), None
+    )
+
+    assert fake.calls == 1
+    assert cache.put_calls == [video_id]
+    produced = next(a for a in previous_assets(payload) if a.kind == AssetKind.TRANSCRIPT)
+    assert cache.store[video_id][0].uri == produced.uri
+
+
+@pytest.mark.asyncio
+async def test_cache_is_bypassed_for_a_language_override(
+    ffmpeg_available, storage
+) -> None:
+    """A forced language can produce a different transcript than the
+    cached (auto-detected) one, so it must neither read nor write the
+    shared cache entry."""
+    source = storage.put(_WITH_AUDIO.read_bytes(), suggested_name="clip.mp4")
+    video_id = str(uuid.uuid4())
+    cache = FakeTranscriptCache()
+    cache.seed(
+        video_id,
+        Asset(kind=AssetKind.TRANSCRIPT, uri="local://should-not-be-used.json"),
+        Asset(kind=AssetKind.SRT, uri="local://should-not-be-used.srt"),
+    )
+    fake = FakeTranscriber()
+
+    await TranscribeWorker(fake, cache=cache).process(
+        _message([source], {"language": "es"}, video_ids=[video_id]), None
+    )
+
+    assert fake.calls == 1
+    assert cache.get_calls == []
+    assert cache.put_calls == []
+
+
+@pytest.mark.asyncio
+async def test_cache_is_bypassed_once_a_prior_stage_produced_a_video(
+    ffmpeg_available, storage
+) -> None:
+    """Caching only applies to the pristine upload's audio. If an earlier
+    stage already re-encoded the video (chained in via previous_output),
+    reusing the original video's transcript would be wrong -- e.g. a trim
+    changes what audio actually plays."""
+    source = storage.put(_WITH_AUDIO.read_bytes(), suggested_name="clip.mp4")
+    video_id = str(uuid.uuid4())
+    cache = FakeTranscriptCache()
+    cache.seed(
+        video_id,
+        Asset(kind=AssetKind.TRANSCRIPT, uri="local://should-not-be-used.json"),
+        Asset(kind=AssetKind.SRT, uri="local://should-not-be-used.srt"),
+    )
+    fake = FakeTranscriber()
+    previous_output = {"assets": [Asset(kind=AssetKind.VIDEO, uri=source).to_dict()]}
+
+    await TranscribeWorker(fake, cache=cache).process(
+        _message([source], {}, stage=1, video_ids=[video_id]), previous_output
+    )
+
+    assert fake.calls == 1
+    assert cache.get_calls == []
+    assert cache.put_calls == []
+
+
+@pytest.mark.asyncio
+async def test_no_cache_key_when_video_ids_were_never_compiled(
+    ffmpeg_available, storage
+) -> None:
+    """A payload built without compile_workflow's video_ids (or any other
+    legacy shape) must degrade to "no cache", not raise."""
+    source = storage.put(_WITH_AUDIO.read_bytes(), suggested_name="clip.mp4")
+    cache = FakeTranscriptCache()
+    fake = FakeTranscriber()
+
+    await TranscribeWorker(fake, cache=cache).process(_message([source], {}), None)
+
+    assert fake.calls == 1
+    assert cache.get_calls == []
+    assert cache.put_calls == []
+
+
+@pytest.mark.asyncio
+async def test_cache_write_failure_does_not_fail_the_stage(
+    ffmpeg_available, storage
+) -> None:
+    """A caching side-effect must never dead-letter a job whose
+    transcription itself succeeded."""
+    source = storage.put(_WITH_AUDIO.read_bytes(), suggested_name="clip.mp4")
+    video_id = str(uuid.uuid4())
+    cache = FakeTranscriptCache()
+    cache.fail_puts_with(RuntimeError("db unreachable"))
+    fake = FakeTranscriber()
+
+    payload = await TranscribeWorker(fake, cache=cache).process(
+        _message([source], {}, video_ids=[video_id]), None
+    )
+
+    kinds = {a.kind for a in previous_assets(payload)}
+    assert kinds == {"video", "transcript", "srt"}
 
 
 # --- burn_subtitles --------------------------------------------------------

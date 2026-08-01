@@ -16,15 +16,26 @@ def test_compiles_to_the_exact_expected_workflow_and_payload_shape() -> None:
             ProposalStage(stage="color", video_ids=["video_1"], params={"brightness": 1.1}),
         ],
     )
-    context = ExecutionContext(video_uris={"video_1": "local:///videos/abc.mp4"})
+    context = ExecutionContext(
+        video_uris={"video_1": "local:///videos/abc.mp4"},
+        video_db_ids={"video_1": "11111111-1111-1111-1111-111111111111"},
+    )
 
     workflow, payload = compile_workflow(proposal, context)
 
     assert workflow == ["crop", "color"]
     assert payload == {
         "stage_params": {
-            "0": {"params": {"aspect_ratio": "9:16"}, "video_uris": ["local:///videos/abc.mp4"]},
-            "1": {"params": {"brightness": 1.1}, "video_uris": ["local:///videos/abc.mp4"]},
+            "0": {
+                "params": {"aspect_ratio": "9:16"},
+                "video_uris": ["local:///videos/abc.mp4"],
+                "video_ids": ["11111111-1111-1111-1111-111111111111"],
+            },
+            "1": {
+                "params": {"brightness": 1.1},
+                "video_uris": ["local:///videos/abc.mp4"],
+                "video_ids": ["11111111-1111-1111-1111-111111111111"],
+            },
         },
     }
 
@@ -36,7 +47,9 @@ def test_single_stage_proposal_compiles() -> None:
     workflow, payload = compile_workflow(proposal, context)
 
     assert workflow == ["dummy"]
-    assert payload == {"stage_params": {"0": {"params": {}, "video_uris": []}}}
+    assert payload == {
+        "stage_params": {"0": {"params": {}, "video_uris": [], "video_ids": []}}
+    }
 
 
 def test_stage_referencing_multiple_videos_resolves_all_of_them() -> None:
@@ -76,6 +89,42 @@ def test_unknown_video_handle_raises_instead_of_crashing_with_keyerror() -> None
         compile_workflow(proposal, context)
 
     assert exc_info.value.video_id == "video_99"
+
+
+# --- video_db_ids (Phase 10 foundation) -------------------------------------
+
+
+def test_video_db_ids_default_to_empty_string_when_not_supplied() -> None:
+    """A caller that only ever cared about bytes (video_uris) must keep
+    working unchanged -- video_db_ids defaults to {}, so every handle
+    degrades to "" rather than raising."""
+    proposal = Proposal(
+        summary="...",
+        workflow=[ProposalStage(stage="crop", video_ids=["video_1"], params={})],
+    )
+    context = ExecutionContext(video_uris={"video_1": "local://a.mp4"})
+
+    _, payload = compile_workflow(proposal, context)
+
+    assert payload["stage_params"]["0"]["video_ids"] == [""]
+
+
+def test_video_db_ids_are_positionally_aligned_with_video_uris() -> None:
+    proposal = Proposal(
+        summary="Combine two clips.",
+        workflow=[ProposalStage(stage="combine", video_ids=["video_1", "video_2"], params={})],
+    )
+    context = ExecutionContext(
+        video_uris={
+            "video_1": "local:///videos/a.mp4",
+            "video_2": "local:///videos/b.mp4",
+        },
+        video_db_ids={"video_1": "id-a", "video_2": "id-b"},
+    )
+
+    _, payload = compile_workflow(proposal, context)
+
+    assert payload["stage_params"]["0"]["video_ids"] == ["id-a", "id-b"]
 
 
 # --- preview mode (Phase 5A, Step 8) ---------------------------------------

@@ -12,7 +12,9 @@ directly, and burned-in pixels can never be turned back into one.
 """
 
 import json
-from typing import Any
+import logging
+import uuid
+from typing import Any, Protocol
 
 from backend.core.config import get_settings
 from backend.services.transcription_client import (
@@ -33,11 +35,15 @@ from backend.workers.media import (
     materialize_to_tempfile,
     output_tempfile,
     previous_assets,
+    primary_video,
     put_asset,
     resolve_input_uri,
     run_ffmpeg,
     stage_params,
+    stage_video_ids,
 )
+
+logger = logging.getLogger(__name__)
 
 # Whisper works on 16kHz mono; anything richer is discarded by the model
 # anyway. At 32kbps this is roughly 14MB per hour of speech, comfortably
@@ -46,13 +52,70 @@ from backend.workers.media import (
 _AUDIO_ARGS = ["-vn", "-ar", "16000", "-ac", "1", "-c:a", "libmp3lame", "-b:a", "32k"]
 
 
+class TranscriptCache(Protocol):
+    """Per-video transcript cache (Phase 10 foundation).
+
+    Deliberately its own small interface rather than TranscribeWorker
+    holding a VideoAssetRepository directly: the worker is constructed
+    once at process startup and reused across every message (runner.py),
+    long before any per-message database session exists, so it cannot
+    hold one. Implementations own opening (and closing) whatever session
+    they need per call, the same way get_storage()/get_settings() are
+    ambient accessors rather than injected connections.
+    """
+
+    async def get(self, video_id: str) -> tuple[Asset, Asset] | None:
+        """The (transcript, srt) assets cached for this video, or None."""
+        ...
+
+    async def put(self, video_id: str, transcript: Asset, srt: Asset) -> None: ...
+
+
+class SqlTranscriptCache:
+    """Default TranscriptCache, backed by video_assets."""
+
+    async def get(self, video_id: str) -> tuple[Asset, Asset] | None:
+        from backend.database.session import get_sessionmaker
+        from backend.repositories.video_asset_repository import VideoAssetRepository
+
+        async with get_sessionmaker()() as session:
+            repo = VideoAssetRepository(session)
+            video_uuid = uuid.UUID(video_id)
+            transcript = await repo.get(video_uuid, AssetKind.TRANSCRIPT)
+            srt = await repo.get(video_uuid, AssetKind.SRT)
+            if transcript is None or srt is None:
+                return None
+            return (
+                Asset(kind=AssetKind.TRANSCRIPT, uri=transcript.uri),
+                Asset(kind=AssetKind.SRT, uri=srt.uri),
+            )
+
+    async def put(self, video_id: str, transcript: Asset, srt: Asset) -> None:
+        from backend.database.session import get_sessionmaker
+        from backend.repositories.video_asset_repository import VideoAssetRepository
+
+        async with get_sessionmaker()() as session:
+            repo = VideoAssetRepository(session)
+            video_uuid = uuid.UUID(video_id)
+            await repo.upsert(video_uuid, AssetKind.TRANSCRIPT, transcript.uri)
+            await repo.upsert(video_uuid, AssetKind.SRT, srt.uri)
+            await session.commit()
+
+
 class TranscribeWorker(Worker):
     name = "transcribe"
 
-    def __init__(self, client: TranscriptionClient | None = None) -> None:
+    def __init__(
+        self,
+        client: TranscriptionClient | None = None,
+        cache: TranscriptCache | None = None,
+    ) -> None:
         # Injectable so tests exercise the real audio extraction and SRT
         # building without calling a paid API over the network.
         self._client = client
+        # Same reasoning, same default-to-real-implementation shape as
+        # _client above.
+        self._cache = cache if cache is not None else SqlTranscriptCache()
 
     def _resolve_client(self) -> TranscriptionClient:
         if self._client is not None:
@@ -83,6 +146,29 @@ class TranscribeWorker(Worker):
             )
 
         source_uri = resolve_input_uri(message, previous_output)
+        carried = previous_assets(previous_output)
+
+        # Caching only ever applies to the pristine upload: primary_video
+        # being None on the carried assets means nothing upstream produced
+        # (and therefore nothing re-encoded) a video, which is exactly the
+        # "we're reading the original audio" case the roadmap calls out
+        # ("Transcribe once, reuse across previews, re-runs, and final
+        # renders"). A language override changes what transcription
+        # produces, so it opts out of both reading and writing the cache
+        # rather than serving or storing a mismatched result under the
+        # same key.
+        cache_key = None
+        if language is None and primary_video(carried) is None:
+            ids = stage_video_ids(message)
+            if ids and ids[0]:
+                cache_key = ids[0]
+
+        if cache_key is not None:
+            cached = await self._cache.get(cache_key)
+            if cached is not None:
+                transcript, srt = cached
+                return _finish(carried, source_uri, transcript, srt)
+
         audio = await _extract_audio(source_uri)
 
         try:
@@ -121,13 +207,33 @@ class TranscribeWorker(Worker):
             build_srt(result.segments).encode("utf-8"), "captions.srt", AssetKind.SRT
         )
 
-        # The video asset is forwarded exactly as received -- same URI, no
-        # re-upload, no re-encode.
-        carried = previous_assets(previous_output)
-        produced = [transcript, srt]
-        if not carried:
-            produced.insert(0, Asset(kind=AssetKind.VIDEO, uri=source_uri))
-        return assets_payload(forward_assets(carried, produced))
+        if cache_key is not None:
+            try:
+                await self._cache.put(cache_key, transcript, srt)
+            except Exception:
+                # A caching side-effect must never fail a stage whose
+                # transcription itself succeeded -- worst case, the next
+                # call pays for a re-transcription it could have skipped.
+                logger.warning(
+                    "failed to cache transcript for video %s", cache_key, exc_info=True
+                )
+
+        return _finish(carried, source_uri, transcript, srt)
+
+
+def _finish(carried: list[Asset], source_uri: str, transcript: Asset, srt: Asset) -> dict[str, Any]:
+    """Assemble the result payload, shared by the cache-hit and
+    freshly-transcribed paths so they cannot silently diverge.
+
+    A cache hit still needs the same "insert the video asset when nothing
+    was carried" rule as a real transcription: both are stage 0 or its
+    equivalent, and skipping this on the cache-hit path would drop the
+    video from what reaches the next stage.
+    """
+    produced = [transcript, srt]
+    if not carried:
+        produced.insert(0, Asset(kind=AssetKind.VIDEO, uri=source_uri))
+    return assets_payload(forward_assets(carried, produced))
 
 
 def put_asset_bytes(data: bytes, filename: str, kind: str) -> Asset:

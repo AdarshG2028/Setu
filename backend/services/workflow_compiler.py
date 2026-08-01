@@ -11,7 +11,7 @@ Assumes the proposal already passed validate_proposal -- this does not
 re-check the registry.
 """
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 from backend.services.proposal import Proposal
@@ -44,6 +44,14 @@ class ExecutionContext:
 
     video_uris: dict[str, str]
 
+    # Handle -> the Video row's own id, alongside video_uris' handle ->
+    # storage URI. Only durable per-video state (Phase 10's video_assets
+    # cache) needs the real id; everything else in Setu's engine only
+    # ever needs bytes, which is why video_uris alone sufficed until now.
+    # Defaults to {} so a caller that only cares about storage URIs never
+    # has to supply it.
+    video_db_ids: dict[str, str] = field(default_factory=dict)
+
     # Compile the same proposal for a fast, low-resolution render instead
     # of the real one. Deliberately a mode of compilation rather than a
     # different pipeline: the result is an ordinary Job on the ordinary
@@ -61,11 +69,21 @@ def compile_workflow(
     stage_params = {}
     for i, item in enumerate(proposal.workflow):
         video_uris = []
-        for video_id in item.video_ids:
-            if video_id not in context.video_uris:
-                raise UnknownVideoHandleError(video_id)
-            video_uris.append(context.video_uris[video_id])
-        stage_params[str(i)] = {"params": item.params, "video_uris": video_uris}
+        video_db_ids = []
+        for handle in item.video_ids:
+            if handle not in context.video_uris:
+                raise UnknownVideoHandleError(handle)
+            video_uris.append(context.video_uris[handle])
+            # "" rather than omitting: keeps this list positionally
+            # aligned with video_uris for callers that zip/index them
+            # together, and a missing id degrades to "not cacheable"
+            # rather than a KeyError.
+            video_db_ids.append(context.video_db_ids.get(handle, ""))
+        stage_params[str(i)] = {
+            "params": item.params,
+            "video_uris": video_uris,
+            "video_ids": video_db_ids,
+        }
 
     payload: dict[str, Any] = {"stage_params": stage_params}
     if context.preview:

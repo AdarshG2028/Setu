@@ -94,9 +94,14 @@ class ProposalConfirmationService:
         """
         project_id = proposal.project_id
         videos = await self._videos.list_by_project(project_id)
+        contexts = build_video_contexts(videos)
         video_uris = {
             video_context.handle: video.storage_uri
-            for video_context, video in zip(build_video_contexts(videos), videos)
+            for video_context, video in zip(contexts, videos)
+        }
+        video_db_ids = {
+            video_context.handle: str(video.id)
+            for video_context, video in zip(contexts, videos)
         }
         # The row keeps its stages under a "workflow" key, mirroring
         # Job.workflow, while summary and the facilitation fields live in
@@ -106,7 +111,7 @@ class ProposalConfirmationService:
             Proposal.from_dict(
                 {"summary": proposal.summary, "workflow": proposal.workflow["workflow"]}
             ),
-            ExecutionContext(video_uris=video_uris, preview=preview),
+            ExecutionContext(video_uris=video_uris, video_db_ids=video_db_ids, preview=preview),
         )
 
         # Setu's Job is generic infrastructure and carries no link back to
