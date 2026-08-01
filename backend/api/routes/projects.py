@@ -23,8 +23,9 @@ from backend.api.schemas.conversation import (
 )
 from backend.api.schemas.project import CreateProjectRequest, ProjectResponse
 from backend.api.schemas.video import VideoListResponse, VideoSummaryResponse, VideoUploadResponse
-from backend.database.session import get_session
+from backend.api.deps import CurrentUserDep, ProjectMemberDep, SessionDep
 from backend.models import Project
+from backend.repositories.project_member_repository import OWNER, ProjectMemberRepository
 from backend.repositories.project_repository import ProjectNotFoundError, ProjectRepository
 from backend.repositories.video_repository import VideoRepository
 from backend.services.conversation_service import ConversationService
@@ -38,13 +39,18 @@ from backend.services.video_upload_service import VideoUploadService
 
 router = APIRouter(prefix="/projects", tags=["projects"])
 
-SessionDep = Annotated[AsyncSession, Depends(get_session)]
-
 
 @router.post("", response_model=ProjectResponse, status_code=status.HTTP_201_CREATED)
-async def create_project(request: CreateProjectRequest, session: SessionDep) -> ProjectResponse:
-    project = Project(owner_id=request.owner_id, name=request.name)
+async def create_project(
+    request: CreateProjectRequest, session: SessionDep, user_id: CurrentUserDep
+) -> ProjectResponse:
+    project = Project(owner_id=user_id, name=request.name)
     ProjectRepository(session).add(project)
+    await session.flush()  # assigns project.id before the membership row
+    # In the same transaction as the project itself: a project that exists
+    # but has no members would be unreachable through the membership
+    # guard, including by the person who just created it.
+    await ProjectMemberRepository(session).add(project.id, user_id, role=OWNER)
     await session.commit()
     return ProjectResponse(
         id=project.id,
@@ -56,13 +62,16 @@ async def create_project(request: CreateProjectRequest, session: SessionDep) -> 
 
 @router.post("/{project_id}/messages", response_model=PostMessageResponse)
 async def post_message(
-    project_id: uuid.UUID, request: PostMessageRequest, session: SessionDep
+    project_id: uuid.UUID,
+    request: PostMessageRequest,
+    session: SessionDep,
+    user_id: ProjectMemberDep,
 ) -> PostMessageResponse:
     try:
         result = await ConversationService(
             session, planner=get_default_planner()
         ).post_message(
-            project_id=project_id, sender_id=request.sender_id, content=request.content
+            project_id=project_id, sender_id=user_id, content=request.content
         )
     except ProjectNotFoundError as exc:
         raise HTTPException(
@@ -73,7 +82,7 @@ async def post_message(
 
 @router.get("/{project_id}/messages", response_model=ConversationHistoryResponse)
 async def get_messages(
-    project_id: uuid.UUID, session: SessionDep
+    project_id: uuid.UUID, session: SessionDep, user_id: ProjectMemberDep
 ) -> ConversationHistoryResponse:
     try:
         messages = await ConversationService(session).get_history(project_id)
@@ -101,6 +110,7 @@ async def get_messages(
 async def upload_video(
     project_id: uuid.UUID,
     session: SessionDep,
+    user_id: ProjectMemberDep,
     file: Annotated[UploadFile, File()],
     name: Annotated[str | None, Form()] = None,
 ) -> VideoUploadResponse:
@@ -123,7 +133,9 @@ async def upload_video(
 
 
 @router.post("/{project_id}/confirm-proposal", response_model=ConfirmProposalResponse)
-async def confirm_proposal(project_id: uuid.UUID, session: SessionDep) -> ConfirmProposalResponse:
+async def confirm_proposal(
+    project_id: uuid.UUID, session: SessionDep, user_id: ProjectMemberDep
+) -> ConfirmProposalResponse:
     try:
         result = await ProposalConfirmationService(session).confirm(project_id)
     except ProjectNotFoundError as exc:
@@ -143,7 +155,9 @@ async def confirm_proposal(project_id: uuid.UUID, session: SessionDep) -> Confir
 
 
 @router.post("/{project_id}/preview-proposal", response_model=ConfirmProposalResponse)
-async def preview_proposal(project_id: uuid.UUID, session: SessionDep) -> ConfirmProposalResponse:
+async def preview_proposal(
+    project_id: uuid.UUID, session: SessionDep, user_id: ProjectMemberDep
+) -> ConfirmProposalResponse:
     """Render the latest proposal fast and low-resolution, for review.
 
     Deliberately a sibling of confirm-proposal rather than a flag on it:
@@ -173,7 +187,9 @@ async def preview_proposal(project_id: uuid.UUID, session: SessionDep) -> Confir
 
 
 @router.get("/{project_id}/videos", response_model=VideoListResponse)
-async def list_videos(project_id: uuid.UUID, session: SessionDep) -> VideoListResponse:
+async def list_videos(
+    project_id: uuid.UUID, session: SessionDep, user_id: ProjectMemberDep
+) -> VideoListResponse:
     if await ProjectRepository(session).get(project_id) is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="project not found")
     videos = await VideoRepository(session).list_by_project(project_id)

@@ -8,6 +8,8 @@ on the second user turn, same as test_conversations_api.py.
 import uuid
 
 import pytest
+
+from tests.conftest import as_user
 import sqlalchemy as sa
 from fastapi.testclient import TestClient
 from sqlalchemy.ext.asyncio import create_async_engine
@@ -33,7 +35,8 @@ async def cleanup_project_ids(database_url: str):
 
 
 def _create_project(client: TestClient) -> dict:
-    response = client.post("/projects", json={"owner_id": str(uuid.uuid4())})
+    owner_id = uuid.uuid4()
+    response = client.post("/projects", json={}, headers=as_user(owner_id))
     assert response.status_code == 201
     return response.json()
 
@@ -41,7 +44,8 @@ def _create_project(client: TestClient) -> dict:
 def _post_message(client: TestClient, project_id: str, sender_id: str, content: str) -> dict:
     response = client.post(
         f"/projects/{project_id}/messages",
-        json={"sender_id": sender_id, "content": content},
+        json={"content": content},
+        headers=as_user(sender_id),
     )
     assert response.status_code == 200
     return response.json()
@@ -53,26 +57,26 @@ def test_confirm_proposal_with_no_proposal_yet_is_409(
     project = _create_project(client)
     cleanup_project_ids.append(uuid.UUID(project["id"]))
 
-    _post_message(client, project["id"], str(uuid.uuid4()), "hi")  # clarifying turn only
+    _post_message(client, project["id"], project["owner_id"], "hi")  # clarifying turn only
 
-    response = client.post(f"/projects/{project['id']}/confirm-proposal")
+    response = client.post(f"/projects/{project['id']}/confirm-proposal", headers=as_user(project["owner_id"]))
     assert response.status_code == 409
 
 
 def test_confirm_proposal_for_unknown_project_is_404(client: TestClient) -> None:
-    response = client.post(f"/projects/{uuid.uuid4()}/confirm-proposal")
+    response = client.post(f"/projects/{uuid.uuid4()}/confirm-proposal", headers=as_user(uuid.uuid4()))
     assert response.status_code == 404
 
 
 def test_confirm_proposal_submits_a_job(client: TestClient, cleanup_project_ids: list) -> None:
     project = _create_project(client)
     cleanup_project_ids.append(uuid.UUID(project["id"]))
-    sender_id = str(uuid.uuid4())
+    sender_id = project["owner_id"]
 
     _post_message(client, project["id"], sender_id, "hi")
     _post_message(client, project["id"], sender_id, "crop it vertically")
 
-    response = client.post(f"/projects/{project['id']}/confirm-proposal")
+    response = client.post(f"/projects/{project['id']}/confirm-proposal", headers=as_user(project["owner_id"]))
     assert response.status_code == 200
     body = response.json()
     uuid.UUID(body["job_id"])  # doesn't raise
@@ -82,13 +86,13 @@ def test_confirm_proposal_submits_a_job(client: TestClient, cleanup_project_ids:
 def test_confirm_proposal_is_idempotent(client: TestClient, cleanup_project_ids: list) -> None:
     project = _create_project(client)
     cleanup_project_ids.append(uuid.UUID(project["id"]))
-    sender_id = str(uuid.uuid4())
+    sender_id = project["owner_id"]
 
     _post_message(client, project["id"], sender_id, "hi")
     _post_message(client, project["id"], sender_id, "crop it vertically")
 
-    first = client.post(f"/projects/{project['id']}/confirm-proposal").json()
-    second = client.post(f"/projects/{project['id']}/confirm-proposal").json()
+    first = client.post(f"/projects/{project['id']}/confirm-proposal", headers=as_user(project["owner_id"])).json()
+    second = client.post(f"/projects/{project['id']}/confirm-proposal", headers=as_user(project["owner_id"])).json()
 
     assert first["job_id"] == second["job_id"]
     assert first["replayed"] is False
@@ -101,12 +105,12 @@ def test_confirm_proposal_is_idempotent(client: TestClient, cleanup_project_ids:
 def test_preview_proposal_submits_a_job(client: TestClient, cleanup_project_ids: list) -> None:
     project = _create_project(client)
     cleanup_project_ids.append(uuid.UUID(project["id"]))
-    sender_id = str(uuid.uuid4())
+    sender_id = project["owner_id"]
 
     _post_message(client, project["id"], sender_id, "hi")
     _post_message(client, project["id"], sender_id, "crop it vertically")
 
-    response = client.post(f"/projects/{project['id']}/preview-proposal")
+    response = client.post(f"/projects/{project['id']}/preview-proposal", headers=as_user(project["owner_id"]))
 
     assert response.status_code == 200
     body = response.json()
@@ -123,13 +127,13 @@ def test_preview_and_confirm_produce_different_jobs(
     480p file as their final render."""
     project = _create_project(client)
     cleanup_project_ids.append(uuid.UUID(project["id"]))
-    sender_id = str(uuid.uuid4())
+    sender_id = project["owner_id"]
 
     _post_message(client, project["id"], sender_id, "hi")
     _post_message(client, project["id"], sender_id, "crop it vertically")
 
-    preview = client.post(f"/projects/{project['id']}/preview-proposal").json()
-    confirm = client.post(f"/projects/{project['id']}/confirm-proposal").json()
+    preview = client.post(f"/projects/{project['id']}/preview-proposal", headers=as_user(project["owner_id"])).json()
+    confirm = client.post(f"/projects/{project['id']}/confirm-proposal", headers=as_user(project["owner_id"])).json()
 
     assert preview["job_id"] != confirm["job_id"]
     assert confirm["replayed"] is False
@@ -140,13 +144,13 @@ def test_preview_proposal_is_idempotent(client: TestClient, cleanup_project_ids:
     the point of a preview is that it's cheap to ask for repeatedly."""
     project = _create_project(client)
     cleanup_project_ids.append(uuid.UUID(project["id"]))
-    sender_id = str(uuid.uuid4())
+    sender_id = project["owner_id"]
 
     _post_message(client, project["id"], sender_id, "hi")
     _post_message(client, project["id"], sender_id, "crop it vertically")
 
-    first = client.post(f"/projects/{project['id']}/preview-proposal").json()
-    second = client.post(f"/projects/{project['id']}/preview-proposal").json()
+    first = client.post(f"/projects/{project['id']}/preview-proposal", headers=as_user(project["owner_id"])).json()
+    second = client.post(f"/projects/{project['id']}/preview-proposal", headers=as_user(project["owner_id"])).json()
 
     assert first["job_id"] == second["job_id"]
     assert second["replayed"] is True
@@ -158,10 +162,10 @@ def test_preview_proposal_with_no_proposal_yet_is_409(
     project = _create_project(client)
     cleanup_project_ids.append(uuid.UUID(project["id"]))
 
-    response = client.post(f"/projects/{project['id']}/preview-proposal")
+    response = client.post(f"/projects/{project['id']}/preview-proposal", headers=as_user(project["owner_id"]))
 
     assert response.status_code == 409
 
 
 def test_preview_proposal_for_unknown_project_is_404(client: TestClient) -> None:
-    assert client.post(f"/projects/{uuid.uuid4()}/preview-proposal").status_code == 404
+    assert client.post(f"/projects/{uuid.uuid4()}/preview-proposal", headers=as_user(uuid.uuid4())).status_code == 404

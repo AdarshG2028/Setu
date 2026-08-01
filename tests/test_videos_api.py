@@ -10,6 +10,8 @@ import asyncio
 import uuid
 
 import pytest
+
+from tests.conftest import as_user
 import sqlalchemy as sa
 from fastapi.testclient import TestClient
 from sqlalchemy.ext.asyncio import create_async_engine
@@ -70,9 +72,21 @@ async def cleanup_project_ids(database_url: str):
 
 
 def _create_project(client: TestClient) -> uuid.UUID:
-    response = client.post("/projects", json={"owner_id": str(uuid.uuid4())})
+    """Returns the project id, recording its owner in _OWNERS so later
+    calls can send a membership-satisfying header without every caller
+    threading the owner through."""
+    owner_id = uuid.uuid4()
+    response = client.post("/projects", json={}, headers=as_user(owner_id))
     assert response.status_code == 201
-    return uuid.UUID(response.json()["id"])
+    body = response.json()
+    project_id = uuid.UUID(body["id"])
+    _OWNERS[project_id] = uuid.UUID(body["owner_id"])
+    return project_id
+
+
+# project id -> its owner, so _upload can send a membership-satisfying
+# header without every caller having to thread the owner through.
+_OWNERS: dict[uuid.UUID, uuid.UUID] = {}
 
 
 def _upload(
@@ -87,6 +101,7 @@ def _upload(
         f"/projects/{project_id}/videos",
         files={"file": (filename, data, "video/mp4")},
         data={"name": name} if name is not None else None,
+        headers=as_user(_OWNERS.get(project_id, project_id)),
     )
 
 
@@ -123,7 +138,7 @@ def test_upload_with_display_name_persists_and_is_readable(
     assert detail["name"] == "Intro clip"
     assert detail["original_filename"] == "raw_export_final_v3.mp4"
 
-    listed = client.get(f"/projects/{project_id}/videos").json()["videos"]
+    listed = client.get(f"/projects/{project_id}/videos", headers=as_user(_OWNERS[project_id])).json()["videos"]
     assert listed[0]["name"] == "Intro clip"
 
 
@@ -169,14 +184,14 @@ def test_list_videos_returns_uploaded_videos(
     cleanup_video_ids.append(uuid.UUID(first["video_id"]))
     cleanup_video_ids.append(uuid.UUID(second["video_id"]))
 
-    response = client.get(f"/projects/{project_id}/videos")
+    response = client.get(f"/projects/{project_id}/videos", headers=as_user(_OWNERS[project_id]))
     assert response.status_code == 200
     filenames = [v["original_filename"] for v in response.json()["videos"]]
     assert filenames == ["first.mp4", "second.mp4"]
 
 
 def test_list_videos_for_unknown_project_is_404(client: TestClient) -> None:
-    response = client.get(f"/projects/{uuid.uuid4()}/videos")
+    response = client.get(f"/projects/{uuid.uuid4()}/videos", headers=as_user(uuid.uuid4()))
     assert response.status_code == 404
 
 

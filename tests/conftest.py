@@ -13,6 +13,17 @@ from backend.core.config import get_settings
 from backend.services.planner_factory import get_default_planner
 
 
+def as_user(user_id) -> dict[str, str]:
+    """Headers identifying the caller (Phase 8).
+
+    Identity moved out of the request body into the X-User-Id header,
+    because FastAPI resolves Pydantic bodies after dependencies and a
+    membership guard therefore cannot read a body field. Tests that talk
+    to a room endpoint need this or they get 422.
+    """
+    return {"X-User-Id": str(user_id)}
+
+
 def _database_reachable(url: str) -> bool:
     async def check() -> bool:
         engine = create_async_engine(url)

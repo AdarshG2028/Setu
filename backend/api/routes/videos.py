@@ -12,15 +12,13 @@ from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from backend.api.schemas.video import VideoDetailResponse
-from backend.database.session import get_session
+from backend.api.deps import SessionDep
 from backend.models import JobStatus
 from backend.repositories.job_repository import JobRepository
 from backend.repositories.result_repository import ResultRepository
 from backend.repositories.video_repository import VideoRepository
 
 router = APIRouter(prefix="/videos", tags=["videos"])
-
-SessionDep = Annotated[AsyncSession, Depends(get_session)]
 
 # video_analysis is always stage 0 of Job #1 — a single-stage workflow.
 _ANALYSIS_STAGE = 0

@@ -12,7 +12,7 @@ from backend.api.schemas.artifact import (
     StageArtifactsResponse,
 )
 from backend.api.schemas.job import JobCreateRequest, JobResponse, MemoryUpdateResponse
-from backend.database.session import get_session
+from backend.api.deps import SessionDep
 from backend.repositories.job_repository import JobRepository
 from backend.repositories.result_repository import ResultRepository
 from backend.services.job_submission_service import (
@@ -33,8 +33,6 @@ from backend.services.planner_factory import get_default_memory_extractor
 from backend.workers.media import previous_assets
 
 router = APIRouter(prefix="/jobs", tags=["jobs"])
-
-SessionDep = Annotated[AsyncSession, Depends(get_session)]
 
 
 @router.post("", response_model=JobResponse, status_code=status.HTTP_201_CREATED)

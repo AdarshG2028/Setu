@@ -12,6 +12,7 @@ from backend.models.job import Job
 from backend.models.message import Message
 from backend.models.outbox import OutboxEvent
 from backend.models.project import Project
+from backend.models.project_member import ProjectMember
 from backend.models.result import Result
 from backend.models.user_preference import UserPreference
 from backend.models.video import Video
@@ -29,6 +30,7 @@ __all__ = [
     "OutboxEvent",
     "OutboxStatus",
     "Project",
+    "ProjectMember",
     "Result",
     "UserPreference",
     "Video",

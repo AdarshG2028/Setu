@@ -11,6 +11,8 @@ can't reveal how many messages it was actually handed.
 import uuid
 
 import pytest
+
+from tests.conftest import as_user
 import sqlalchemy as sa
 from fastapi.testclient import TestClient
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
@@ -46,7 +48,8 @@ async def cleanup_project_ids(database_url: str):
 
 
 def _create_project(client: TestClient) -> dict:
-    response = client.post("/projects", json={"owner_id": str(uuid.uuid4())})
+    owner_id = uuid.uuid4()
+    response = client.post("/projects", json={}, headers=as_user(owner_id))
     assert response.status_code == 201
     return response.json()
 
@@ -54,7 +57,8 @@ def _create_project(client: TestClient) -> dict:
 def _post_message(client: TestClient, project_id: str, sender_id: str, content: str) -> dict:
     response = client.post(
         f"/projects/{project_id}/messages",
-        json={"sender_id": sender_id, "content": content},
+        json={"content": content},
+        headers=as_user(sender_id),
     )
     assert response.status_code == 200
     return response.json()
@@ -73,7 +77,7 @@ def test_first_message_returns_clarifying_message(
     project = _create_project(client)
     cleanup_project_ids.append(uuid.UUID(project["id"]))
 
-    body = _post_message(client, project["id"], str(uuid.uuid4()), "hi")
+    body = _post_message(client, project["id"], project["owner_id"], "hi")
     assert body["response"]["type"] == "message"
     uuid.UUID(body["message_id"])  # doesn't raise
 
@@ -81,7 +85,7 @@ def test_first_message_returns_clarifying_message(
 def test_second_message_returns_proposal(client: TestClient, cleanup_project_ids: list) -> None:
     project = _create_project(client)
     cleanup_project_ids.append(uuid.UUID(project["id"]))
-    sender_id = str(uuid.uuid4())
+    sender_id = project["owner_id"]
 
     _post_message(client, project["id"], sender_id, "hi")
     body = _post_message(client, project["id"], sender_id, "crop it vertically")
@@ -93,13 +97,13 @@ def test_second_message_returns_proposal(client: TestClient, cleanup_project_ids
 def test_messages_persist_in_order(client: TestClient, cleanup_project_ids: list) -> None:
     project = _create_project(client)
     cleanup_project_ids.append(uuid.UUID(project["id"]))
-    sender_id = str(uuid.uuid4())
+    sender_id = project["owner_id"]
 
     contents = ["first", "second", "third"]
     for content in contents:
         _post_message(client, project["id"], sender_id, content)
 
-    history = client.get(f"/projects/{project['id']}/messages").json()["messages"]
+    history = client.get(f"/projects/{project['id']}/messages", headers=as_user(project["owner_id"])).json()["messages"]
     assert [m["role"] for m in history] == ["user", "assistant"] * 3
     assert [m["content"] for m in history if m["role"] == "user"] == contents
 
@@ -112,7 +116,7 @@ async def test_conversation_is_auto_created_on_first_message(
     project_id = uuid.UUID(project["id"])
     cleanup_project_ids.append(project_id)
 
-    _post_message(client, project["id"], str(uuid.uuid4()), "hi")
+    _post_message(client, project["id"], project["owner_id"], "hi")
 
     engine = create_async_engine(database_url, poolclass=NullPool)
     async with engine.connect() as conn:
@@ -128,13 +132,14 @@ async def test_conversation_is_auto_created_on_first_message(
 def test_post_message_to_unknown_project_is_404(client: TestClient) -> None:
     response = client.post(
         f"/projects/{uuid.uuid4()}/messages",
-        json={"sender_id": str(uuid.uuid4()), "content": "hi"},
+        json={"content": "hi"},
+        headers=as_user(uuid.uuid4()),
     )
     assert response.status_code == 404
 
 
 def test_get_history_for_unknown_project_is_404(client: TestClient) -> None:
-    response = client.get(f"/projects/{uuid.uuid4()}/messages")
+    response = client.get(f"/projects/{uuid.uuid4()}/messages", headers=as_user(uuid.uuid4()))
     assert response.status_code == 404
 
 

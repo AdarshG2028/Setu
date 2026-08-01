@@ -13,10 +13,12 @@ from pydantic import BaseModel, Field
 
 
 class PostMessageRequest(BaseModel):
-    # Required, not optional: every user turn has a sender. Assistant/system
-    # messages are the only ones with no sender_id, and those aren't posted
-    # by clients.
-    sender_id: uuid.UUID
+    # sender_id used to be supplied here. It is now the authenticated
+    # caller (X-User-Id header, backend/api/deps.py) -- a client can no
+    # longer post as somebody else, and more practically, a dependency
+    # cannot read a body field, so membership could never be checked
+    # against one. Assistant messages still carry sender_id=None; those
+    # are never posted by a client.
     content: str
 
 
