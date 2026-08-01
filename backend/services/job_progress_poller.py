@@ -1,0 +1,168 @@
+"""Bridges job progress out of Setu and onto the room socket (Phase 8).
+
+Setu's engine emits nothing when a job advances -- `WorkflowEngine` moves
+`current_stage` and `StageProcessingService` writes the terminal status,
+and neither knows a room exists. So the V1 bridge is a **server-side
+watcher that polls and pushes diffs**, which is the same polling decision
+Phase 7 already made for the frontend, moved server-side so N clients do
+not each poll for the same answer.
+
+The clean upgrade is backlog item 1 -- terminal lifecycle events through
+the outbox -- feeding this same fan-out. When that lands only the
+producer changes; the envelope, the event types and every client stay put.
+
+**It polls only rooms that currently have a socket open.** With nobody
+listening there is nothing to send, so scanning the jobs table would be
+work performed for no observer. It also keeps this inert in a process
+where nobody has connected, which matters more than it sounds: the test
+suite runs the whole app lifespan against a database shared with a live
+development stack.
+"""
+
+import asyncio
+import logging
+import uuid
+from dataclasses import dataclass
+
+from sqlalchemy.ext.asyncio import async_sessionmaker
+
+from backend.api.schemas.artifact import ArtifactResponse
+from backend.models import Job
+from backend.models.enums import JobStatus
+from backend.repositories.project_job_repository import ProjectJobRepository
+from backend.repositories.result_repository import ResultRepository
+from backend.services.room_events import RoomEventBus
+from backend.services.room_snapshot_service import export_artifacts, final_result_by_job
+
+logger = logging.getLogger(__name__)
+
+__all__ = ["JobProgressPoller"]
+
+
+@dataclass(frozen=True)
+class _JobState:
+    """The parts of a job worth telling a room about."""
+
+    status: str
+    current_stage: int
+
+
+class JobProgressPoller:
+    def __init__(
+        self,
+        sessionmaker: async_sessionmaker,
+        events: RoomEventBus,
+        *,
+        interval_seconds: float = 2.0,
+    ) -> None:
+        self._sessionmaker = sessionmaker
+        self._events = events
+        self._interval = interval_seconds
+        # What each job looked like last tick. Only jobs in rooms with a
+        # listener ever appear here, and entries are dropped once a room
+        # goes quiet, so this cannot grow with the jobs table.
+        self._seen: dict[uuid.UUID, _JobState] = {}
+
+    async def run_forever(self, stop_event: asyncio.Event) -> None:
+        while not stop_event.is_set():
+            try:
+                await self.poll_once()
+            except Exception:
+                # Never take the API down to deliver a progress update.
+                # The next tick re-reads current state from the database,
+                # so a missed pass costs latency, not correctness.
+                logger.exception("room progress poll failed; will retry")
+            try:
+                await asyncio.wait_for(stop_event.wait(), timeout=self._interval)
+            except TimeoutError:
+                continue
+
+    async def poll_once(self) -> None:
+        watched = self._events.rooms()
+        if not watched:
+            # Forget everything: with no listeners there is no baseline
+            # worth keeping, and whoever connects next re-baselines from
+            # the room snapshot anyway.
+            self._seen.clear()
+            return
+
+        async with self._sessionmaker() as session:
+            for project_id in watched:
+                await self._poll_room(session, project_id)
+
+    async def _poll_room(self, session, project_id: uuid.UUID) -> None:
+        jobs = await ProjectJobRepository(session).list_jobs_for_project(project_id)
+        for job in jobs:
+            state = _JobState(status=job.status, current_stage=job.current_stage)
+            previous = self._seen.get(job.id)
+            if previous == state:
+                continue
+            self._seen[job.id] = state
+
+            # First sighting of an already-finished job is not news. A
+            # room that just gained a listener would otherwise replay its
+            # whole finished history, which the snapshot handed that
+            # client in full a moment earlier. `terminal()` rather than a
+            # local list, so this agrees with what the snapshot calls
+            # active -- a retryable `failed` is still moving.
+            first_sighting = previous is None
+            if first_sighting and JobStatus(job.status) in JobStatus.terminal():
+                continue
+
+            self._events.publish(project_id, type="job.updated", data=_job_event(job))
+
+            # Only on an observed transition: an export announced on first
+            # sighting would duplicate what the snapshot already listed.
+            if not first_sighting and job.status == JobStatus.COMPLETED:
+                await self._announce_export(session, project_id, job)
+
+    async def _announce_export(self, session, project_id: uuid.UUID, job: Job) -> None:
+        """Emit export.completed, if this job is an export at all.
+
+        Uses the snapshot's own predicate rather than a second copy of it:
+        a client that acts on this event and then reconnects must find the
+        same thing in `GET /projects/{id}`.
+        """
+        results = await ResultRepository(session).list_by_job(job.id)
+        artifacts = export_artifacts(job, final_result_by_job(results).get(job.id))
+        if not artifacts:
+            return
+        self._events.publish(
+            project_id,
+            type="export.completed",
+            data={
+                "job_id": str(job.id),
+                "workflow": job.workflow["workflow"],
+                "completed_at": job.completed_at.isoformat() if job.completed_at else None,
+                # Built through the API schema, deliberately: the value
+                # here is the download_url format, which step 7 changed
+                # and will change again at Phase 5H's presigned URLs. A
+                # hand-rolled copy in this module would drift silently and
+                # hand clients dead links.
+                "artifacts": [
+                    ArtifactResponse.from_asset(
+                        kind=asset.kind, uri=asset.uri, job_id=job.id
+                    ).model_dump()
+                    for asset in artifacts
+                ],
+            },
+        )
+
+
+def _job_event(job: Job) -> dict:
+    """A job as the room socket carries it.
+
+    Same field names as `GET /jobs/{id}` (JobResponse), so a client
+    tracking progress handles one shape whether it polled or was pushed.
+    """
+    workflow = job.workflow["workflow"]
+    return {
+        "id": str(job.id),
+        "status": job.status,
+        "workflow": workflow,
+        "current_stage": job.current_stage,
+        "total_stages": len(workflow),
+        "attempts": job.attempts,
+        "max_attempts": job.max_attempts,
+        "created_at": job.created_at.isoformat(),
+    }

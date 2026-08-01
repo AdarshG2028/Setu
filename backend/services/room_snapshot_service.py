@@ -16,6 +16,7 @@ from dataclasses import dataclass
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from backend.models import Job, Message, Project, ProjectMember, Result, Video
+from backend.models.enums import JobStatus
 from backend.repositories.conversation_repository import ConversationRepository
 from backend.repositories.message_repository import MessageRepository
 from backend.repositories.project_job_repository import ProjectJobRepository
@@ -25,7 +26,13 @@ from backend.repositories.result_repository import ResultRepository
 from backend.repositories.video_repository import VideoRepository
 from backend.workers.media import Asset, PREVIEW_FLAG, previous_assets
 
-__all__ = ["Export", "RoomSnapshot", "RoomSnapshotService"]
+__all__ = [
+    "Export",
+    "RoomSnapshot",
+    "RoomSnapshotService",
+    "export_artifacts",
+    "final_result_by_job",
+]
 
 # How much of the transcript the snapshot carries. Bounded, unlike
 # ConversationService.get_history: this is the room's opening render, and
@@ -38,6 +45,54 @@ DEFAULT_MESSAGE_LIMIT = 50
 class Export:
     job: Job
     artifacts: list[Asset]
+
+
+def export_artifacts(job: Job, final_result: Result | None) -> list[Asset]:
+    """What this job contributes to the room's version list -- [] if nothing.
+
+    **The export rule, in one place on purpose.** The snapshot below and
+    the progress poller's `export.completed` event both call this. A
+    stream announcing a set of exports that a reconnect then disagrees
+    with would be worse than emitting no event at all, and two copies of
+    a four-line predicate is exactly how that happens.
+
+    Three exclusions, only one of them naming anything:
+
+    - **Unfinished work** is not a version.
+    - **Previews are not versions.** A preview is deliberately the same
+      workflow at low resolution (see ProposalConfirmationService), so
+      nothing about its shape distinguishes it -- only the `_preview`
+      payload flag the compiler sets, which is what this reads.
+    - **Jobs that produced nothing** drop out on their own, without an
+      allowlist: `video_analysis` measures a video rather than producing
+      one and `dummy` produces nothing at all, so both arrive with an
+      empty asset list. Filtering on what a job *left behind* rather than
+      on a worker name means a future non-producing capability needs no
+      change here.
+    """
+    if job.status != JobStatus.COMPLETED:
+        return []
+    if (job.payload or {}).get(PREVIEW_FLAG):
+        return []
+    if final_result is None:
+        return []
+    return previous_assets(final_result.payload)
+
+
+def final_result_by_job(results: list[Result]) -> dict[uuid.UUID, Result]:
+    """The last stage each job got to, keyed by job.
+
+    The last stage rather than the last *declared* stage: a job that
+    stopped early still has a meaningful newest result, and under the
+    asset model that result already carries everything the earlier stages
+    forwarded.
+    """
+    final: dict[uuid.UUID, Result] = {}
+    for result in results:
+        current = final.get(result.job_id)
+        if current is None or result.stage > current.stage:
+            final[result.job_id] = result
+    return final
 
 
 @dataclass(frozen=True)
@@ -89,47 +144,19 @@ class RoomSnapshotService:
     async def _exports(self, project_id: uuid.UUID) -> list[Export]:
         """The room's completed jobs that left something worth keeping.
 
-        Two exclusions, and only one of them is hardcoded:
-
-        - **Previews are not versions.** A preview is deliberately the
-          same workflow at low resolution (see ProposalConfirmationService),
-          so nothing about its shape distinguishes it -- only the
-          `_preview` payload flag the compiler sets, which is what this
-          reads.
-        - **Jobs that produced no assets** drop out on their own, without
-          naming any worker: `video_analysis` measures a video rather than
-          producing one, and `dummy` produces nothing at all, so both come
-          back with an empty final-stage asset list. Filtering on *what a
-          job left behind* rather than on a worker allowlist means a
-          future non-producing capability needs no change here.
+        The rule itself is `export_artifacts` above, shared with the
+        socket. This only supplies it with a batch: one results query for
+        every candidate rather than one per job, since the snapshot
+        renders them all together.
         """
         completed = await self._project_jobs.list_completed_jobs(project_id)
-        candidates = [job for job in completed if not (job.payload or {}).get(PREVIEW_FLAG)]
-
-        results_by_job = self._final_results(
-            await self._results.list_by_jobs([job.id for job in candidates])
+        results_by_job = final_result_by_job(
+            await self._results.list_by_jobs([job.id for job in completed])
         )
 
         exports = []
-        for job in candidates:
-            final = results_by_job.get(job.id)
-            artifacts = previous_assets(final.payload) if final is not None else []
+        for job in completed:
+            artifacts = export_artifacts(job, results_by_job.get(job.id))
             if artifacts:
                 exports.append(Export(job=job, artifacts=artifacts))
         return exports
-
-    @staticmethod
-    def _final_results(results: list[Result]) -> dict[uuid.UUID, Result]:
-        """The last stage each job got to, keyed by job.
-
-        The last stage rather than the last *declared* stage: a job that
-        stopped early still has a meaningful newest result, and under the
-        asset model that result already carries everything the earlier
-        stages forwarded.
-        """
-        final: dict[uuid.UUID, Result] = {}
-        for result in results:
-            current = final.get(result.job_id)
-            if current is None or result.stage > current.stage:
-                final[result.job_id] = result
-        return final

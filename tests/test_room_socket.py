@@ -13,10 +13,16 @@ socket, make a REST call, assert on what arrives.
 import uuid
 
 import pytest
+import sqlalchemy as sa
 from fastapi.testclient import TestClient
+from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+from sqlalchemy.pool import NullPool
 from starlette.websockets import WebSocketDisconnect
 
+from backend.models import Job, ProjectJob, Result
+from backend.services.job_progress_poller import JobProgressPoller
 from backend.services.room_events import RoomEventBus, get_room_events
+from backend.workers.media import Asset, AssetKind, assets_payload
 from tests.conftest import as_user
 
 pytestmark = pytest.mark.usefixtures("database_url")
@@ -35,6 +41,92 @@ def room(client: TestClient, cleanup_project_ids: list):
     )
     client.post(f"/projects/{project['id']}/join", headers=as_user(member))
     return project["id"], owner, member
+
+
+@pytest.fixture
+async def seeded_room(client: TestClient, cleanup_project_ids: list, database_url: str):
+    """A room with one pending job, written straight to the database.
+
+    Seeded rather than submitted for the reason recorded in
+    tests/test_membership.py: a real submission publishes to Kafka, and a
+    live worker from a running dev stack will drive the job to a terminal
+    state underneath the assertions.
+    """
+    owner = uuid.uuid4()
+    project = client.post("/projects", json={"name": "poll"}, headers=as_user(owner)).json()
+    cleanup_project_ids.append(uuid.UUID(project["id"]))
+
+    job_id = uuid.uuid4()
+    engine = create_async_engine(database_url, poolclass=NullPool)
+    try:
+        async with engine.connect() as conn:
+            await conn.execute(
+                sa.insert(Job).values(
+                    id=job_id,
+                    status="pending",
+                    workflow={"workflow": ["crop", "audio"]},
+                    current_stage=0,
+                    payload={},
+                    max_attempts=5,
+                )
+            )
+            await conn.execute(
+                sa.insert(ProjectJob).values(
+                    job_id=job_id,
+                    project_id=uuid.UUID(project["id"]),
+                    submitted_by_user_id=owner,
+                )
+            )
+            await conn.commit()
+    finally:
+        await engine.dispose()
+    return project["id"], str(job_id)
+
+
+async def _advance_job(database_url: str, job_id: str, *, status: str, current_stage: int):
+    engine = create_async_engine(database_url, poolclass=NullPool)
+    try:
+        async with engine.connect() as conn:
+            await conn.execute(
+                sa.update(Job)
+                .where(Job.id == uuid.UUID(job_id))
+                .values(
+                    status=status,
+                    current_stage=current_stage,
+                    completed_at=sa.func.now() if status == "completed" else None,
+                )
+            )
+            await conn.commit()
+    finally:
+        await engine.dispose()
+
+
+async def _finish_with_asset(database_url: str, job_id: str, uri: str):
+    await _advance_job(database_url, job_id, status="completed", current_stage=1)
+    engine = create_async_engine(database_url, poolclass=NullPool)
+    try:
+        async with engine.connect() as conn:
+            await conn.execute(
+                sa.insert(Result).values(
+                    id=uuid.uuid4(),
+                    job_id=uuid.UUID(job_id),
+                    worker_name="render",
+                    stage=0,
+                    payload=assets_payload([Asset(kind=AssetKind.VIDEO, uri=uri)]),
+                )
+            )
+            await conn.commit()
+    finally:
+        await engine.dispose()
+
+
+def _drain(bus: RoomEventBus, project_id: uuid.UUID) -> list[dict]:
+    """Everything queued for the room's single test subscriber."""
+    subscription = next(iter(bus._rooms[project_id]))  # noqa: SLF001 - test introspection
+    out = []
+    while not subscription.queue.empty():
+        out.append(subscription.queue.get_nowait())
+    return out
 
 
 def _url(project_id: str, user: uuid.UUID) -> str:
@@ -325,3 +417,149 @@ def test_the_bus_accessor_is_process_wide() -> None:
     """A registry request handlers write to and socket tasks read from
     only works if both reach the same object."""
     assert get_room_events() is get_room_events()
+
+
+# --- the progress bridge ---------------------------------------------------
+#
+# poll_once() is driven directly rather than through run_forever's timer:
+# these assert what a tick *does*, and sleeping for a real interval would
+# buy nothing but flakiness.
+
+
+@pytest.fixture
+async def poller(database_url: str):
+    """A poller on its own bus, so tests never race the app's own task."""
+    engine = create_async_engine(database_url, poolclass=NullPool)
+    bus = RoomEventBus()
+    yield JobProgressPoller(
+        async_sessionmaker(bind=engine, expire_on_commit=False), bus
+    ), bus
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_only_rooms_with_a_listener_are_queried(poller, monkeypatch) -> None:
+    """The property that keeps this cheap, and keeps it inert in a process
+    where nobody has connected. Asserted in both directions, or "queried
+    nothing" would pass for a poller that never queries anything."""
+    progress, bus = poller
+    queried: list[uuid.UUID] = []
+    monkeypatch.setattr(
+        "backend.services.job_progress_poller.ProjectJobRepository",
+        lambda session: _RecordingRepo(queried),
+    )
+
+    await progress.poll_once()
+    assert queried == []
+
+    watched = uuid.uuid4()
+    bus.subscribe(watched)
+    bus.publish(uuid.uuid4(), type="message.created", data={})  # a room with nobody in it
+    await progress.poll_once()
+
+    assert queried == [watched]
+
+
+@pytest.mark.asyncio
+async def test_a_stage_advancing_is_pushed_to_the_room(
+    poller, database_url: str, seeded_room
+) -> None:
+    """What replaces every client polling GET /jobs/{id} for itself."""
+    progress, bus = poller
+    project_id, job_id = seeded_room
+    bus.subscribe(uuid.UUID(project_id))
+
+    await progress.poll_once()  # baseline
+    await _advance_job(database_url, job_id, status="running", current_stage=1)
+    await progress.poll_once()
+
+    published = _drain(bus, uuid.UUID(project_id))
+    assert [e["type"] for e in published] == ["job.updated", "job.updated"]
+    assert published[-1]["data"]["current_stage"] == 1
+    assert published[-1]["data"]["status"] == "running"
+
+
+@pytest.mark.asyncio
+async def test_an_unchanged_job_is_not_re_announced(
+    poller, database_url: str, seeded_room
+) -> None:
+    """Diffs, not snapshots. A poller that re-sent everything every tick
+    would make seq useless as a gap detector."""
+    progress, bus = poller
+    project_id, _ = seeded_room
+    bus.subscribe(uuid.UUID(project_id))
+
+    await progress.poll_once()
+    before = bus.current_seq(uuid.UUID(project_id))
+    await progress.poll_once()
+    await progress.poll_once()
+
+    assert bus.current_seq(uuid.UUID(project_id)) == before
+
+
+@pytest.mark.asyncio
+async def test_a_job_already_finished_when_you_connect_is_not_replayed(
+    poller, database_url: str, seeded_room
+) -> None:
+    """The snapshot just handed that client this job. Announcing it again
+    would be news that is not new."""
+    progress, bus = poller
+    project_id, job_id = seeded_room
+    await _advance_job(database_url, job_id, status="completed", current_stage=1)
+    bus.subscribe(uuid.UUID(project_id))
+
+    await progress.poll_once()
+
+    assert _drain(bus, uuid.UUID(project_id)) == []
+
+
+@pytest.mark.asyncio
+async def test_completing_announces_an_export_alongside_the_update(
+    poller, database_url: str, seeded_room
+) -> None:
+    """export.completed has to agree with what a reconnect would list, so
+    it runs the snapshot's own predicate."""
+    progress, bus = poller
+    project_id, job_id = seeded_room
+    bus.subscribe(uuid.UUID(project_id))
+
+    await progress.poll_once()
+    await _finish_with_asset(database_url, job_id, "local://done.mp4")
+    await progress.poll_once()
+
+    published = _drain(bus, uuid.UUID(project_id))
+    types = [e["type"] for e in published]
+    assert types == ["job.updated", "job.updated", "export.completed"]
+    export = published[-1]["data"]
+    assert export["job_id"] == job_id
+    # The download URL is built through the API schema, so the socket and
+    # the snapshot can never hand out different links.
+    assert export["artifacts"][0]["download_url"] == (
+        f"/artifacts?uri=local%3A%2F%2Fdone.mp4&job_id={job_id}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_completed_job_that_produced_nothing_is_not_an_export(
+    poller, database_url: str, seeded_room
+) -> None:
+    """Same rule as the snapshot: analysis jobs finish, but finish nothing."""
+    progress, bus = poller
+    project_id, job_id = seeded_room
+    bus.subscribe(uuid.UUID(project_id))
+
+    await progress.poll_once()
+    await _advance_job(database_url, job_id, status="completed", current_stage=1)
+    await progress.poll_once()
+
+    types = [e["type"] for e in _drain(bus, uuid.UUID(project_id))]
+    assert "export.completed" not in types
+
+
+class _RecordingRepo:
+    def __init__(self, log: list) -> None:
+        self._log = log
+
+    async def list_jobs_for_project(self, project_id, **_):
+        self._log.append(project_id)
+        return []

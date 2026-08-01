@@ -16,6 +16,7 @@ from backend.messaging.outbox_publisher import OutboxPublisher
 from backend.observability.logging import configure_logging
 from backend.observability.metrics import poll_job_lifecycle_gauges
 from backend.services.artifact_cleanup_service import ArtifactCleanupService
+from backend.services.job_progress_poller import JobProgressPoller
 from backend.services.room_events import get_room_events
 from backend.observability.tracing import configure_tracing
 
@@ -77,6 +78,16 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             get_sessionmaker(), stop_event, settings.metrics_poll_interval_seconds
         )
     )
+    # Setu's engine emits nothing when a job advances, so this is the
+    # bridge onto the room socket. It costs nothing until somebody
+    # connects: with no open sockets it reads no jobs at all.
+    progress_task = asyncio.create_task(
+        JobProgressPoller(
+            get_sessionmaker(),
+            get_room_events(),
+            interval_seconds=settings.room_progress_poll_interval_seconds,
+        ).run_forever(stop_event)
+    )
 
     try:
         yield
@@ -89,6 +100,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         await publisher_task
         await metrics_task
         await cleanup_task
+        await progress_task
         await publisher.stop()
 
 

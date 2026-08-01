@@ -100,6 +100,13 @@ class Settings(BaseSettings):
     artifact_cleanup_interval_seconds: float = 900.0
     artifact_cleanup_enabled: bool = True
 
+    # How often the room socket's progress bridge re-reads the jobs of
+    # rooms that currently have a listener. Short, because this is what
+    # replaces per-client polling of GET /jobs/{id} and a stage boundary
+    # a user is watching for should not sit unreported for long; cheap,
+    # because a room nobody is watching is not queried at all.
+    room_progress_poll_interval_seconds: float = 2.0
+
 
 @lru_cache
 def get_settings() -> Settings:
