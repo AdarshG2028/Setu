@@ -14,6 +14,7 @@ from typing import Annotated
 from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from backend.api.schemas.artifact import ArtifactResponse
 from backend.api.schemas.conversation import (
     ConfirmProposalResponse,
     ConversationHistoryResponse,
@@ -21,12 +22,14 @@ from backend.api.schemas.conversation import (
     PostMessageRequest,
     PostMessageResponse,
 )
+from backend.api.schemas.job import JobResponse
 from backend.api.schemas.member import (
     AddMemberRequest,
     MemberListResponse,
     MemberResponse,
 )
 from backend.api.schemas.project import CreateProjectRequest, ProjectResponse
+from backend.api.schemas.room import ExportResponse, RoomSnapshotResponse
 from backend.api.schemas.video import VideoListResponse, VideoSummaryResponse, VideoUploadResponse
 from backend.api.deps import (
     CurrentUserDep,
@@ -49,6 +52,7 @@ from backend.services.proposal_confirmation_service import (
     ProposalConfirmationService,
     UnknownVideoHandleError,
 )
+from backend.services.room_snapshot_service import RoomSnapshotService
 from backend.services.video_upload_service import VideoUploadService
 
 router = APIRouter(prefix="/projects", tags=["projects"])
@@ -71,6 +75,69 @@ async def create_project(
         owner_id=project.owner_id,
         name=project.name,
         created_at=project.created_at,
+    )
+
+
+@router.get("/{project_id}", response_model=RoomSnapshotResponse)
+async def get_room(
+    project_id: uuid.UUID, session: SessionDep, user_id: ProjectMemberDep
+) -> RoomSnapshotResponse:
+    """Everything needed to render the room, in one request.
+
+    Five separate GETs (project, members, videos, messages, jobs) is a
+    slow and racy way to open a room -- the client would stitch together
+    five points in time. It is also the socket's reconnect path: refetch
+    this, then resume the stream.
+
+    No 404 branch of its own: ProjectMemberDep already 404s for both a
+    non-member and a missing project (deliberately indistinguishable, see
+    backend/api/deps.py), so by the time this body runs the project
+    exists and the caller belongs to it.
+    """
+    snapshot = await RoomSnapshotService(session).get(project_id)
+    return RoomSnapshotResponse(
+        project=ProjectResponse(
+            id=snapshot.project.id,
+            owner_id=snapshot.project.owner_id,
+            name=snapshot.project.name,
+            created_at=snapshot.project.created_at,
+        ),
+        members=[
+            MemberResponse(user_id=m.user_id, role=m.role, joined_at=m.joined_at)
+            for m in snapshot.members
+        ],
+        videos=[
+            VideoSummaryResponse(
+                id=v.id,
+                original_filename=v.original_filename,
+                name=v.name,
+                created_at=v.created_at,
+            )
+            for v in snapshot.videos
+        ],
+        messages=[
+            MessageResponse(
+                id=m.id,
+                role=m.role,
+                sender_id=m.sender_id,
+                content=m.content,
+                created_at=m.created_at,
+            )
+            for m in snapshot.messages
+        ],
+        active_jobs=[JobResponse.from_model(job) for job in snapshot.active_jobs],
+        exports=[
+            ExportResponse(
+                job_id=export.job.id,
+                workflow=export.job.workflow["workflow"],
+                completed_at=export.job.completed_at,
+                artifacts=[
+                    ArtifactResponse.from_asset(kind=asset.kind, uri=asset.uri)
+                    for asset in export.artifacts
+                ],
+            )
+            for export in snapshot.exports
+        ],
     )
 
 

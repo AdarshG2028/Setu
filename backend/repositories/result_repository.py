@@ -43,5 +43,19 @@ class ResultRepository:
         )
         return {result.job_id: result for result in rows.scalars().all()}
 
+    async def list_by_jobs(self, job_ids: list[uuid.UUID]) -> list[Result]:
+        """Every stage's result across several jobs, in (job, stage) order.
+
+        One query for the whole room snapshot: listing each export's
+        artifacts per job would be N round trips for a view that renders
+        all of them together.
+        """
+        if not job_ids:
+            return []
+        rows = await self._session.execute(
+            select(Result).where(Result.job_id.in_(job_ids)).order_by(Result.job_id, Result.stage)
+        )
+        return list(rows.scalars().all())
+
     def add(self, result: Result) -> None:
         self._session.add(result)

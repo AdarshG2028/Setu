@@ -2,11 +2,12 @@
 
 import uuid
 
-from sqlalchemy import select
+from sqlalchemy import Select, select
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from backend.models import Job, ProjectJob
+from backend.models.enums import JobStatus
 
 
 class ProjectJobRepository:
@@ -51,10 +52,53 @@ class ProjectJobRepository:
         """The room's jobs, most recent first — what the snapshot endpoint
         and the progress poller both need."""
         result = await self._session.execute(
+            self._room_jobs(project_id).order_by(Job.created_at.desc()).limit(limit)
+        )
+        return list(result.scalars().all())
+
+    async def list_active_jobs(self, project_id: uuid.UUID) -> list[Job]:
+        """Work still outstanding in this room, oldest first.
+
+        "Active" is `not in JobStatus.terminal()`, reusing the definition
+        the engine already works to rather than inventing a second one --
+        which means a `failed` job counts as active, correctly: failed is
+        retryable here, and `dead_lettered` is the state that means it
+        has genuinely stopped.
+
+        Unbounded, unlike the listing above: this is what is *running*,
+        and a snapshot that silently dropped an in-flight job would make
+        the room look idle while it burns compute.
+        """
+        result = await self._session.execute(
+            self._room_jobs(project_id)
+            .where(Job.status.not_in([s.value for s in JobStatus.terminal()]))
+            .order_by(Job.created_at)
+        )
+        return list(result.scalars().all())
+
+    async def list_completed_jobs(self, project_id: uuid.UUID) -> list[Job]:
+        """The room's finished jobs, most recently completed first.
+
+        Ordered by `completed_at` rather than `created_at` because this
+        feeds the derived version list (architecture doc, Phase 8: the
+        room's completed export jobs *are* the version history), and jobs
+        do not necessarily finish in the order they were submitted.
+
+        Deliberately returns previews and analysis jobs too. Which of
+        these count as exports is a product question, and answering it
+        needs the payload -- so it belongs one layer up in
+        RoomSnapshotService, not buried in a JSON predicate here.
+        """
+        result = await self._session.execute(
+            self._room_jobs(project_id)
+            .where(Job.status == JobStatus.COMPLETED.value)
+            .order_by(Job.completed_at.desc())
+        )
+        return list(result.scalars().all())
+
+    def _room_jobs(self, project_id: uuid.UUID) -> Select[tuple[Job]]:
+        return (
             select(Job)
             .join(ProjectJob, ProjectJob.job_id == Job.id)
             .where(ProjectJob.project_id == project_id)
-            .order_by(Job.created_at.desc())
-            .limit(limit)
         )
-        return list(result.scalars().all())
