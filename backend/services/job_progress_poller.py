@@ -107,29 +107,40 @@ class JobProgressPoller:
         # is to fetch the room's *active* jobs here rather than its most
         # recent ones.
         jobs = await ProjectJobRepository(session).list_jobs_for_project(project_id)
+
+        # The room's *first* tick establishes a baseline and announces
+        # nothing: whoever just connected got all of this in the snapshot,
+        # and replaying it would be news that is not new.
+        #
+        # Baselining per room rather than per job is the whole point.
+        # Keying it on the job made a job that was unknown-then-finished
+        # indistinguishable from a job that had finished before anyone
+        # connected, so both were suppressed -- and a job that started and
+        # ended *between two ticks* was therefore never reported at all.
+        # Found live: a video_analysis job that lived 1.4s under a 2s
+        # interval vanished silently, and a short render would have taken
+        # its export.completed with it.
+        baselining = project_id not in self._seen
         seen = self._seen.setdefault(project_id, {})
+
         for job in jobs:
             state = _JobState(status=job.status, current_stage=job.current_stage)
             previous = seen.get(job.id)
             if previous == state:
                 continue
             seen[job.id] = state
-
-            # First sighting of an already-finished job is not news. A
-            # room that just gained a listener would otherwise replay its
-            # whole finished history, which the snapshot handed that
-            # client in full a moment earlier. `terminal()` rather than a
-            # local list, so this agrees with what the snapshot calls
-            # active -- a retryable `failed` is still moving.
-            first_sighting = previous is None
-            if first_sighting and JobStatus(job.status) in JobStatus.terminal():
+            if baselining:
                 continue
 
             self._events.publish(project_id, type="job.updated", data=_job_event(job))
 
-            # Only on an observed transition: an export announced on first
-            # sighting would duplicate what the snapshot already listed.
-            if not first_sighting and job.status == JobStatus.COMPLETED:
+            # Including a job first seen already complete: while this room
+            # was being watched, it went from not existing to done, and
+            # that is exactly the moment worth announcing.
+            became_complete = job.status == JobStatus.COMPLETED and (
+                previous is None or previous.status != JobStatus.COMPLETED
+            )
+            if became_complete:
                 await self._announce_export(session, project_id, job)
 
     async def _announce_export(self, session, project_id: uuid.UUID, job: Job) -> None:

@@ -120,6 +120,45 @@ async def _finish_with_asset(database_url: str, job_id: str, uri: str):
         await engine.dispose()
 
 
+async def _seed_completed_job(database_url: str, project_id: str, uri: str) -> str:
+    """A job that is already finished the first time anyone looks at it."""
+    job_id = uuid.uuid4()
+    engine = create_async_engine(database_url, poolclass=NullPool)
+    try:
+        async with engine.connect() as conn:
+            await conn.execute(
+                sa.insert(Job).values(
+                    id=job_id,
+                    status="completed",
+                    workflow={"workflow": ["crop"]},
+                    current_stage=1,
+                    payload={},
+                    max_attempts=5,
+                    completed_at=sa.func.now(),
+                )
+            )
+            await conn.execute(
+                sa.insert(ProjectJob).values(
+                    job_id=job_id,
+                    project_id=uuid.UUID(project_id),
+                    submitted_by_user_id=uuid.uuid4(),
+                )
+            )
+            await conn.execute(
+                sa.insert(Result).values(
+                    id=uuid.uuid4(),
+                    job_id=job_id,
+                    worker_name="crop",
+                    stage=0,
+                    payload=assets_payload([Asset(kind=AssetKind.VIDEO, uri=uri)]),
+                )
+            )
+            await conn.commit()
+    finally:
+        await engine.dispose()
+    return str(job_id)
+
+
 def _drain(bus: RoomEventBus, project_id: uuid.UUID) -> list[dict]:
     """Everything queued for the room's single test subscriber."""
     subscription = next(iter(bus._rooms[project_id]))  # noqa: SLF001 - test introspection
@@ -474,7 +513,9 @@ async def test_a_stage_advancing_is_pushed_to_the_room(
     await progress.poll_once()
 
     published = _drain(bus, uuid.UUID(project_id))
-    assert [e["type"] for e in published] == ["job.updated", "job.updated"]
+    # One event, not two: the first tick only baselined, since the client
+    # already had that state from the snapshot.
+    assert [e["type"] for e in published] == ["job.updated"]
     assert published[-1]["data"]["current_stage"] == 1
     assert published[-1]["data"]["status"] == "running"
 
@@ -529,7 +570,7 @@ async def test_completing_announces_an_export_alongside_the_update(
 
     published = _drain(bus, uuid.UUID(project_id))
     types = [e["type"] for e in published]
-    assert types == ["job.updated", "job.updated", "export.completed"]
+    assert types == ["job.updated", "export.completed"]
     export = published[-1]["data"]
     assert export["job_id"] == job_id
     # The download URL is built through the API schema, so the socket and
@@ -554,6 +595,34 @@ async def test_a_completed_job_that_produced_nothing_is_not_an_export(
 
     types = [e["type"] for e in _drain(bus, uuid.UUID(project_id))]
     assert "export.completed" not in types
+
+
+@pytest.mark.asyncio
+async def test_a_job_that_starts_and_finishes_between_ticks_is_still_announced(
+    poller, database_url: str, client: TestClient, cleanup_project_ids: list
+) -> None:
+    """Found in a live walkthrough: a video_analysis job lived 1.4s under
+    a 2s poll interval and was never reported at all, because the poller
+    first saw it already complete and treated that like history. A short
+    render would have taken its export.completed with it — the room would
+    only have learned of the export by refetching the snapshot, which is
+    the polling this whole bridge exists to remove."""
+    progress, bus = poller
+    owner = uuid.uuid4()
+    project = client.post("/projects", json={"name": "fast"}, headers=as_user(owner)).json()
+    cleanup_project_ids.append(uuid.UUID(project["id"]))
+    room = uuid.UUID(project["id"])
+    bus.subscribe(room)
+
+    await progress.poll_once()  # baseline: the room has no jobs at all
+
+    # Created and finished entirely within one interval.
+    job_id = await _seed_completed_job(database_url, project["id"], "local://fast.mp4")
+    await progress.poll_once()
+
+    published = _drain(bus, room)
+    assert [e["type"] for e in published] == ["job.updated", "export.completed"]
+    assert published[-1]["data"]["job_id"] == job_id
 
 
 @pytest.mark.asyncio
@@ -612,7 +681,7 @@ async def test_the_poller_publishes_onto_the_shared_bus(
     finally:
         await engine.dispose()
 
-    assert [e["type"] for e in queued] == ["job.updated", "job.updated"]
+    assert [e["type"] for e in queued] == ["job.updated"]
 
 
 class _RecordingRepo:
