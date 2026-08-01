@@ -52,4 +52,7 @@ def test_to_dict_proposal_round_trips_video_ids() -> None:
         "type": "proposal",
         "summary": "Combine.",
         "workflow": [{"stage": "combine", "video_ids": ["video_1", "video_2"], "params": {}}],
+        # Phase 9a facilitation fields, null when the planner omits them.
+        "reasoning": None,
+        "discussion_summary": None,
     }

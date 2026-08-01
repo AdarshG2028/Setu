@@ -8,7 +8,15 @@ from typing import AsyncIterator
 from fastapi import FastAPI
 from prometheus_client import make_asgi_app
 
-from backend.api.routes import artifacts, health, jobs, projects, room_socket, videos
+from backend.api.routes import (
+    artifacts,
+    health,
+    jobs,
+    projects,
+    proposals,
+    room_socket,
+    videos,
+)
 from backend.core.config import Settings, get_settings
 from backend.database.session import get_sessionmaker
 from backend.messaging.kafka_producer import build_producer
@@ -121,6 +129,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.include_router(jobs.router)
     app.include_router(videos.router)
     app.include_router(projects.router)
+    app.include_router(proposals.router)
     app.include_router(room_socket.router)
     app.mount("/metrics", make_asgi_app())
     return app

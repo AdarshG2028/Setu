@@ -20,6 +20,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from backend.core.config import get_settings
 from backend.models import Conversation, Message, MessageRole
+from backend.models import Proposal as ProposalRow
 from backend.repositories.conversation_repository import ConversationRepository
 from backend.repositories.message_repository import MessageRepository
 from backend.repositories.result_repository import ResultRepository
@@ -29,6 +30,8 @@ from backend.repositories.video_repository import VideoRepository
 from backend.services.capability_registry import DEFAULT_CAPABILITY_REGISTRY, CapabilityRegistry
 from backend.services.planner import Planner, StaticPlanner
 from backend.services.planner_context import PlannerContext, build_video_contexts
+from backend.repositories.proposal_repository import ProposalRepository
+from backend.services.proposal_service import proposal_event
 from backend.services.room_events import get_room_events
 
 __all__ = ["ConversationService", "PostMessageResult", "ProjectNotFoundError"]
@@ -120,6 +123,28 @@ class ConversationService:
             content=json.dumps(response_dict),
         )
         self._messages.add(assistant_message)
+
+        # A proposal becomes a row, not just a line in the transcript
+        # (Phase 9a). Creation is the planner's job -- there is no manual
+        # proposal endpoint -- and the author is whoever's turn produced
+        # it, which becomes job ownership when the room approves it.
+        proposal_row = None
+        if response.type == "proposal" and response.proposal is not None:
+            proposal_row = ProposalRow(
+                project_id=project_id,
+                created_by_user_id=sender_id,
+                summary=response.proposal.summary,
+                reasoning=response.proposal.reasoning,
+                discussion_summary=response.proposal.discussion_summary,
+                workflow={
+                    "workflow": [
+                        {"stage": s.stage, "video_ids": s.video_ids, "params": s.params}
+                        for s in response.proposal.workflow
+                    ]
+                },
+            )
+            ProposalRepository(self._session).add(proposal_row)
+
         await self._session.commit()
 
         # Fanned out only after the commit. Emitting earlier would let a
@@ -135,6 +160,10 @@ class ConversationService:
         events.publish(
             project_id, type="planner.replied", data=_message_event(assistant_message)
         )
+        if proposal_row is not None:
+            events.publish(
+                project_id, type="proposal.created", data=proposal_event(proposal_row)
+            )
 
         return PostMessageResult(message_id=user_message.id, response=response_dict)
 

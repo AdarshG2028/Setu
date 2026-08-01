@@ -228,26 +228,12 @@ async def upload_video(
     )
 
 
-@router.post("/{project_id}/confirm-proposal", response_model=ConfirmProposalResponse)
-async def confirm_proposal(
-    project_id: uuid.UUID, session: SessionDep, user_id: ProjectMemberDep
-) -> ConfirmProposalResponse:
-    try:
-        result = await ProposalConfirmationService(session).confirm(project_id, user_id=user_id)
-    except ProjectNotFoundError as exc:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND, detail="project not found"
-        ) from exc
-    except NoPendingProposalError as exc:
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT, detail="no pending proposal to confirm"
-        ) from exc
-    except UnknownVideoHandleError as exc:
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail=f"proposal references unknown video handle '{exc.video_id}'",
-        ) from exc
-    return ConfirmProposalResponse(job_id=result.job.id, replayed=result.replayed)
+# POST /projects/{id}/confirm-proposal was removed in Phase 9a. It
+# submitted a real render on one member's say-so, which is precisely the
+# decision the room's approval policy now governs -- leaving it in place
+# would have made approval opt-in, and any member could have spent the
+# room's compute by calling the older endpoint instead. Its replacement
+# is POST /proposals/{id}/approve. Previewing stays unapproved and free.
 
 
 @router.post("/{project_id}/preview-proposal", response_model=ConfirmProposalResponse)
@@ -265,7 +251,9 @@ async def preview_proposal(
     Job, polled and downloaded through exactly the same endpoints.
     """
     try:
-        result = await ProposalConfirmationService(session).preview(project_id, user_id=user_id)
+        result = await ProposalConfirmationService(session).preview(
+            project_id, user_id=user_id
+        )
     except ProjectNotFoundError as exc:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND, detail="project not found"

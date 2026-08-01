@@ -26,6 +26,11 @@ PLANNER_RESPONSE_SCHEMA: dict[str, Any] = {
         "type": {"type": "string", "enum": ["message", "proposal"]},
         "text": {"type": ["string", "null"]},
         "summary": {"type": ["string", "null"]},
+        # Phase 9a facilitation fields. Nullable because a clarifying
+        # message carries neither, and strict structured-output modes
+        # require every declared property to be present.
+        "reasoning": {"type": ["string", "null"]},
+        "discussion_summary": {"type": ["string", "null"]},
         "workflow": {
             "type": ["array", "null"],
             "items": {
@@ -40,7 +45,7 @@ PLANNER_RESPONSE_SCHEMA: dict[str, Any] = {
             },
         },
     },
-    "required": ["type", "text", "summary", "workflow"],
+    "required": ["type", "text", "summary", "workflow", "reasoning", "discussion_summary"],
     "additionalProperties": False,
 }
 
@@ -60,7 +65,12 @@ class PlannerResponse:
             return cls(
                 type="proposal",
                 proposal=Proposal.from_dict(
-                    {"summary": data.get("summary") or "", "workflow": data.get("workflow") or []}
+                    {
+                        "summary": data.get("summary") or "",
+                        "workflow": data.get("workflow") or [],
+                        "reasoning": data.get("reasoning"),
+                        "discussion_summary": data.get("discussion_summary"),
+                    }
                 ),
             )
         raise ValueError(f"unknown planner response type {response_type!r}")
@@ -79,4 +89,6 @@ class PlannerResponse:
                 {"stage": s.stage, "video_ids": s.video_ids, "params": s.params}
                 for s in self.proposal.workflow
             ],
+            "reasoning": self.proposal.reasoning,
+            "discussion_summary": self.proposal.discussion_summary,
         }

@@ -1,9 +1,9 @@
 """Identity and membership (Phase 8, steps 1-5).
 
-Before this, five of the seven /projects endpoints — including
-confirm-proposal, which spends real compute — took no caller identity at
-all, and the two that did took it from the request body where no
-dependency could ever read it.
+Before this, five of the seven /projects endpoints — including the ones
+that spend real compute — took no caller identity at all, and the two
+that did took it from the request body where no dependency could ever
+read it.
 
 These tests are mostly about *rejection*. A guard that lets members
 through is easy; one that actually keeps strangers out is the only part
@@ -113,7 +113,7 @@ def test_the_creator_is_a_member_of_their_own_project(
         ("get", "/messages"),
         ("post", "/messages"),
         ("get", "/videos"),
-        ("post", "/confirm-proposal"),
+        ("get", "/proposals"),
         ("post", "/preview-proposal"),
     ],
 )
@@ -156,14 +156,17 @@ def test_a_stranger_gets_404_not_403(client: TestClient, cleanup_project_ids: li
 def test_a_stranger_cannot_spend_compute(
     client: TestClient, cleanup_project_ids: list
 ) -> None:
-    """confirm-proposal previously took no identity at all, so anyone who
-    knew a project id could submit a render job against it."""
+    """The submission endpoints previously took no identity at all, so
+    anyone who knew a project id could start a render against it. Aimed at
+    preview-proposal now that confirm-proposal is gone (Phase 9a) --
+    a preview is unapproved but still real compute, and still members
+    only."""
     owner = uuid.uuid4()
     project = _create_project(client, owner)
     cleanup_project_ids.append(uuid.UUID(project["id"]))
 
     response = client.post(
-        f"/projects/{project['id']}/confirm-proposal", headers=as_user(uuid.uuid4())
+        f"/projects/{project['id']}/preview-proposal", headers=as_user(uuid.uuid4())
     )
 
     assert response.status_code == 404
@@ -387,8 +390,9 @@ async def test_a_confirmed_job_is_bound_to_its_room_and_submitter(
             headers=as_user(owner),
         )
 
+    proposal_id = _pending_proposal_id(client, project["id"], owner)
     job_id = client.post(
-        f"/projects/{project['id']}/confirm-proposal", headers=as_user(owner)
+        f"/proposals/{proposal_id}/approve", headers=as_user(owner)
     ).json()["job_id"]
 
     row = await _project_job_row(database_url, job_id)
@@ -414,12 +418,17 @@ async def test_job_ownership_records_who_actually_submitted(
             headers=as_user(member),
         )
 
+    # Two active members under `team`, so both must approve. The owner
+    # casts the deciding vote deliberately: job ownership must still land
+    # on the proposal's *author*, not on whoever happened to vote last.
+    proposal_id = _pending_proposal_id(client, project["id"], member)
+    client.post(f"/proposals/{proposal_id}/approve", headers=as_user(member))
     job_id = client.post(
-        f"/projects/{project['id']}/confirm-proposal", headers=as_user(member)
+        f"/proposals/{proposal_id}/approve", headers=as_user(owner)
     ).json()["job_id"]
 
     row = await _project_job_row(database_url, job_id)
-    assert row["submitted_by"] == str(member), "recorded the room owner, not the submitter"
+    assert row["submitted_by"] == str(member), "recorded the last voter, not the author"
 
 
 @pytest.mark.asyncio
@@ -427,8 +436,8 @@ async def test_a_replayed_submission_keeps_its_original_owner(
     client: TestClient, cleanup_project_ids: list, database_url: str
 ) -> None:
     """Setu's idempotency key returns the original job for a repeat
-    submission. The mapping must not be rewritten to whoever asked second
-    — that would silently transfer cancellation rights."""
+    submission. The mapping must not be rewritten by a later caller —
+    that would silently transfer cancellation rights."""
     owner, member = uuid.uuid4(), uuid.uuid4()
     project = _create_project(client, owner)
     cleanup_project_ids.append(uuid.UUID(project["id"]))
@@ -441,16 +450,19 @@ async def test_a_replayed_submission_keeps_its_original_owner(
             headers=as_user(owner),
         )
 
-    first = client.post(
-        f"/projects/{project['id']}/confirm-proposal", headers=as_user(owner)
-    ).json()
-    second = client.post(
-        f"/projects/{project['id']}/confirm-proposal", headers=as_user(member)
+    proposal_id = _pending_proposal_id(client, project["id"], owner)
+    client.post(f"/proposals/{proposal_id}/approve", headers=as_user(owner))
+    approved = client.post(
+        f"/proposals/{proposal_id}/approve", headers=as_user(member)
     ).json()
 
-    assert first["job_id"] == second["job_id"] and second["replayed"] is True
-    row = await _project_job_row(database_url, first["job_id"])
-    assert row["submitted_by"] == str(owner), "a replay reassigned job ownership"
+    # A vote on an already-submitted proposal is refused outright, so the
+    # ownership recorded at submission cannot be rewritten afterwards.
+    second = client.post(f"/proposals/{proposal_id}/approve", headers=as_user(member))
+    assert second.status_code == 409
+
+    row = await _project_job_row(database_url, approved["job_id"])
+    assert row["submitted_by"] == str(owner), "job ownership was reassigned"
 
 
 @pytest.mark.asyncio
@@ -538,6 +550,14 @@ async def _seed_finished_job(
     finally:
         await engine.dispose()
     return str(job_id)
+
+
+def _pending_proposal_id(client: TestClient, project_id: str, user: uuid.UUID) -> str:
+    listed = client.get(
+        f"/projects/{project_id}/proposals?status=pending", headers=as_user(user)
+    ).json()["proposals"]
+    assert listed, "the planner produced no proposal"
+    return listed[0]["id"]
 
 
 def _propose(client: TestClient, project_id: str, user: uuid.UUID) -> None:
@@ -734,8 +754,9 @@ async def test_a_real_preview_submission_carries_the_flag_the_filter_reads(
     preview = client.post(
         f"/projects/{project['id']}/preview-proposal", headers=as_user(owner)
     ).json()["job_id"]
+    proposal_id = _pending_proposal_id(client, project["id"], owner)
     confirm = client.post(
-        f"/projects/{project['id']}/confirm-proposal", headers=as_user(owner)
+        f"/proposals/{proposal_id}/approve", headers=as_user(owner)
     ).json()["job_id"]
 
     engine = create_async_engine(database_url, poolclass=NullPool)

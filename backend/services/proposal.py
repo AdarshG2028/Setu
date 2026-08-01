@@ -28,6 +28,12 @@ class ProposalStage:
 class Proposal:
     summary: str
     workflow: list[ProposalStage]
+    # Phase 9a. Why this workflow, and what the room actually discussed.
+    # Optional because they are new: StaticPlanner produces neither, and a
+    # live model will sometimes omit them. A proposal without its
+    # rationale is worth less, not invalid.
+    reasoning: str | None = None
+    discussion_summary: str | None = None
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "Proposal":
@@ -46,4 +52,9 @@ class Proposal:
             )
             for item in data.get("workflow", [])
         ]
-        return cls(summary=data.get("summary", ""), workflow=workflow)
+        return cls(
+            summary=data.get("summary", ""),
+            workflow=workflow,
+            reasoning=data.get("reasoning"),
+            discussion_summary=data.get("discussion_summary"),
+        )

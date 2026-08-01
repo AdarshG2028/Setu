@@ -1,34 +1,34 @@
-"""ProposalConfirmationService (Changelog v8, Phase 4) -- the explicit
-POST /projects/{id}/confirm-proposal entry point. Free-text chat
-confirmation is deliberately not supported (item 10): a proposal is
-confirmed by calling this endpoint, never inferred from a message's
-content.
+"""Compiling a stored proposal into a Setu job (Phase 4, reworked in 9a).
 
-Obtains the latest proposal by scanning the conversation backwards for the
-most recent {"type": "proposal"} message -- not just the last message,
-since a clarifying turn can legitimately follow a proposal. No proposal
-persistence (Phase 8/9 backlog item): the conversation transcript is the
-only source of truth for Phase 4.
+**The proposal now arrives as a row, not as a message to be found.**
+Phase 4 scanned the conversation backwards for the newest
+`{"type": "proposal"}` blob, because there was nowhere else to keep one.
+Phase 9a persists proposals, so that scan is gone -- and with it the
+failure mode where one malformed historical message could break
+confirmation for the whole room.
 
-Idempotent via Setu's existing idempotency-key mechanism (Phase 1) rather
-than a new persisted "already confirmed" flag: the key is derived from the
-conversation id and the proposal message's own id, both already stable and
-unique, so calling this twice replays the same Job instead of creating a
-second one -- as long as compile_workflow's output stays a pure function of
-the proposal + the project's video rows (no fresh timestamps, no
-regenerated URIs), which it does.
+Two callers, one body: a **preview** (free, unapproved, low resolution)
+and an **approval-triggered submission**. They share this code so they
+provably cannot diverge in how a proposal is compiled; if they did, a
+preview would stop being evidence about what the real render produces,
+which is its entire purpose.
+
+Idempotent via Setu's existing key mechanism rather than a persisted
+"already submitted" flag: the key derives from the proposal's own id,
+which is stable and unique, so a retry replays the same Job instead of
+creating a second one -- as long as compile_workflow stays a pure function
+of the proposal plus the project's video rows, which it does.
 """
 
-import json
 import uuid
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from backend.models import Message, MessageRole
+from backend.models import Proposal as ProposalRow
 from backend.repositories.conversation_repository import ConversationRepository
-from backend.repositories.message_repository import MessageRepository
 from backend.repositories.project_job_repository import ProjectJobRepository
 from backend.repositories.project_repository import ProjectNotFoundError, ProjectRepository
+from backend.repositories.proposal_repository import ProposalRepository
 from backend.repositories.video_repository import VideoRepository
 from backend.services.job_submission_service import JobSubmissionResult, JobSubmissionService
 from backend.services.memory_update_service import CONVERSATION_ID_KEY
@@ -44,8 +44,7 @@ __all__ = ["NoPendingProposalError", "ProposalConfirmationService", "UnknownVide
 
 
 class NoPendingProposalError(Exception):
-    """Raised when the project's conversation has no `{"type": "proposal"}`
-    message to confirm."""
+    """Raised when the room has no pending proposal to act on."""
 
     def __init__(self, project_id: uuid.UUID) -> None:
         super().__init__(f"project {project_id} has no pending proposal")
@@ -57,73 +56,77 @@ class ProposalConfirmationService:
         self._session = session
         self._projects = ProjectRepository(session)
         self._conversations = ConversationRepository(session)
-        self._messages = MessageRepository(session)
         self._videos = VideoRepository(session)
+        self._proposals = ProposalRepository(session)
         self._jobs = JobSubmissionService(session)
-
-    async def confirm(
-        self, project_id: uuid.UUID, *, user_id: uuid.UUID
-    ) -> JobSubmissionResult:
-        """Execute the latest proposal for real."""
-        return await self._submit(project_id, user_id=user_id, preview=False)
 
     async def preview(
         self, project_id: uuid.UUID, *, user_id: uuid.UUID
     ) -> JobSubmissionResult:
-        """Execute the latest proposal as a fast, low-resolution render.
+        """Render the room's latest pending proposal fast and low-res.
 
-        Same proposal, same capabilities, same execution path -- only the
-        compilation mode differs. Kept as a sibling of confirm() over one
-        shared body so the two provably cannot diverge in how they locate
-        or compile the proposal; if they did, a preview would stop being
-        evidence about what the real render will produce, which is its
-        entire purpose.
+        **Not governed by the approval policy** (Phase 9a). A preview is
+        cheap, reversible and deliberately low resolution, so requiring
+        sign-off on every exploratory tweak would grind the very iteration
+        loop previews exist to serve. Any member may preview; only a real
+        render is voted on.
         """
-        return await self._submit(project_id, user_id=user_id, preview=True)
-
-    async def _submit(
-        self, project_id: uuid.UUID, *, user_id: uuid.UUID, preview: bool
-    ) -> JobSubmissionResult:
         if await self._projects.get(project_id) is None:
             raise ProjectNotFoundError(project_id)
-
-        conversation = await self._conversations.get_by_project(project_id)
-        if conversation is None:
+        proposal = await self._proposals.latest_pending(project_id)
+        if proposal is None:
             raise NoPendingProposalError(project_id)
+        # The requester owns a preview job, unlike an approved render whose
+        # owner is the proposal's author: they triggered this one, so they
+        # are who should be able to cancel it (Phase 9b).
+        return await self.submit(proposal, submitted_by=user_id, preview=True)
 
-        history = await self._messages.list_by_conversation(conversation.id)
-        proposal_message = self._latest_proposal_message(history)
-        if proposal_message is None:
-            raise NoPendingProposalError(project_id)
+    async def submit(
+        self, proposal: ProposalRow, *, submitted_by: uuid.UUID, preview: bool
+    ) -> JobSubmissionResult:
+        """Compile a stored proposal and hand it to Setu.
 
-        proposal = Proposal.from_dict(json.loads(proposal_message.content))
-
+        `submitted_by` becomes `project_jobs.submitted_by_user_id`, which
+        *is* job ownership -- and for an approval-triggered submission that
+        is the proposal's **author**, not whoever cast the deciding vote.
+        Phase 9b authorizes cancellation directly against that column, so
+        the wrong value here hands cancel rights to the wrong person.
+        """
+        project_id = proposal.project_id
         videos = await self._videos.list_by_project(project_id)
         video_uris = {
             video_context.handle: video.storage_uri
             for video_context, video in zip(build_video_contexts(videos), videos)
         }
+        # The row keeps its stages under a "workflow" key, mirroring
+        # Job.workflow, while summary and the facilitation fields live in
+        # their own columns -- so the domain object is reassembled from
+        # both rather than stored twice.
         workflow, payload = compile_workflow(
-            proposal, ExecutionContext(video_uris=video_uris, preview=preview)
+            Proposal.from_dict(
+                {"summary": proposal.summary, "workflow": proposal.workflow["workflow"]}
+            ),
+            ExecutionContext(video_uris=video_uris, preview=preview),
         )
+
         # Setu's Job is generic infrastructure and carries no link back to
         # a conversation, so Phase 6's memory update has no way to find the
         # transcript that produced this job. Stamping it here is the
         # cheapest bridge; underscore-prefixed to mark it as job metadata
         # rather than worker input, like the existing _preview flag.
         # Deterministic, so it does not disturb the idempotency hash.
-        # Phase 8's project_jobs table supersedes this.
-        payload[CONVERSATION_ID_KEY] = str(conversation.id)
+        conversation = await self._conversations.get_by_project(project_id)
+        if conversation is not None:
+            payload[CONVERSATION_ID_KEY] = str(conversation.id)
 
-        # Separate namespaces, so previewing a proposal and then confirming
-        # it produce two distinct jobs rather than the confirm replaying the
-        # preview's low-resolution result -- which is exactly what a single
+        # Separate namespaces, so previewing a proposal and then approving
+        # it produce two distinct jobs rather than the approval replaying
+        # the preview's low-resolution result -- which is exactly what one
         # shared key would do, since everything else about the two calls is
         # identical by construction.
-        prefix = "preview-proposal" if preview else "confirm-proposal"
-        idempotency_key = f"{prefix}:{conversation.id}:{proposal_message.id}"
+        prefix = "preview-proposal" if preview else "approved-proposal"
         result = await self._jobs.submit(
-            idempotency_key=idempotency_key, workflow=workflow, payload=payload
+            idempotency_key=f"{prefix}:{proposal.id}", workflow=workflow, payload=payload
         )
         # Binds the job to its room and records who set it running.
         # Idempotent, so a replayed submission keeps its original owner
@@ -137,19 +140,7 @@ class ProposalConfirmationService:
         # repairs (payload._conversation_id -> project), so the recovery
         # path already exists and costs nothing to reuse.
         await ProjectJobRepository(self._session).add(
-            project_id=project_id, job_id=result.job.id, submitted_by_user_id=user_id
+            project_id=project_id, job_id=result.job.id, submitted_by_user_id=submitted_by
         )
         await self._session.commit()
         return result
-
-    def _latest_proposal_message(self, history: list[Message]) -> Message | None:
-        for message in reversed(history):
-            if message.role != MessageRole.ASSISTANT:
-                continue
-            try:
-                data = json.loads(message.content)
-            except json.JSONDecodeError:
-                continue
-            if data.get("type") == "proposal":
-                return message
-        return None
