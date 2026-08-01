@@ -112,6 +112,10 @@ class ConversationService:
             videos=build_video_contexts(videos, await self._video_analysis(videos)),
             preferences=preferences,
             capability_registry=self._capability_registry,
+            # Wording only -- the planner describes the room's rule so its
+            # facilitation messages do not promise a render that still
+            # needs votes. It never evaluates the policy (Phase 9a).
+            approval_policy=project.approval_policy,
         )
         response = await self._planner.respond(context)
         response_dict = response.to_dict()

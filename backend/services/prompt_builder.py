@@ -9,7 +9,7 @@ sections here without duplicating context assembly.
 from dataclasses import dataclass
 
 from backend.models import MessageRole
-from backend.services.planner_context import PlannerContext
+from backend.services.planner_context import PlannerContext, participant_handles
 
 
 @dataclass(frozen=True)
@@ -91,13 +91,93 @@ def _render_preferences(preferences: object | None) -> list[str]:
     ]
 
 
+def _attributed(message, handles: dict) -> str:
+    """One transcript turn, labelled with who said it and when.
+
+    Only user turns are labelled. The planner's own turns need no speaker
+    -- the chat role already says so -- and prefixing them would teach the
+    model to emit the prefix back inside its JSON.
+    """
+    if message.sender_id is None:
+        return message.content
+    handle = handles.get(message.sender_id, "member")
+    # Clock time, not a date: what matters to facilitation is the order and
+    # rough spacing of turns within a discussion, and a full timestamp
+    # spends tokens to say less.
+    stamp = message.created_at.strftime("%H:%M") if message.created_at else ""
+    return f"{handle} ({stamp}): {message.content}" if stamp else f"{handle}: {message.content}"
+
+
+# Only rendered once a room actually has more than one participant. A solo
+# user does not need to be told to watch for disagreement, and telling
+# them to summarise "the discussion" invites a summary of a monologue.
+_FACILITATION = (
+    "More than one person is in this room. You are facilitating their "
+    "discussion, not taking orders from whoever spoke last.",
+    "- When members want incompatible things, say so plainly, name who "
+    "wants what, and ask the room to decide. Do NOT propose a workflow "
+    "that silently picks a side.",
+    "- When they agree, or when one concedes, treat that as settled and "
+    "move to a proposal.",
+    "- Never invent agreement that has not happened.",
+    "",
+    "When you do propose, also fill in:",
+    "- `reasoning`: why this workflow, in one or two sentences a "
+    "non-technical member would follow.",
+    "- `discussion_summary`: what the room actually decided and what was "
+    "rejected along the way, so somebody arriving late can catch up.",
+)
+
+
+def _policy_lines(policy: str, collaborative: bool) -> list[str]:
+    """How to *describe* what happens after a proposal -- wording only.
+
+    The planner never decides whether a proposal is approved; the
+    collaboration layer collects the votes. But a facilitation message
+    that says "I'll start rendering" when the room actually has to vote
+    first would be a lie the model told with no way of knowing better, so
+    it is told what the room's rule is.
+    """
+    lines = [f"Approval policy for this room: {policy}"]
+    if not collaborative:
+        return lines
+    if policy == "admin":
+        lines.append(
+            "A proposal runs once the project owner approves it. Say it is "
+            "ready for the owner's approval -- never that it is running."
+        )
+    else:
+        lines.append(
+            "A proposal runs only once EVERY active member approves it, and "
+            "a single rejection ends it. Say it is waiting for approval from "
+            "all team members -- never that it is running, and never that a "
+            "majority is enough."
+        )
+    lines.append(
+        "Previews are exempt: any member may preview a pending proposal "
+        "without a vote."
+    )
+    return lines
+
+
 class PromptBuilder:
     def build(
         self, context: PlannerContext, *, validation_feedback: list[str] | None = None
     ) -> Prompt:
         system = self._build_system(context)
+        # Attributed, not anonymous (Phase 9a). A shared room is a
+        # conversation *between people*, and a planner that cannot tell
+        # who said what cannot notice that two of them want opposite
+        # things -- which is the single most important thing it has to
+        # notice. Prefixed onto the content rather than carried in a
+        # separate field because the chat format has nowhere else to put
+        # it, and the model reads the text either way.
+        handles = participant_handles(context.conversation_history)
         messages = [
-            {"role": _ROLE_TO_CHAT_ROLE[m.role], "content": m.content}
+            {
+                "role": _ROLE_TO_CHAT_ROLE[m.role],
+                "content": _attributed(m, handles),
+            }
             for m in context.conversation_history
         ]
         if validation_feedback:
@@ -115,6 +195,7 @@ class PromptBuilder:
         return Prompt(system=system, messages=messages)
 
     def _build_system(self, context: PlannerContext) -> str:
+        participants = participant_handles(context.conversation_history)
         lines = [
             "You are a video editing assistant. You never edit video yourself -- "
             "you either ask a clarifying question or propose a workflow of stages "
@@ -153,8 +234,13 @@ class PromptBuilder:
             lines.append("")
             lines.extend(rendered_preferences)
 
+        collaborative = len(participants) > 1
+        if collaborative:
+            lines.append("")
+            lines.extend(_FACILITATION)
+
         if context.approval_policy is not None:
             lines.append("")
-            lines.append(f"Approval policy for this room: {context.approval_policy}")
+            lines.extend(_policy_lines(context.approval_policy, collaborative))
 
         return "\n".join(lines)

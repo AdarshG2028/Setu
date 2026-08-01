@@ -5,6 +5,7 @@ fetches data itself (project/conversation/videos/preferences all come in
 already loaded).
 """
 
+import uuid
 from dataclasses import dataclass, field
 
 from backend.models import Message, Project, UserPreference, Video
@@ -68,7 +69,30 @@ class PlannerContext:
     videos: list[VideoContext]
     preferences: UserPreference | None
     capability_registry: CapabilityRegistry
-    # Future-compatible placeholder for Phase 9a (multi-participant approval
-    # policies). Unused in Phase 4 -- present now so that phase doesn't need
-    # to change this shape again.
+    # The room's approval policy, rendered so the planner can *describe*
+    # what happens next ("waiting for approval from all team members").
+    # It never decides outcomes -- that is the collaboration layer's job --
+    # so this is wording only (Phase 9a).
     approval_policy: str | None = field(default=None)
+
+
+def participant_handles(history: list[Message]) -> dict[uuid.UUID, str]:
+    """Stable, short labels for the humans in a conversation (Phase 9a).
+
+    There is no users table -- a sender is a bare asserted UUID -- so the
+    planner has no names to work with, and a raw UUID is both unreadable
+    and something models echo unreliably. The same reasoning produced
+    `video_1` handles in Phase 4, and this follows it: numbered in order of
+    first appearance, so a given member keeps one label for the whole
+    transcript and "member_2 disagreed with member_1" is a statement the
+    model can actually make.
+
+    Assistant turns are excluded: they have no sender, and the planner
+    knows which turns are its own from the chat role.
+    """
+    handles: dict[uuid.UUID, str] = {}
+    for message in history:
+        if message.sender_id is None or message.sender_id in handles:
+            continue
+        handles[message.sender_id] = f"member_{len(handles) + 1}"
+    return handles
