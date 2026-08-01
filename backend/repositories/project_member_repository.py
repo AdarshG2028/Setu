@@ -2,7 +2,7 @@
 
 import uuid
 
-from sqlalchemy import select
+from sqlalchemy import select, update
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -10,6 +10,16 @@ from backend.models import ProjectMember
 
 OWNER = "owner"
 MEMBER = "member"
+
+# An invitation, not yet accepted. Stored as a row so no invites table is
+# needed -- the doc's "one new table" holds -- but deliberately NOT a
+# role that grants access: being invited to a room is not the same as
+# being in it, and a /join endpoint that did nothing would make accepting
+# meaningless.
+INVITED = "invited"
+
+# The roles the membership guard lets through.
+_ADMITTED = (OWNER, MEMBER)
 
 
 class ProjectMemberRepository:
@@ -25,7 +35,7 @@ class ProjectMemberRepository:
                 ProjectMember.user_id == user_id,
             )
         )
-        return result.scalar_one_or_none() is not None
+        return result.scalar_one_or_none() in _ADMITTED
 
     async def get_role(self, project_id: uuid.UUID, user_id: uuid.UUID) -> str | None:
         result = await self._session.execute(
@@ -51,8 +61,23 @@ class ProjectMemberRepository:
         )
         return list(result.scalars().all())
 
+    async def accept_invitation(self, project_id: uuid.UUID, user_id: uuid.UUID) -> bool:
+        """Turn this user's invitation into membership. False if they had
+        none -- which is what stops /join being a way to walk into any
+        room whose id you happen to know."""
+        result = await self._session.execute(
+            update(ProjectMember)
+            .where(
+                ProjectMember.project_id == project_id,
+                ProjectMember.user_id == user_id,
+                ProjectMember.role == INVITED,
+            )
+            .values(role=MEMBER)
+        )
+        return result.rowcount > 0
+
     async def add(
-        self, project_id: uuid.UUID, user_id: uuid.UUID, *, role: str = MEMBER
+        self, project_id: uuid.UUID, user_id: uuid.UUID, *, role: str = INVITED
     ) -> None:
         """Idempotent by design.
 

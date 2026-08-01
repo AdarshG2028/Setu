@@ -42,8 +42,10 @@ __all__ = [
     "CurrentUserDep",
     "ProjectMemberDep",
     "SessionDep",
+    "ProjectOwnerDep",
     "current_user_id",
     "require_project_member",
+    "require_project_owner",
 ]
 
 SessionDep = Annotated[AsyncSession, Depends(get_session)]
@@ -104,3 +106,36 @@ async def require_project_member(
 
 
 ProjectMemberDep = Annotated[uuid.UUID, Depends(require_project_member)]
+
+
+async def require_project_owner(
+    project_id: uuid.UUID, session: SessionDep, user_id: CurrentUserDep
+) -> uuid.UUID:
+    """Stricter than membership: only the owner may invite.
+
+    A member who could invite could hand the room to anyone, which makes
+    the owner's control over who is present meaningless. V1 keeps that
+    power in one place; Phase 9a's approval policies are where richer
+    roles get designed, and inventing them before then would be guessing.
+
+    404 rather than 403 for a non-member, for the reason in
+    require_project_member. A *member* who is not the owner gets 403 --
+    they already know the room exists, so there is nothing left to hide,
+    and "you are not allowed" is the more useful answer.
+    """
+    from backend.repositories.project_member_repository import OWNER, ProjectMemberRepository
+
+    role = await ProjectMemberRepository(session).get_role(project_id, user_id)
+    if role is None or role not in ("owner", "member"):
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="project not found"
+        )
+    if role != OWNER:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="only the project owner can invite members",
+        )
+    return user_id
+
+
+ProjectOwnerDep = Annotated[uuid.UUID, Depends(require_project_owner)]

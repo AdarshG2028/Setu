@@ -21,11 +21,25 @@ from backend.api.schemas.conversation import (
     PostMessageRequest,
     PostMessageResponse,
 )
+from backend.api.schemas.member import (
+    AddMemberRequest,
+    MemberListResponse,
+    MemberResponse,
+)
 from backend.api.schemas.project import CreateProjectRequest, ProjectResponse
 from backend.api.schemas.video import VideoListResponse, VideoSummaryResponse, VideoUploadResponse
-from backend.api.deps import CurrentUserDep, ProjectMemberDep, SessionDep
+from backend.api.deps import (
+    CurrentUserDep,
+    ProjectMemberDep,
+    ProjectOwnerDep,
+    SessionDep,
+)
 from backend.models import Project
-from backend.repositories.project_member_repository import OWNER, ProjectMemberRepository
+from backend.repositories.project_member_repository import (
+    INVITED,
+    OWNER,
+    ProjectMemberRepository,
+)
 from backend.repositories.project_repository import ProjectNotFoundError, ProjectRepository
 from backend.repositories.video_repository import VideoRepository
 from backend.services.conversation_service import ConversationService
@@ -202,5 +216,78 @@ async def list_videos(
                 created_at=v.created_at,
             )
             for v in videos
+        ]
+    )
+
+
+@router.post(
+    "/{project_id}/members",
+    response_model=MemberResponse,
+    status_code=status.HTTP_201_CREATED,
+)
+async def add_member(
+    project_id: uuid.UUID,
+    request: AddMemberRequest,
+    session: SessionDep,
+    owner_id: ProjectOwnerDep,
+) -> MemberResponse:
+    """Invite someone into the room. Owner only.
+
+    Creates an *invitation*, not a membership: the invitee has to call
+    join before they can see anything. Being added to a room without
+    having asked is not the same as being in it, and an invitation that
+    granted access immediately would make join a no-op.
+    """
+    members = ProjectMemberRepository(session)
+    await members.add(project_id, request.user_id, role=INVITED)
+    await session.commit()
+
+    role = await members.get_role(project_id, request.user_id)
+    member = next(
+        m for m in await members.list_by_project(project_id) if m.user_id == request.user_id
+    )
+    return MemberResponse(user_id=member.user_id, role=role, joined_at=member.joined_at)
+
+
+@router.post("/{project_id}/join", response_model=MemberResponse)
+async def join_project(
+    project_id: uuid.UUID, session: SessionDep, user_id: CurrentUserDep
+) -> MemberResponse:
+    """Accept an invitation.
+
+    Deliberately NOT behind the membership guard -- an invitee is not yet
+    a member, so the guard would make accepting impossible. It is instead
+    gated on holding an invitation, which is what stops this becoming a
+    way to walk into any room whose id you happen to know.
+    """
+    members = ProjectMemberRepository(session)
+    if not await members.accept_invitation(project_id, user_id):
+        # Covers all three of: no invitation, no such project, and already
+        # a member. They are deliberately indistinguishable -- telling a
+        # stranger "that room exists but you weren't invited" is the same
+        # leak the 404 in require_project_member avoids.
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="no pending invitation for this project",
+        )
+    await session.commit()
+
+    member = next(
+        m for m in await members.list_by_project(project_id) if m.user_id == user_id
+    )
+    return MemberResponse(user_id=member.user_id, role=member.role, joined_at=member.joined_at)
+
+
+@router.get("/{project_id}/members", response_model=MemberListResponse)
+async def list_members(
+    project_id: uuid.UUID, session: SessionDep, user_id: ProjectMemberDep
+) -> MemberListResponse:
+    """Everyone in the room, including outstanding invitations — a member
+    should be able to see who has been asked, not just who has arrived."""
+    members = await ProjectMemberRepository(session).list_by_project(project_id)
+    return MemberListResponse(
+        members=[
+            MemberResponse(user_id=m.user_id, role=m.role, joined_at=m.joined_at)
+            for m in members
         ]
     )
