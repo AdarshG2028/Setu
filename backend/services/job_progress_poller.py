@@ -58,10 +58,14 @@ class JobProgressPoller:
         self._sessionmaker = sessionmaker
         self._events = events
         self._interval = interval_seconds
-        # What each job looked like last tick. Only jobs in rooms with a
-        # listener ever appear here, and entries are dropped once a room
-        # goes quiet, so this cannot grow with the jobs table.
-        self._seen: dict[uuid.UUID, _JobState] = {}
+        # What each job looked like last tick, per room. Keyed by room and
+        # not by job so the baseline can be dropped wholesale the moment a
+        # room loses its last listener -- which both bounds this by
+        # "rooms currently being watched" rather than by the jobs table,
+        # and makes reconnecting a genuine first sighting again. A stale
+        # baseline would otherwise make the first tick after a reconnect
+        # re-announce an export the snapshot had just listed.
+        self._seen: dict[uuid.UUID, dict[uuid.UUID, _JobState]] = {}
 
     async def run_forever(self, stop_event: asyncio.Event) -> None:
         while not stop_event.is_set():
@@ -79,11 +83,16 @@ class JobProgressPoller:
 
     async def poll_once(self) -> None:
         watched = self._events.rooms()
+
+        # Forget rooms that have gone quiet. Whoever connects next
+        # re-baselines from the room snapshot, so keeping their old state
+        # would only let that tick announce things the snapshot already
+        # contained.
+        for project_id in list(self._seen):
+            if project_id not in watched:
+                del self._seen[project_id]
+
         if not watched:
-            # Forget everything: with no listeners there is no baseline
-            # worth keeping, and whoever connects next re-baselines from
-            # the room snapshot anyway.
-            self._seen.clear()
             return
 
         async with self._sessionmaker() as session:
@@ -91,13 +100,20 @@ class JobProgressPoller:
                 await self._poll_room(session, project_id)
 
     async def _poll_room(self, session, project_id: uuid.UUID) -> None:
+        # Bounded by list_jobs_for_project's default limit, newest first.
+        # A room with more than that many jobs would stop reporting
+        # progress on its oldest still-running one; irrelevant at any
+        # scale a single room reaches today, and the fix when it matters
+        # is to fetch the room's *active* jobs here rather than its most
+        # recent ones.
         jobs = await ProjectJobRepository(session).list_jobs_for_project(project_id)
+        seen = self._seen.setdefault(project_id, {})
         for job in jobs:
             state = _JobState(status=job.status, current_stage=job.current_stage)
-            previous = self._seen.get(job.id)
+            previous = seen.get(job.id)
             if previous == state:
                 continue
-            self._seen[job.id] = state
+            seen[job.id] = state
 
             # First sighting of an already-finished job is not news. A
             # room that just gained a listener would otherwise replay its

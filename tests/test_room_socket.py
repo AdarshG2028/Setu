@@ -556,6 +556,65 @@ async def test_a_completed_job_that_produced_nothing_is_not_an_export(
     assert "export.completed" not in types
 
 
+@pytest.mark.asyncio
+async def test_reconnecting_does_not_replay_an_export_finished_while_away(
+    poller, database_url: str, seeded_room
+) -> None:
+    """The baseline has to be dropped when a room goes quiet. Keeping it
+    makes the first tick after a reconnect see a job it 'already knew',
+    treat completion as a fresh transition, and re-announce an export the
+    snapshot had just listed."""
+    progress, bus = poller
+    project_id, job_id = seeded_room
+    room = uuid.UUID(project_id)
+
+    subscription = bus.subscribe(room)
+    await progress.poll_once()
+    bus.unsubscribe(subscription)
+
+    # Finishes while nobody is connected.
+    await _finish_with_asset(database_url, job_id, "local://away.mp4")
+    await progress.poll_once()
+
+    bus.subscribe(room)
+    await progress.poll_once()
+
+    types = [e["type"] for e in _drain(bus, room)]
+    assert types == [], f"replayed history to a reconnecting client: {types}"
+
+
+@pytest.mark.asyncio
+async def test_the_poller_publishes_onto_the_shared_bus(
+    database_url: str, seeded_room
+) -> None:
+    """The one line where a wrong bus instance would leave job.updated
+    reaching nobody while every other test stayed green: main.py wires the
+    poller to get_room_events(), the same accessor the socket subscribes
+    through."""
+    project_id, job_id = seeded_room
+    room = uuid.UUID(project_id)
+    engine = create_async_engine(database_url, poolclass=NullPool)
+    try:
+        progress = JobProgressPoller(
+            async_sessionmaker(bind=engine, expire_on_commit=False), get_room_events()
+        )
+        subscription = get_room_events().subscribe(room)
+        try:
+            await progress.poll_once()
+            await _advance_job(database_url, job_id, status="running", current_stage=1)
+            await progress.poll_once()
+
+            queued = []
+            while not subscription.queue.empty():
+                queued.append(subscription.queue.get_nowait())
+        finally:
+            get_room_events().unsubscribe(subscription)
+    finally:
+        await engine.dispose()
+
+    assert [e["type"] for e in queued] == ["job.updated", "job.updated"]
+
+
 class _RecordingRepo:
     def __init__(self, log: list) -> None:
         self._log = log
