@@ -8,7 +8,7 @@ from typing import AsyncIterator
 from fastapi import FastAPI
 from prometheus_client import make_asgi_app
 
-from backend.api.routes import artifacts, health, jobs, projects, videos
+from backend.api.routes import artifacts, health, jobs, projects, room_socket, videos
 from backend.core.config import Settings, get_settings
 from backend.database.session import get_sessionmaker
 from backend.messaging.kafka_producer import build_producer
@@ -16,6 +16,7 @@ from backend.messaging.outbox_publisher import OutboxPublisher
 from backend.observability.logging import configure_logging
 from backend.observability.metrics import poll_job_lifecycle_gauges
 from backend.services.artifact_cleanup_service import ArtifactCleanupService
+from backend.services.room_events import get_room_events
 from backend.observability.tracing import configure_tracing
 
 logger = logging.getLogger(__name__)
@@ -81,6 +82,10 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         yield
     finally:
         stop_event.set()
+        # Before awaiting anything: every open room socket is parked on a
+        # queue read that nothing will ever satisfy again, and shutdown
+        # would wait on those tasks forever.
+        get_room_events().close_all()
         await publisher_task
         await metrics_task
         await cleanup_task
@@ -104,6 +109,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.include_router(jobs.router)
     app.include_router(videos.router)
     app.include_router(projects.router)
+    app.include_router(room_socket.router)
     app.mount("/metrics", make_asgi_app())
     return app
 

@@ -46,6 +46,13 @@ class ExportResponse(BaseModel):
 
 
 class RoomSnapshotResponse(BaseModel):
+    # Where this snapshot sits in the room's event stream. A client that
+    # connects the socket first, then fetches this, discards any event
+    # whose seq is <= this value -- which closes the handoff window
+    # without needing the server to replay anything. Resets to zero when
+    # the process restarts; harmless, because every reconnect re-baselines
+    # against a fresh snapshot.
+    seq: int
     project: ProjectResponse
     members: list[MemberResponse]
     videos: list[VideoSummaryResponse]

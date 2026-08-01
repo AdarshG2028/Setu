@@ -27,20 +27,6 @@ from tests.conftest import as_user
 pytestmark = pytest.mark.usefixtures("database_url")
 
 
-@pytest.fixture
-async def cleanup_project_ids(database_url: str):
-    created: list[uuid.UUID] = []
-    yield created
-    if not created:
-        return
-    engine = create_async_engine(database_url, poolclass=NullPool)
-    async with engine.connect() as conn:
-        for project_id in created:
-            await conn.execute(sa.delete(Project).where(Project.id == project_id))
-        await conn.commit()
-    await engine.dispose()
-
-
 def _create_project(client: TestClient, owner: uuid.UUID) -> dict:
     response = client.post("/projects", json={"name": "room"}, headers=as_user(owner))
     assert response.status_code == 201

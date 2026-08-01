@@ -29,6 +29,7 @@ from backend.repositories.video_repository import VideoRepository
 from backend.services.capability_registry import DEFAULT_CAPABILITY_REGISTRY, CapabilityRegistry
 from backend.services.planner import Planner, StaticPlanner
 from backend.services.planner_context import PlannerContext, build_video_contexts
+from backend.services.room_events import get_room_events
 
 __all__ = ["ConversationService", "PostMessageResult", "ProjectNotFoundError"]
 
@@ -37,6 +38,25 @@ __all__ = ["ConversationService", "PostMessageResult", "ProjectNotFoundError"]
 class PostMessageResult:
     message_id: uuid.UUID
     response: dict[str, Any]
+
+
+def _message_event(message: Message) -> dict[str, Any]:
+    """A message as the room socket carries it.
+
+    Deliberately the same field names GET /projects/{id}/messages returns
+    (backend/api/schemas/conversation.py MessageResponse), so a client
+    appending a streamed message to the history it already fetched is
+    handling one shape, not two. Built here as a plain dict rather than
+    imported from the API layer -- a service reaching up into
+    api/schemas would invert the dependency for the sake of five keys.
+    """
+    return {
+        "id": str(message.id),
+        "role": message.role,
+        "sender_id": str(message.sender_id) if message.sender_id else None,
+        "content": message.content,
+        "created_at": message.created_at.isoformat(),
+    }
 
 
 class ConversationService:
@@ -101,6 +121,20 @@ class ConversationService:
         )
         self._messages.add(assistant_message)
         await self._session.commit()
+
+        # Fanned out only after the commit. Emitting earlier would let a
+        # client be told about a message, refetch the room snapshot, and
+        # not find it -- manufacturing exactly the gap the seq counter
+        # exists to report. Two events from one call, since a member
+        # watching wants the other person's message the moment it lands,
+        # not held back until the planner has finished thinking.
+        events = get_room_events()
+        events.publish(
+            project_id, type="message.created", data=_message_event(user_message)
+        )
+        events.publish(
+            project_id, type="planner.replied", data=_message_event(assistant_message)
+        )
 
         return PostMessageResult(message_id=user_message.id, response=response_dict)
 

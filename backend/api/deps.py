@@ -46,6 +46,7 @@ __all__ = [
     "ProjectMemberDep",
     "SessionDep",
     "ProjectOwnerDep",
+    "as_user_id",
     "current_user_id",
     "require_artifact_access",
     "require_project_member",
@@ -106,13 +107,30 @@ async def current_user_id(
             status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
             detail="an X-User-Id header or user_id query parameter is required",
         )
-    try:
-        return uuid.UUID(raw)
-    except ValueError as exc:
+    caller = as_user_id(raw)
+    if caller is None:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
             detail="X-User-Id must be a UUID",
-        ) from exc
+        )
+    return caller
+
+
+def as_user_id(raw: str | None) -> uuid.UUID | None:
+    """Parse an asserted user id, or None if it is absent or malformed.
+
+    Shared with the room WebSocket, which cannot use `current_user_id`
+    directly: that raises HTTPException, and there is no HTTP response to
+    put a status on once a handshake is under way -- a socket has to be
+    closed with a code instead. Same parsing either way, so the two
+    transports can never disagree about what counts as a valid id.
+    """
+    if raw is None:
+        return None
+    try:
+        return uuid.UUID(raw)
+    except ValueError:
+        return None
 
 
 CurrentUserDep = Annotated[uuid.UUID, Depends(current_user_id)]

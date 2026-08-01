@@ -7,10 +7,31 @@ import pytest
 import sqlalchemy as sa
 from fastapi.testclient import TestClient
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
+from sqlalchemy.pool import NullPool
 
 from backend.api.main import create_app
+from backend.models import Project
 from backend.core.config import get_settings
 from backend.services.planner_factory import get_default_planner
+
+
+@pytest.fixture
+async def cleanup_project_ids(database_url: str):
+    """Projects to delete afterwards. Shared by every room-level test file.
+
+    Deleting the project cascades to its members, conversation, videos and
+    project_jobs rows, which is why appending one id is enough.
+    """
+    created = []
+    yield created
+    if not created:
+        return
+    engine = create_async_engine(database_url, poolclass=NullPool)
+    async with engine.connect() as conn:
+        for project_id in created:
+            await conn.execute(sa.delete(Project).where(Project.id == project_id))
+        await conn.commit()
+    await engine.dispose()
 
 
 def as_user(user_id) -> dict[str, str]:

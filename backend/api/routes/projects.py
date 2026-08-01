@@ -52,6 +52,7 @@ from backend.services.proposal_confirmation_service import (
     ProposalConfirmationService,
     UnknownVideoHandleError,
 )
+from backend.services.room_events import get_room_events
 from backend.services.room_snapshot_service import RoomSnapshotService
 from backend.services.video_upload_service import VideoUploadService
 
@@ -96,6 +97,13 @@ async def get_room(
     """
     snapshot = await RoomSnapshotService(session).get(project_id)
     return RoomSnapshotResponse(
+        # Read here rather than inside RoomSnapshotService: the counter is
+        # in-memory bus state, not database state, and joining the two is
+        # a transport concern. It is the *same* counter the socket
+        # advances, which is the whole point -- a reconnecting client
+        # compares two numbers from one source and discards anything it
+        # has already seen.
+        seq=get_room_events().current_seq(project_id),
         project=ProjectResponse(
             id=snapshot.project.id,
             owner_id=snapshot.project.owner_id,
@@ -347,6 +355,18 @@ async def join_project(
 
     member = next(
         m for m in await members.list_by_project(project_id) if m.user_id == user_id
+    )
+    # After the commit, and only on a real transition: accept_invitation
+    # returning False above already sent the no-op case away, so nobody
+    # gets announced twice for refreshing the join link.
+    get_room_events().publish(
+        project_id,
+        type="member.joined",
+        data={
+            "user_id": str(member.user_id),
+            "role": member.role,
+            "joined_at": member.joined_at.isoformat(),
+        },
     )
     return MemberResponse(user_id=member.user_id, role=member.role, joined_at=member.joined_at)
 
