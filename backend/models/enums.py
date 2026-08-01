@@ -32,6 +32,18 @@ class ExecutionStatus(StrEnum):
     FAILED = "failed"
 
 
+class Decision(StrEnum):
+    """A member's vote on a proposal (Phase 9a).
+
+    Here rather than beside the policy functions because it is a stored
+    column value, like every other enum in this module -- which also keeps
+    repositories from having to import out of services/ to read a row.
+    """
+
+    APPROVE = "approve"
+    REJECT = "reject"
+
+
 class MessageRole(StrEnum):
     USER = "user"
     ASSISTANT = "assistant"

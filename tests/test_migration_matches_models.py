@@ -41,6 +41,12 @@ _ALTER_RE = re.compile(
     r"ALTER TABLE (?P<add_col_table>\w+) ADD COLUMN (?P<add_col_def>.+?);"
     r"|ALTER TABLE (?P<add_con_table>\w+) ADD CONSTRAINT (?P<add_con_name>\w+) "
     r"(?P<add_con_def>FOREIGN KEY.+?);"
+    # CHECK added to an existing table. Needed because Alembic's
+    # autogenerate never emits one -- it detects CHECK constraints only
+    # inside CREATE TABLE -- so any CHECK on a pre-existing table is
+    # hand-written, which is exactly the case most likely to drift.
+    r"|ALTER TABLE (?P<add_chk_table>\w+) ADD CONSTRAINT (?P<add_chk_name>\w+) "
+    r"(?P<add_chk_def>CHECK .+?);"
     r"|ALTER TABLE (?P<drop_con_table>\w+) DROP CONSTRAINT (?P<drop_con_name>\w+);"
     r"|ALTER TABLE (?P<alt_col_table>\w+) ALTER COLUMN (?P<alt_col_name>\w+) "
     r"SET NOT NULL;",
@@ -84,6 +90,17 @@ def _parse_create_tables(sql: str) -> dict[str, str]:
             con_name, con_def = match.group("add_con_name"), match.group("add_con_def")
             if name in tables:
                 tables[name][f"constraint:{con_name}"] = _normalize(con_def)
+        elif match.group("add_chk_table") is not None:
+            name = match.group("add_chk_table")
+            con_name, con_def = match.group("add_chk_name"), match.group("add_chk_def")
+            if name in tables:
+                # Stored with its CONSTRAINT prefix, unlike the foreign-key
+                # branch above: SQLAlchemy renders a *named* constraint
+                # inline as "CONSTRAINT <name> CHECK (...)", and the two
+                # sides only compare equal if this matches that spelling.
+                tables[name][f"constraint:{con_name}"] = _normalize(
+                    f"CONSTRAINT {con_name} {con_def}"
+                )
         elif match.group("drop_con_table") is not None:
             name, con_name = match.group("drop_con_table"), match.group("drop_con_name")
             if name in tables:
