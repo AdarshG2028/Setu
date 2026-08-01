@@ -9,10 +9,7 @@ submission can happen, and that a decision reaches the room.
 import uuid
 
 import pytest
-import sqlalchemy as sa
 from fastapi.testclient import TestClient
-from sqlalchemy.ext.asyncio import create_async_engine
-from sqlalchemy.pool import NullPool
 
 from tests.conftest import as_user
 
@@ -48,19 +45,15 @@ def _room(client: TestClient, cleanup_project_ids: list, members: int = 2):
     return project["id"], owner, joined, proposal_id
 
 
-async def _set_policy(database_url: str, project_id: str, policy: str) -> None:
-    """No endpoint sets the policy yet — the roadmap does not ask for one,
-    and `team` is the default every room gets."""
-    engine = create_async_engine(database_url, poolclass=NullPool)
-    try:
-        async with engine.connect() as conn:
-            await conn.execute(
-                sa.text("UPDATE projects SET approval_policy = :p WHERE id = :i"),
-                {"p": policy, "i": uuid.UUID(project_id)},
-            )
-            await conn.commit()
-    finally:
-        await engine.dispose()
+def _set_policy(client: TestClient, project_id: str, owner: uuid.UUID, policy: str) -> None:
+    """Owner-only, via PATCH /projects/{id} -- the write path this file's
+    admin tests previously had no choice but to route around with raw
+    SQL, since nothing exposed the setting."""
+    response = client.patch(
+        f"/projects/{project_id}", json={"approval_policy": policy}, headers=as_user(owner)
+    )
+    assert response.status_code == 200
+    assert response.json()["approval_policy"] == policy
 
 
 # --- team (the default) ----------------------------------------------------
@@ -175,14 +168,13 @@ def test_a_stranger_cannot_vote(client: TestClient, cleanup_project_ids: list) -
 # --- admin ------------------------------------------------------------------
 
 
-@pytest.mark.asyncio
-async def test_under_admin_only_the_owners_vote_counts(
-    client: TestClient, cleanup_project_ids: list, database_url: str
+def test_under_admin_only_the_owners_vote_counts(
+    client: TestClient, cleanup_project_ids: list
 ) -> None:
     """Other members' votes are advisory. A room could unanimously approve
     and still be waiting on the one person the policy names."""
     project_id, owner, members, proposal_id = _room(client, cleanup_project_ids, members=3)
-    await _set_policy(database_url, project_id, "admin")
+    _set_policy(client, project_id, owner, "admin")
 
     client.post(f"/proposals/{proposal_id}/approve", headers=as_user(members[0]))
     body = client.post(
@@ -194,12 +186,11 @@ async def test_under_admin_only_the_owners_vote_counts(
     assert body["proposal"]["approval"]["required"] == 1
 
 
-@pytest.mark.asyncio
-async def test_under_admin_the_owner_alone_submits(
-    client: TestClient, cleanup_project_ids: list, database_url: str
+def test_under_admin_the_owner_alone_submits(
+    client: TestClient, cleanup_project_ids: list
 ) -> None:
     project_id, owner, _, proposal_id = _room(client, cleanup_project_ids, members=3)
-    await _set_policy(database_url, project_id, "admin")
+    _set_policy(client, project_id, owner, "admin")
 
     body = client.post(f"/proposals/{proposal_id}/approve", headers=as_user(owner)).json()
 
@@ -207,18 +198,35 @@ async def test_under_admin_the_owner_alone_submits(
     assert body["job_id"] is not None
 
 
-@pytest.mark.asyncio
-async def test_under_admin_a_members_rejection_does_not_kill_it(
-    client: TestClient, cleanup_project_ids: list, database_url: str
+def test_under_admin_a_members_rejection_does_not_kill_it(
+    client: TestClient, cleanup_project_ids: list
 ) -> None:
     project_id, owner, members, proposal_id = _room(client, cleanup_project_ids, members=3)
-    await _set_policy(database_url, project_id, "admin")
+    _set_policy(client, project_id, owner, "admin")
 
     body = client.post(
         f"/proposals/{proposal_id}/reject", headers=as_user(members[0])
     ).json()
 
     assert body["proposal"]["status"] == "pending"
+
+
+def test_switching_policy_applies_to_the_next_vote_not_retroactively(
+    client: TestClient, cleanup_project_ids: list
+) -> None:
+    """A policy change takes effect for whatever votes happen next; a
+    proposal already sitting with partial votes is not grandfathered into
+    whatever rule was active when it was created. Start under `team`, get
+    one of two members in, switch to `admin`, and let the owner's vote
+    alone decide it — proving the *new* rule is what's being evaluated,
+    not the one active when the first vote landed."""
+    project_id, owner, members, proposal_id = _room(client, cleanup_project_ids, members=2)
+    client.post(f"/proposals/{proposal_id}/approve", headers=as_user(members[0]))
+
+    _set_policy(client, project_id, owner, "admin")
+    body = client.post(f"/proposals/{proposal_id}/approve", headers=as_user(owner)).json()
+
+    assert body["proposal"]["status"] == "submitted"
 
 
 # --- the room hears about it ------------------------------------------------
@@ -267,3 +275,110 @@ def test_a_decision_is_announced_to_the_room(
 
     assert event["type"] == "proposal.updated"
     assert event["data"]["id"] == proposal_id
+
+
+# --- setting the approval policy (PATCH /projects/{id}) --------------------
+#
+# Until this endpoint existed, `team` — the migration default — was the
+# only policy any room could ever have: nothing wrote to the column, so
+# every `admin` test above had no choice but to set it with raw SQL.
+
+
+def _bare_room(client: TestClient, cleanup_project_ids: list) -> tuple[str, uuid.UUID, uuid.UUID]:
+    """A room with an owner and one joined member, no proposal — cheaper
+    than `_room` for tests that never touch the planner."""
+    owner, member = uuid.uuid4(), uuid.uuid4()
+    project = client.post("/projects", json={"name": "policy"}, headers=as_user(owner)).json()
+    cleanup_project_ids.append(uuid.UUID(project["id"]))
+    client.post(
+        f"/projects/{project['id']}/members",
+        json={"user_id": str(member)},
+        headers=as_user(owner),
+    )
+    client.post(f"/projects/{project['id']}/join", headers=as_user(member))
+    return project["id"], owner, member
+
+
+def test_a_fresh_room_defaults_to_team(client: TestClient, cleanup_project_ids: list) -> None:
+    owner = uuid.uuid4()
+    project = client.post("/projects", json={"name": "x"}, headers=as_user(owner)).json()
+    cleanup_project_ids.append(uuid.UUID(project["id"]))
+
+    assert project["approval_policy"] == "team"
+
+
+def test_the_owner_can_switch_to_admin(client: TestClient, cleanup_project_ids: list) -> None:
+    project_id, owner, _ = _bare_room(client, cleanup_project_ids)
+
+    response = client.patch(
+        f"/projects/{project_id}", json={"approval_policy": "admin"}, headers=as_user(owner)
+    )
+
+    assert response.status_code == 200
+    assert response.json()["approval_policy"] == "admin"
+
+
+def test_the_change_is_visible_on_the_room_snapshot(
+    client: TestClient, cleanup_project_ids: list
+) -> None:
+    project_id, owner, _ = _bare_room(client, cleanup_project_ids)
+    client.patch(
+        f"/projects/{project_id}", json={"approval_policy": "admin"}, headers=as_user(owner)
+    )
+
+    snapshot = client.get(f"/projects/{project_id}", headers=as_user(owner)).json()
+
+    assert snapshot["project"]["approval_policy"] == "admin"
+
+
+def test_a_member_who_is_not_the_owner_cannot_change_the_policy(
+    client: TestClient, cleanup_project_ids: list
+) -> None:
+    """A member already knows the room exists, so the answer is 403, not
+    404 — the same distinction require_project_owner draws for inviting."""
+    project_id, _, member = _bare_room(client, cleanup_project_ids)
+
+    response = client.patch(
+        f"/projects/{project_id}", json={"approval_policy": "admin"}, headers=as_user(member)
+    )
+
+    assert response.status_code == 403
+
+
+def test_a_stranger_gets_404_not_403(client: TestClient, cleanup_project_ids: list) -> None:
+    project_id, _, _ = _bare_room(client, cleanup_project_ids)
+
+    response = client.patch(
+        f"/projects/{project_id}",
+        json={"approval_policy": "admin"},
+        headers=as_user(uuid.uuid4()),
+    )
+
+    assert response.status_code == 404
+
+
+def test_an_invalid_policy_value_is_rejected(
+    client: TestClient, cleanup_project_ids: list
+) -> None:
+    """Literal validation catches it before it ever reaches the database's
+    own CHECK constraint."""
+    project_id, owner, _ = _bare_room(client, cleanup_project_ids)
+
+    response = client.patch(
+        f"/projects/{project_id}",
+        json={"approval_policy": "majority"},
+        headers=as_user(owner),
+    )
+
+    assert response.status_code == 422
+
+
+def test_an_empty_body_leaves_the_policy_unchanged(
+    client: TestClient, cleanup_project_ids: list
+) -> None:
+    project_id, owner, _ = _bare_room(client, cleanup_project_ids)
+
+    response = client.patch(f"/projects/{project_id}", json={}, headers=as_user(owner))
+
+    assert response.status_code == 200
+    assert response.json()["approval_policy"] == "team"

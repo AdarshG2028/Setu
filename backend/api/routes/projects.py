@@ -28,7 +28,11 @@ from backend.api.schemas.member import (
     MemberListResponse,
     MemberResponse,
 )
-from backend.api.schemas.project import CreateProjectRequest, ProjectResponse
+from backend.api.schemas.project import (
+    CreateProjectRequest,
+    ProjectResponse,
+    UpdateProjectRequest,
+)
 from backend.api.schemas.room import ExportResponse, RoomSnapshotResponse
 from backend.api.schemas.video import VideoListResponse, VideoSummaryResponse, VideoUploadResponse
 from backend.api.deps import (
@@ -75,6 +79,46 @@ async def create_project(
         id=project.id,
         owner_id=project.owner_id,
         name=project.name,
+        approval_policy=project.approval_policy,
+        created_at=project.created_at,
+    )
+
+
+@router.patch("/{project_id}", response_model=ProjectResponse)
+async def update_project(
+    project_id: uuid.UUID,
+    request: UpdateProjectRequest,
+    session: SessionDep,
+    owner_id: ProjectOwnerDep,
+) -> ProjectResponse:
+    """Change room-level settings. Owner only.
+
+    The only setting today is the approval policy (Phase 9a). There was
+    previously no way to reach `admin` at all: `team` is the migration
+    default and nothing wrote to the column afterward, so every room was
+    permanently unanimous whether that was wanted or not.
+
+    Takes effect immediately, for whatever votes happen from here on --
+    a proposal already sitting with partial votes is not "grandfathered"
+    into the policy that was active when it was created. That is the
+    simpler rule, and it matches what an owner changing the setting
+    mid-discussion would actually expect: the new rule applies to what
+    happens next.
+
+    ProjectOwnerDep has already resolved and authorized the caller (404
+    for a non-member matching require_project_member's reasoning, 403 for
+    a member who is not the owner), so the project is guaranteed to exist
+    by the time this body runs.
+    """
+    project = await ProjectRepository(session).get(project_id)
+    if request.approval_policy is not None:
+        project.approval_policy = request.approval_policy
+        await session.commit()
+    return ProjectResponse(
+        id=project.id,
+        owner_id=project.owner_id,
+        name=project.name,
+        approval_policy=project.approval_policy,
         created_at=project.created_at,
     )
 
@@ -108,6 +152,7 @@ async def get_room(
             id=snapshot.project.id,
             owner_id=snapshot.project.owner_id,
             name=snapshot.project.name,
+            approval_policy=snapshot.project.approval_policy,
             created_at=snapshot.project.created_at,
         ),
         members=[
