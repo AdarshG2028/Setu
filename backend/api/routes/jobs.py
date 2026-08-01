@@ -12,8 +12,10 @@ from backend.api.schemas.artifact import (
     StageArtifactsResponse,
 )
 from backend.api.schemas.job import JobCreateRequest, JobResponse, MemoryUpdateResponse
-from backend.api.deps import SessionDep
+from backend.api.deps import CurrentUserDep, SessionDep
 from backend.repositories.job_repository import JobRepository
+from backend.repositories.project_job_repository import ProjectJobRepository
+from backend.repositories.project_member_repository import ProjectMemberRepository
 from backend.repositories.result_repository import ResultRepository
 from backend.services.job_submission_service import (
     IdempotencyConflictError,
@@ -95,6 +97,59 @@ async def get_job_artifacts(job_id: uuid.UUID, session: SessionDep) -> JobArtifa
             for result in results
         ],
     )
+
+
+@router.post("/{job_id}/cancel", response_model=JobResponse)
+async def cancel_job(
+    job_id: uuid.UUID, session: SessionDep, user_id: CurrentUserDep
+) -> JobResponse:
+    """Stop a running job between stages. Job owner only.
+
+    **Cooperative, not forceful.** The stage currently in flight runs to
+    completion and keeps its Result -- there is no mid-stage kill -- and
+    the workflow simply stops rather than dispatching the next stage. So a
+    cancel during a long render is not instant; it takes effect at the
+    next stage boundary.
+
+    Authorized against `project_jobs.submitted_by_user_id`, the column
+    Phase 8 recorded at submission time. That is the *job* owner --
+    whoever's action started the work -- which is deliberately not the
+    room's owner and not the `admin` approver from Phase 9a. A member who
+    is not the job's owner gets 403: they can already see the job, so
+    there is nothing left to hide and "you are not allowed" is the more
+    useful answer. Anyone outside the room gets 404, matching every other
+    room-scoped endpoint.
+    """
+    owner_id = await ProjectJobRepository(session).owner_of_job(job_id)
+    project_id = await ProjectJobRepository(session).project_for_job(job_id)
+    if owner_id is None or project_id is None:
+        # No project_jobs row: either no such job, or a raw POST /jobs
+        # submission that belongs to no room. Neither has an owner to
+        # authorize against, and both are indistinguishable from outside.
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="job not found")
+
+    if not await ProjectMemberRepository(session).is_member(project_id, user_id):
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="job not found")
+
+    if owner_id != user_id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="only the job owner can cancel this job",
+        )
+
+    if not await JobRepository(session).cancel(job_id):
+        # Already finished, dead-lettered, or cancelled. A 409 rather than
+        # a silent success: the caller asked to stop something that had
+        # already stopped, and pretending otherwise would have them show a
+        # user "cancelling..." forever.
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT, detail="job has already finished"
+        )
+    await session.commit()
+
+    job = await JobRepository(session).get(job_id)
+    await session.refresh(job)
+    return JobResponse.from_model(job)
 
 
 @router.post("/{job_id}/update-memory", response_model=MemoryUpdateResponse)

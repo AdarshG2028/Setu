@@ -167,7 +167,20 @@ class StageProcessingService:
         # only delays the DLQ, it never avoids it.
         exhausted = attempt >= job.max_attempts or isinstance(exc, PermanentError)
         if exhausted:
-            job.status = JobStatus.DEAD_LETTERED
+            # Never over-write a cancellation (Phase 9b). A user who
+            # cancelled a job and then saw it reported `dead_lettered`
+            # because its in-flight stage happened to fail its last
+            # attempt would be told the system broke, when in fact it did
+            # what they asked. The execution row above still records the
+            # failure, so nothing is hidden -- only the job's own status,
+            # which the user has already decided, is left alone.
+            #
+            # Read fresh for the same reason as the success path: `job`
+            # was loaded before the worker ran.
+            if await self._jobs.current_status(job.id) == JobStatus.CANCELLED:
+                job.status = JobStatus.CANCELLED
+            else:
+                job.status = JobStatus.DEAD_LETTERED
             # No dedicated "dead_lettered_at" column; completed_at implies
             # success, so leave it null and rely on the auto-maintained
             # updated_at for when this became terminal.
@@ -207,15 +220,29 @@ class StageProcessingService:
             )
         )
         job.attempts = attempt
+
+        # Read fresh rather than trusting `job.status` (Phase 9b): that
+        # object was loaded before the worker ran, which for a render is
+        # minutes ago, and a cancel arriving during the work is precisely
+        # what this needs to see.
+        cancelled = await self._jobs.current_status(job.id) == JobStatus.CANCELLED
+
         # WorkflowEngine owns workflow position (current_stage, whether
         # another stage exists, dispatching it) — not job lifecycle. It
         # already added the next stage's OutboxEvent to this same session
         # if progress.is_last_stage is False; committing below covers
         # that dispatch atomically along with this stage's Result.
-        progress = self._engine.advance(job, message)
-        if progress.is_last_stage:
+        progress = self._engine.advance(job, message, cancelled=cancelled)
+        if progress.is_last_stage and not cancelled:
             job.status = JobStatus.COMPLETED
             job.completed_at = dt.datetime.now(dt.UTC)
+        if cancelled:
+            # The in-flight stage's Result above is kept -- the user asked
+            # to stop, not to discard work already paid for -- but the
+            # status they set stands. Writing COMPLETED here would undo a
+            # deliberate action just because the last stage happened to
+            # land first.
+            job.status = JobStatus.CANCELLED
 
         try:
             await self._session.commit()

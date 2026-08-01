@@ -102,6 +102,31 @@ class ProjectJobRepository:
         )
         return list(result.scalars().all())
 
+    async def list_ended_without_output(self, project_id: uuid.UUID) -> list[Job]:
+        """Work that stopped without producing a version (Phase 9b).
+
+        `cancelled` and `dead_lettered` are terminal, so they are absent
+        from `list_active_jobs`, and they produce no export -- which left
+        them visible nowhere in the room at all. Tolerable while the only
+        way to reach those states was a worker exhausting its retries;
+        not tolerable once a member can press cancel and watch the job
+        disappear on the next refresh, which is exactly what 9b's demo
+        scenario asks to see.
+
+        Most recently updated first: `completed_at` means success, so
+        neither of these states sets it.
+        """
+        result = await self._session.execute(
+            self._room_jobs(project_id)
+            .where(
+                Job.status.in_(
+                    [JobStatus.CANCELLED.value, JobStatus.DEAD_LETTERED.value]
+                )
+            )
+            .order_by(Job.updated_at.desc(), Job.id)
+        )
+        return list(result.scalars().all())
+
     def _room_jobs(self, project_id: uuid.UUID) -> Select[tuple[Job]]:
         return (
             select(Job)

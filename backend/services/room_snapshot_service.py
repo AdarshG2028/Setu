@@ -102,6 +102,10 @@ class RoomSnapshot:
     videos: list[Video]
     messages: list[Message]
     active_jobs: list[Job]
+    # Terminal, produced nothing, and therefore in neither list above --
+    # cancelled or dead-lettered. Without this a member who cancels a job
+    # watches it vanish from the room on the next refresh.
+    ended_jobs: list[Job]
     exports: list[Export]
 
 
@@ -138,6 +142,7 @@ class RoomSnapshotService:
             videos=await self._videos.list_by_project(project_id),
             messages=messages,
             active_jobs=await self._project_jobs.list_active_jobs(project_id),
+            ended_jobs=await self._project_jobs.list_ended_without_output(project_id),
             exports=await self._exports(project_id),
         )
 

@@ -62,5 +62,9 @@ class RoomSnapshotResponse(BaseModel):
     # -- which is the whole point in a room, where the member watching is
     # often not the member who submitted.
     active_jobs: list[JobResponse]
+    # Terminal work that produced no version: cancelled or dead-lettered.
+    # In neither list on either side of it, which is why it needs its own
+    # -- a job a member deliberately cancelled must not simply disappear.
+    ended_jobs: list[JobResponse]
     # Newest first. The derived version list; see ExportResponse.
     exports: list[ExportResponse]

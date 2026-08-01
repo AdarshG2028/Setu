@@ -134,6 +134,7 @@ async def get_room(
             for m in snapshot.messages
         ],
         active_jobs=[JobResponse.from_model(job) for job in snapshot.active_jobs],
+        ended_jobs=[JobResponse.from_model(job) for job in snapshot.ended_jobs],
         exports=[
             ExportResponse(
                 job_id=export.job.id,
