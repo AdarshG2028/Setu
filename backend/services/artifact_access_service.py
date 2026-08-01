@@ -68,6 +68,12 @@ class ArtifactAccessService:
         the two are populated by different mechanisms -- the column holds
         only the primary video (StageProcessingService), while the
         transcript and subtitle files exist solely inside the payload.
+
+        Recomputed per request, including per Range request, so scrubbing
+        through a long render costs one indexed read per seek. Cheap at
+        this scale and correct by construction; if it ever stops being
+        cheap, the fix is a cache keyed on (job_id, results count), not a
+        denormalized URI column that can go stale.
         """
         uris: set[str] = set()
         for result in await self._results.list_by_job(job_id):

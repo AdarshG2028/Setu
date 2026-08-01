@@ -19,9 +19,9 @@ from fastapi.testclient import TestClient
 from sqlalchemy.ext.asyncio import create_async_engine
 from sqlalchemy.pool import NullPool
 
-from backend.models import Job, Project, Result
+from backend.models import Job, Project, ProjectJob, Result
 from backend.models.enums import JobStatus
-from backend.workers.media import Asset, AssetKind, assets_payload
+from backend.workers.media import PREVIEW_FLAG, Asset, AssetKind, assets_payload
 from tests.conftest import as_user
 
 pytestmark = pytest.mark.usefixtures("database_url")
@@ -490,39 +490,59 @@ async def test_an_upload_binds_its_analysis_job_to_the_room(
 # --- the room snapshot (step 6) --------------------------------------------
 
 
-async def _finish_job(
+async def _seed_finished_job(
     database_url: str,
-    job_id: str,
+    project_id: str,
     *,
     assets: list[Asset] | None,
-    completed_at: dt.datetime | None = None,
-) -> None:
-    """Drive a job to `completed` with a final stage result.
+    completed_at: dt.datetime,
+    payload: dict | None = None,
+) -> str:
+    """A completed job already bound to a room, written straight to the DB.
 
-    Workers are not running in these tests, so the terminal state has to
-    be written directly. `assets=None` models a stage that produces
-    nothing (video_analysis, dummy) -- precisely the case the export
-    filter is supposed to drop.
+    **Not submitted through confirm-proposal**, deliberately. A real
+    submission publishes to Kafka, and this repo's normal development
+    state is a full worker fleet running against the same Postgres and
+    Redpanda the suite uses -- so a live `crop` worker consumes the test's
+    job, fails on URIs that were never stored, retries to exhaustion and
+    overwrites `completed` with `dead_lettered`. That is how this test
+    file first flaked: the export vanished mid-assertion. Seeding removes
+    the race entirely, and costs nothing here, because what is under test
+    is *what the snapshot does with a job in this state*, not how the job
+    got there -- the submission path has its own tests above.
 
-    `completed_at` is explicit rather than `now()` wherever ordering is
-    under test: Postgres' now() is *transaction start* time, so two calls
-    in quick succession are not reliably distinct.
+    `assets=None` models a stage that produces nothing (video_analysis,
+    dummy) -- precisely the case the export filter is meant to drop.
+    `completed_at` is explicit because Postgres' now() is transaction
+    start time, so two calls in quick succession are not reliably
+    distinct, and ordering is exactly what one of these tests asserts.
     """
+    job_id = uuid.uuid4()
     engine = create_async_engine(database_url, poolclass=NullPool)
     try:
         async with engine.connect() as conn:
             await conn.execute(
-                sa.update(Job)
-                .where(Job.id == uuid.UUID(job_id))
-                .values(
+                sa.insert(Job).values(
+                    id=job_id,
                     status=JobStatus.COMPLETED.value,
-                    completed_at=completed_at if completed_at is not None else sa.func.now(),
+                    workflow={"workflow": ["crop", "audio"]},
+                    current_stage=1,
+                    payload=payload or {},
+                    max_attempts=5,
+                    completed_at=completed_at,
+                )
+            )
+            await conn.execute(
+                sa.insert(ProjectJob).values(
+                    job_id=job_id,
+                    project_id=uuid.UUID(project_id),
+                    submitted_by_user_id=uuid.uuid4(),
                 )
             )
             await conn.execute(
                 sa.insert(Result).values(
                     id=uuid.uuid4(),
-                    job_id=uuid.UUID(job_id),
+                    job_id=job_id,
                     worker_name="render" if assets else "video_analysis",
                     stage=0,
                     payload=assets_payload(assets) if assets else {"measured": True},
@@ -531,6 +551,7 @@ async def _finish_job(
             await conn.commit()
     finally:
         await engine.dispose()
+    return str(job_id)
 
 
 def _propose(client: TestClient, project_id: str, user: uuid.UUID) -> None:
@@ -654,13 +675,12 @@ async def test_a_finished_job_leaves_active_and_appears_as_an_export(
     owner = uuid.uuid4()
     project = _create_project(client, owner)
     cleanup_project_ids.append(uuid.UUID(project["id"]))
-    _propose(client, project["id"], owner)
-    job_id = client.post(
-        f"/projects/{project['id']}/confirm-proposal", headers=as_user(owner)
-    ).json()["job_id"]
 
-    await _finish_job(
-        database_url, job_id, assets=[Asset(kind=AssetKind.VIDEO, uri="local://final.mp4")]
+    job_id = await _seed_finished_job(
+        database_url,
+        project["id"],
+        assets=[Asset(kind=AssetKind.VIDEO, uri="local://final.mp4")],
+        completed_at=dt.datetime(2026, 1, 1, tzinfo=dt.UTC),
     )
 
     body = client.get(f"/projects/{project['id']}", headers=as_user(owner)).json()
@@ -694,18 +714,60 @@ async def test_a_completed_preview_is_not_an_export(
     owner = uuid.uuid4()
     project = _create_project(client, owner)
     cleanup_project_ids.append(uuid.UUID(project["id"]))
-    _propose(client, project["id"], owner)
-    job_id = client.post(
-        f"/projects/{project['id']}/preview-proposal", headers=as_user(owner)
-    ).json()["job_id"]
 
-    await _finish_job(
-        database_url, job_id, assets=[Asset(kind=AssetKind.VIDEO, uri="local://preview.mp4")]
+    await _seed_finished_job(
+        database_url,
+        project["id"],
+        assets=[Asset(kind=AssetKind.VIDEO, uri="local://preview.mp4")],
+        completed_at=dt.datetime(2026, 1, 1, tzinfo=dt.UTC),
+        payload={PREVIEW_FLAG: True},
     )
 
     body = client.get(f"/projects/{project['id']}", headers=as_user(owner)).json()
 
     assert body["exports"] == []
+
+
+@pytest.mark.asyncio
+async def test_a_real_preview_submission_carries_the_flag_the_filter_reads(
+    client: TestClient, cleanup_project_ids: list, database_url: str
+) -> None:
+    """Pins the other half of the test above: the filter keys on
+    PREVIEW_FLAG, and this is what proves compile_workflow actually sets
+    it — otherwise the two could drift and previews would silently start
+    appearing as finished versions.
+
+    Asserts on the payload, which no worker ever rewrites, rather than on
+    the job's status, which a live worker in a shared dev stack will.
+    """
+    owner = uuid.uuid4()
+    project = _create_project(client, owner)
+    cleanup_project_ids.append(uuid.UUID(project["id"]))
+    _propose(client, project["id"], owner)
+
+    preview = client.post(
+        f"/projects/{project['id']}/preview-proposal", headers=as_user(owner)
+    ).json()["job_id"]
+    confirm = client.post(
+        f"/projects/{project['id']}/confirm-proposal", headers=as_user(owner)
+    ).json()["job_id"]
+
+    engine = create_async_engine(database_url, poolclass=NullPool)
+    try:
+        async with engine.connect() as conn:
+            payloads = dict(
+                (
+                    await conn.execute(
+                        sa.text("SELECT id, payload FROM jobs WHERE id = ANY(:ids)"),
+                        {"ids": [uuid.UUID(preview), uuid.UUID(confirm)]},
+                    )
+                ).all()
+            )
+    finally:
+        await engine.dispose()
+
+    assert payloads[uuid.UUID(preview)].get(PREVIEW_FLAG) is True
+    assert PREVIEW_FLAG not in payloads[uuid.UUID(confirm)]
 
 
 @pytest.mark.asyncio
@@ -718,13 +780,13 @@ async def test_a_completed_analysis_job_is_not_an_export(
     owner = uuid.uuid4()
     project = _create_project(client, owner)
     cleanup_project_ids.append(uuid.UUID(project["id"]))
-    job_id = client.post(
-        f"/projects/{project['id']}/videos",
-        files={"file": ("clip.mp4", b"bytes", "video/mp4")},
-        headers=as_user(owner),
-    ).json()["job_id"]
 
-    await _finish_job(database_url, job_id, assets=None)
+    await _seed_finished_job(
+        database_url,
+        project["id"],
+        assets=None,
+        completed_at=dt.datetime(2026, 1, 1, tzinfo=dt.UTC),
+    )
 
     body = client.get(f"/projects/{project['id']}", headers=as_user(owner)).json()
 
@@ -744,39 +806,25 @@ async def test_exports_are_ordered_by_completion_not_submission(
     project = _create_project(client, owner)
     cleanup_project_ids.append(uuid.UUID(project["id"]))
 
-    _propose(client, project["id"], owner)
-    first = client.post(
-        f"/projects/{project['id']}/confirm-proposal", headers=as_user(owner)
-    ).json()["job_id"]
-    # A fresh proposal message, so this confirm gets its own idempotency
-    # key rather than replaying the one above.
-    client.post(
-        f"/projects/{project['id']}/messages",
-        json={"content": "now rotate it"},
-        headers=as_user(owner),
-    )
-    second = client.post(
-        f"/projects/{project['id']}/confirm-proposal", headers=as_user(owner)
-    ).json()["job_id"]
-    assert first != second
-
-    # Submitted first, finished last.
-    await _finish_job(
+    # Seeded (and so created_at-ordered) first, but finishes last: the long
+    # render. Ordering by created_at would put it second, and this test
+    # fails if anyone makes that change.
+    submitted_first = await _seed_finished_job(
         database_url,
-        second,
-        assets=[Asset(kind=AssetKind.VIDEO, uri="local://second.mp4")],
-        completed_at=dt.datetime(2026, 1, 1, tzinfo=dt.UTC),
-    )
-    await _finish_job(
-        database_url,
-        first,
-        assets=[Asset(kind=AssetKind.VIDEO, uri="local://first.mp4")],
+        project["id"],
+        assets=[Asset(kind=AssetKind.VIDEO, uri="local://long.mp4")],
         completed_at=dt.datetime(2026, 1, 2, tzinfo=dt.UTC),
+    )
+    submitted_second = await _seed_finished_job(
+        database_url,
+        project["id"],
+        assets=[Asset(kind=AssetKind.VIDEO, uri="local://short.mp4")],
+        completed_at=dt.datetime(2026, 1, 1, tzinfo=dt.UTC),
     )
 
     body = client.get(f"/projects/{project['id']}", headers=as_user(owner)).json()
 
-    assert [e["job_id"] for e in body["exports"]] == [first, second]
+    assert [e["job_id"] for e in body["exports"]] == [submitted_first, submitted_second]
 
 
 def test_the_snapshot_never_leaks_another_rooms_jobs(

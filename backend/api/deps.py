@@ -5,7 +5,9 @@ Two things live here, and the second is the point of the module.
 `SessionDep` was previously copy-pasted into three route modules. It is
 identical in all of them, so it belongs in one place.
 
-`CurrentUserDep` is Phase 8's identity channel. Until now identity arrived
+`CurrentUserDep` is Phase 8's identity channel -- the `X-User-Id` header,
+or a `user_id` query parameter for the requests a browser cannot put
+headers on. Until now identity arrived
 -- when it arrived at all -- as a field inside the request body:
 `CreateProjectRequest.owner_id`, `PostMessageRequest.sender_id`. Five of
 the seven /projects endpoints, including confirm-proposal, carried no
@@ -55,7 +57,7 @@ SessionDep = Annotated[AsyncSession, Depends(get_session)]
 
 async def current_user_id(
     x_user_id: Annotated[
-        str,
+        str | None,
         Header(
             alias="X-User-Id",
             description=(
@@ -64,16 +66,48 @@ async def current_user_id(
                 "user; there is no registration step."
             ),
         ),
-    ],
+    ] = None,
+    user_id: Annotated[
+        str | None,
+        Query(
+            description=(
+                "The caller, for requests that cannot set headers -- a "
+                "<video src>, a download link, a WebSocket handshake. "
+                "Equivalent to X-User-Id, which wins if both are given."
+            )
+        ),
+    ] = None,
 ) -> uuid.UUID:
     """The caller, as a UUID.
+
+    **Why a query parameter is accepted as well as the header.** A browser
+    cannot attach custom headers to the requests that matter most here:
+    `<video src="/artifacts?...">` is the entire reason the download route
+    streams and honours Range, and `new WebSocket(url)` cannot set them
+    either, which Phase 8's membership-checked socket handshake needs.
+    Header-only identity would have made both unusable.
+
+    This costs nothing in security *because there is none to lose*: as the
+    module docstring says, X-User-Id is asserted by the client and
+    believed. A query parameter is exactly as forgeable as a header. It is
+    more *visible* -- query strings reach access logs and browser history
+    where headers do not -- which would matter for a real credential, and
+    is a reason this transport must not be carried over verbatim when
+    actual auth replaces it. The header stays the documented default and
+    wins when both are present.
 
     Rejects a malformed value rather than coercing it: a user id that
     isn't a UUID would still be usable as a dict key and would silently
     create a parallel identity that never matches any stored row.
     """
+    raw = x_user_id or user_id
+    if raw is None:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail="an X-User-Id header or user_id query parameter is required",
+        )
     try:
-        return uuid.UUID(x_user_id)
+        return uuid.UUID(raw)
     except ValueError as exc:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,

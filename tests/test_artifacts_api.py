@@ -65,6 +65,11 @@ async def _cleanup(engine, job_id: uuid.UUID) -> None:
         await conn.execute(text("DELETE FROM jobs WHERE id = :j"), {"j": job_id})
 
 
+async def _delete_project(engine, project_id: uuid.UUID) -> None:
+    async with engine.begin() as conn:
+        await conn.execute(text("DELETE FROM projects WHERE id = :p"), {"p": project_id})
+
+
 @pytest.fixture
 async def engine(database_url: str):
     eng = create_async_engine(database_url, poolclass=NullPool)
@@ -343,27 +348,60 @@ async def test_an_anonymous_download_is_rejected(client, room) -> None:
 
 
 @pytest.mark.asyncio
+async def test_identity_can_travel_in_the_url_for_a_video_element(client, room) -> None:
+    """A browser cannot put a header on `<video src=...>`, and playing
+    output in a video element is the reason this route streams and honours
+    Range at all. Header-only identity would have made the endpoint
+    unusable by the one client it was built for.
+
+    No security is given up: X-User-Id is asserted and believed either
+    way (backend/api/deps.py).
+    """
+    published = await room.publish(b"pretend this is an mp4", "clip.mp4")
+
+    response = client.get(f"{published.url}&user_id={room.owner}")
+
+    assert response.status_code == 200
+    assert response.content == b"pretend this is an mp4"
+
+
+@pytest.mark.asyncio
+async def test_a_url_carried_identity_is_still_checked_for_membership(client, room) -> None:
+    """The query parameter is a transport, not a bypass."""
+    published = await room.publish(b"bytes", "clip.mp4")
+
+    response = client.get(f"{published.url}&user_id={uuid.uuid4()}")
+
+    assert response.status_code == 404
+
+
+@pytest.mark.asyncio
 async def test_a_job_id_from_your_own_room_does_not_unlock_another_rooms_uri(
-    client, room, artifact_storage
+    client, room, engine, artifact_storage
 ) -> None:
     """Membership alone is not enough: without checking that the job
     actually produced this artifact, a member could pair a job id from
     their own room with any URI they had ever seen."""
     theirs = uuid.uuid4()
     other = client.post("/projects", json={"name": "theirs"}, headers=as_user(theirs)).json()
-    foreign = await room.publish_uri(
-        artifact_storage.put(b"private", suggested_name="secret.mp4"),
-        project=uuid.UUID(other["id"]),
-    )
-    mine = await room.publish(b"mine", "mine.mp4")
+    try:
+        foreign = await room.publish_uri(
+            artifact_storage.put(b"private", suggested_name="secret.mp4"),
+            project=uuid.UUID(other["id"]),
+        )
+        mine = await room.publish(b"mine", "mine.mp4")
 
-    response = client.get(
-        f"/artifacts?uri={quote(foreign.uri, safe='')}&job_id={mine.job_id}",
-        headers=as_user(room.owner),
-    )
+        response = client.get(
+            f"/artifacts?uri={quote(foreign.uri, safe='')}&job_id={mine.job_id}",
+            headers=as_user(room.owner),
+        )
 
-    assert response.status_code == 404
-    assert response.content != b"private"
+        assert response.status_code == 404
+        assert response.content != b"private"
+    finally:
+        # The room fixture only owns its own project; this second one
+        # would otherwise be left behind on every run.
+        await _delete_project(engine, uuid.UUID(other["id"]))
 
 
 @pytest.mark.asyncio

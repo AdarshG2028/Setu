@@ -88,11 +88,17 @@ class ProjectJobRepository:
         these count as exports is a product question, and answering it
         needs the payload -- so it belongs one layer up in
         RoomSnapshotService, not buried in a JSON predicate here.
+
+        `id` breaks ties. `completed_at` is set Python-side per job
+        (StageProcessingService) so a collision is unlikely rather than
+        impossible, and an untiebroken sort lets equal timestamps come
+        back in a different order on each call -- which a version list a
+        user reads, and any later pagination over it, cannot tolerate.
         """
         result = await self._session.execute(
             self._room_jobs(project_id)
             .where(Job.status == JobStatus.COMPLETED.value)
-            .order_by(Job.completed_at.desc())
+            .order_by(Job.completed_at.desc(), Job.id)
         )
         return list(result.scalars().all())
 
