@@ -6,6 +6,7 @@ from contextlib import asynccontextmanager
 from typing import AsyncIterator
 
 from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
 from prometheus_client import make_asgi_app
 
 from backend.api.routes import (
@@ -123,6 +124,22 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         version="0.1.0",
         debug=settings.debug,
         lifespan=lifespan,
+    )
+    origins = (
+        ["*"]
+        if settings.cors_allowed_origins == "*"
+        else [o.strip() for o in settings.cors_allowed_origins.split(",") if o.strip()]
+    )
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=origins,
+        # No cookies/sessions to protect (identity is an asserted header,
+        # see backend/api/deps.py) -- allow_credentials stays False so
+        # allow_origins=["*"] remains valid per the CORS spec, which
+        # forbids combining a wildcard origin with credentialed requests.
+        allow_credentials=False,
+        allow_methods=["*"],
+        allow_headers=["*"],
     )
     app.include_router(artifacts.router)
     app.include_router(health.router)

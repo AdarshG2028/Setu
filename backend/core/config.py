@@ -22,6 +22,15 @@ class Settings(BaseSettings):
     api_host: str = "0.0.0.0"
     api_port: int = 8000
 
+    # Comma-separated origins the browser may call this API from, e.g.
+    # "https://your-app.vercel.app,http://localhost:3000". "*" (default)
+    # allows any origin -- fine here because identity is a plain asserted
+    # header (backend/api/deps.py), not a cookie/session, so there is no
+    # credentialed-CORS footgun to widening this. Narrow it once a real
+    # frontend origin exists, but nothing breaks by leaving it permissive
+    # for local dev or an early deploy.
+    cors_allowed_origins: str = "*"
+
     database_url: PostgresDsn = Field(
         default="postgresql+asyncpg://setu:setu@localhost:5432/setu",
         description="Async SQLAlchemy DSN; must use the asyncpg driver.",
