@@ -72,6 +72,27 @@ class Settings(BaseSettings):
     # the same interface, not a change to this setting's callers.
     storage_local_path: str = "./data/storage"
 
+    # "local" (default) keeps every environment without S3 credentials
+    # working exactly as before -- tests, and local dev, never need to
+    # touch these. Flip to "s3" only once storage_s3_bucket points at a
+    # real, empty bucket: switching backends does not migrate existing
+    # local:// URIs already recorded in videos/results/video_assets.
+    storage_backend: Literal["local", "s3"] = "local"
+    storage_s3_bucket: str = ""
+    storage_s3_region: str = "ap-south-1"
+    # Left None for real AWS S3, which needs no override. Setting this is
+    # what would let the same S3Storage target R2/MinIO/B2 later without
+    # a code change -- the whole reason boto3 was chosen over an
+    # AWS-specific SDK.
+    storage_s3_endpoint_url: str | None = None
+    storage_s3_access_key_id: str = ""
+    storage_s3_secret_access_key: str = ""
+    # How long a presigned download URL stays valid. Short: it is minted
+    # fresh on every /artifacts request (see require_artifact_access),
+    # never stored, so there is no reason for it to outlive one viewing
+    # session.
+    storage_s3_presigned_url_ttl_seconds: int = 3600
+
     # Most recent N messages passed to the planner as context -- a real
     # prompt-budget decision (grows the LLM prompt linearly), so it's a
     # named setting rather than a hardcoded number.

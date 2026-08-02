@@ -77,6 +77,24 @@ async def engine(database_url: str):
     await eng.dispose()
 
 
+class _FakePresigningStorage:
+    """A Storage double that answers presigned_url() the way S3Storage
+    would, without touching AWS -- get()/size()/open_stream() are never
+    called by download_artifact once presigned_url() returns non-None, so
+    this double doesn't implement them.
+    """
+
+    def presigned_url(self, uri: str) -> str | None:
+        return f"https://fake-bucket.s3.amazonaws.com/signed?uri={quote(uri, safe='')}"
+
+
+@pytest.fixture
+def presigning_storage(monkeypatch) -> _FakePresigningStorage:
+    fake = _FakePresigningStorage()
+    monkeypatch.setattr("backend.api.routes.artifacts.get_storage", lambda: fake)
+    return fake
+
+
 @pytest.fixture
 def artifact_storage(tmp_path, monkeypatch) -> LocalDiskStorage:
     """Point the download route at a temp dir rather than the configured
@@ -373,6 +391,79 @@ async def test_a_url_carried_identity_is_still_checked_for_membership(client, ro
     response = client.get(f"{published.url}&user_id={uuid.uuid4()}")
 
     assert response.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_redirects_to_a_presigned_url_when_the_backend_offers_one(
+    client, engine, presigning_storage
+) -> None:
+    """An S3-backed Storage answers presigned_url() with a real URL --
+    the route hands the caller straight to it instead of streaming the
+    bytes through this process (backend/api/routes/artifacts.py)."""
+    owner = uuid.uuid4()
+    project = client.post("/projects", json={"name": "s3"}, headers=as_user(owner)).json()
+    project_id = uuid.UUID(project["id"])
+    uri = "s3://deadbeefdeadbeefdeadbeefdeadbeef.mp4"
+    job_id = await _seed_job(
+        engine,
+        project_id=project_id,
+        results=[
+            Result(
+                worker_name="crop",
+                stage=0,
+                payload=assets_payload([Asset(kind=AssetKind.VIDEO, uri=uri)]),
+            )
+        ],
+    )
+    try:
+        response = client.get(
+            f"/artifacts?uri={quote(uri, safe='')}&job_id={job_id}",
+            headers=as_user(owner),
+            follow_redirects=False,
+        )
+
+        assert response.status_code == 307
+        assert response.headers["location"] == presigning_storage.presigned_url(uri)
+        assert response.headers["cache-control"] == "no-store"
+    finally:
+        await _cleanup(engine, job_id)
+        await _delete_project(engine, project_id)
+
+
+@pytest.mark.asyncio
+async def test_a_stranger_is_refused_before_any_presigned_redirect(
+    client, engine, presigning_storage
+) -> None:
+    """The membership guard (require_artifact_access) is a dependency
+    resolved before the route body runs -- proves the redirect branch
+    cannot be reached by someone who was never authorized to see this
+    artifact in the first place."""
+    owner = uuid.uuid4()
+    project = client.post("/projects", json={"name": "s3"}, headers=as_user(owner)).json()
+    project_id = uuid.UUID(project["id"])
+    uri = "s3://deadbeefdeadbeefdeadbeefdeadbeef.mp4"
+    job_id = await _seed_job(
+        engine,
+        project_id=project_id,
+        results=[
+            Result(
+                worker_name="crop",
+                stage=0,
+                payload=assets_payload([Asset(kind=AssetKind.VIDEO, uri=uri)]),
+            )
+        ],
+    )
+    try:
+        response = client.get(
+            f"/artifacts?uri={quote(uri, safe='')}&job_id={job_id}",
+            headers=as_user(uuid.uuid4()),
+            follow_redirects=False,
+        )
+
+        assert response.status_code == 404
+    finally:
+        await _cleanup(engine, job_id)
+        await _delete_project(engine, project_id)
 
 
 @pytest.mark.asyncio

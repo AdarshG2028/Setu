@@ -22,7 +22,7 @@ from pathlib import Path
 from typing import BinaryIO
 
 from fastapi import APIRouter, HTTPException, Request, status
-from fastapi.responses import StreamingResponse
+from fastapi.responses import RedirectResponse, StreamingResponse
 
 from backend.api.deps import ArtifactAccessDep
 from backend.storage import StorageObjectNotFoundError, get_storage
@@ -105,8 +105,10 @@ def _stream(handle: BinaryIO, start: int, length: int):
         handle.close()
 
 
-@router.get("/artifacts")
-async def download_artifact(request: Request, uri: ArtifactAccessDep) -> StreamingResponse:
+@router.get("/artifacts", response_model=None)
+async def download_artifact(
+    request: Request, uri: ArtifactAccessDep
+) -> StreamingResponse | RedirectResponse:
     """Stream a stored artifact, honouring Range requests.
 
     Both the `uri` and the `job_id` it is authorized against are declared
@@ -120,14 +122,34 @@ async def download_artifact(request: Request, uri: ArtifactAccessDep) -> Streami
     opaque-URI contract.
 
     Path traversal is handled by the backend rather than re-checked here:
-    LocalDiskStorage._path_for rejects any key containing a separator or
-    a relative segment before it ever touches the filesystem, so a hostile
-    `uri` fails the same way an unknown one does. Duplicating that check
-    here would risk the two drifting apart. The guard runs first, so
-    reaching that code now also requires a hostile URI to have been
-    recorded as a real asset of a room's job.
+    LocalDiskStorage._path_for / S3Storage._key_for reject any key
+    containing a separator or a relative segment before it ever touches
+    the filesystem or S3, so a hostile `uri` fails the same way an unknown
+    one does. Duplicating that check here would risk the two drifting
+    apart. The guard runs first, so reaching that code now also requires a
+    hostile URI to have been recorded as a real asset of a room's job.
+
+    An S3-backed storage answers presigned_url() with a real URL instead
+    of None, so this handler redirects the caller straight to S3 rather
+    than streaming the bytes through this process itself -- cutting the
+    API server's egress and RAM use for every video byte served. Local
+    disk has nothing to presign (Storage.presigned_url's default), so
+    this branch is simply never taken there and the existing streaming
+    path is unchanged.
     """
     storage = get_storage()
+
+    redirect_url = storage.presigned_url(uri)
+    if redirect_url is not None:
+        return RedirectResponse(
+            redirect_url,
+            status_code=status.HTTP_307_TEMPORARY_REDIRECT,
+            # Every call mints a fresh, short-lived URL (see
+            # storage_s3_presigned_url_ttl_seconds) -- nothing here should
+            # ever be cached and replayed past that window.
+            headers={"Cache-Control": "no-store"},
+        )
+
     try:
         size = storage.size(uri)
         handle = storage.open_stream(uri)

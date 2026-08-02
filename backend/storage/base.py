@@ -6,14 +6,40 @@ themselves. That's what lets a later S3-backed implementation swap in
 behind this same interface without touching anything that calls it.
 """
 
+import uuid
 from abc import ABC, abstractmethod
 from os import PathLike
+from pathlib import Path
 from typing import BinaryIO
 
 
 class StorageObjectNotFoundError(Exception):
     """Raised by get()/exists()/open_stream() when a URI isn't one this
     backend wrote."""
+
+
+def generate_key(suggested_name: str | None) -> str:
+    """The one place a storage key is minted, so every backend produces
+    keys of an identical shape: a uuid4 hex, optionally followed by
+    suggested_name's extension. Shared so both LocalDiskStorage and
+    S3Storage can validate an inbound key against the same "could this
+    possibly be one we generated" check before touching the filesystem or
+    issuing an S3 call.
+    """
+    suffix = Path(suggested_name).suffix if suggested_name else ""
+    return f"{uuid.uuid4().hex}{suffix}"
+
+
+def is_safe_key(key: str) -> bool:
+    """Whether a key could plausibly be one generate_key() produced --
+    rejects path separators and relative segments outright, which is what
+    stands between a hostile or garbled URI (path traversal, a foreign
+    scheme's leftovers) and a filesystem/S3 lookup. Not a full
+    reconstruction of the uuid4-hex shape: an unknown-but-safe-looking key
+    still reaches the backend, which then reports it as not found rather
+    than invalid -- the same externally-visible 404 either way.
+    """
+    return "/" not in key and "\\" not in key and key not in ("", ".", "..")
 
 
 class Storage(ABC):
@@ -66,6 +92,19 @@ class Storage(ABC):
 
         Raises StorageObjectNotFoundError if the URI is unknown.
         """
+
+    def presigned_url(self, uri: str) -> str | None:
+        """A time-limited URL the caller's browser can fetch directly,
+        bypassing this process for the actual bytes.
+
+        Not abstract: local disk has nothing to presign, so the default
+        is None -- meaning "no shortcut, stream it yourself" -- and
+        download_artifact (backend/api/routes/artifacts.py) falls back to
+        its existing StreamingResponse path. A backend that can presign
+        (S3Storage) overrides this; nothing about the local path or its
+        tests changes.
+        """
+        return None
 
     @abstractmethod
     def open_stream(self, uri: str) -> BinaryIO:

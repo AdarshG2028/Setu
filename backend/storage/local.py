@@ -5,11 +5,10 @@ nothing outside this module would change.
 """
 
 import shutil
-import uuid
 from pathlib import Path
 from typing import BinaryIO
 
-from backend.storage.base import Storage, StorageObjectNotFoundError
+from backend.storage.base import Storage, StorageObjectNotFoundError, generate_key, is_safe_key
 
 _SCHEME = "local://"
 _COPY_CHUNK_SIZE = 1024 * 1024
@@ -21,13 +20,12 @@ class LocalDiskStorage(Storage):
         self._base_dir.mkdir(parents=True, exist_ok=True)
 
     def put(self, data: bytes, *, suggested_name: str | None = None) -> str:
-        suffix = Path(suggested_name).suffix if suggested_name else ""
-        key = f"{uuid.uuid4().hex}{suffix}"
+        key = generate_key(suggested_name)
         (self._base_dir / key).write_bytes(data)
         return f"{_SCHEME}{key}"
 
     def put_file(self, path, *, suggested_name: str | None = None) -> str:
-        key = f"{uuid.uuid4().hex}{Path(suggested_name or path).suffix}"
+        key = generate_key(suggested_name or str(path))
         destination = self._base_dir / key
         # Copied rather than moved: the caller owns its temp file and
         # deletes it in a finally block, and a move would pull the ground
@@ -73,9 +71,9 @@ class LocalDiskStorage(Storage):
         if not uri.startswith(_SCHEME):
             return None
         key = uri.removeprefix(_SCHEME)
-        # A key is always a uuid4 hex we generated in put() — reject anything
+        # A key is always one generate_key() produced -- reject anything
         # else outright rather than letting a garbled/malicious URI resolve
         # to a path outside base_dir.
-        if "/" in key or "\\" in key or key in ("", ".", ".."):
+        if not is_safe_key(key):
             return None
         return self._base_dir / key
