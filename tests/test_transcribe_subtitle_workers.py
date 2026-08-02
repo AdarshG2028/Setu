@@ -82,8 +82,13 @@ class FakeTranscriptCache:
     def fail_puts_with(self, error: Exception) -> None:
         self._put_error = error
 
+    def fail_gets_with(self, error: Exception) -> None:
+        self._get_error = error
+
     async def get(self, video_id: str) -> tuple[Asset, Asset] | None:
         self.get_calls.append(video_id)
+        if getattr(self, "_get_error", None):
+            raise self._get_error
         return self.store.get(video_id)
 
     async def put(self, video_id: str, transcript: Asset, srt: Asset) -> None:
@@ -416,6 +421,28 @@ async def test_cache_write_failure_does_not_fail_the_stage(
         _message([source], {}, video_ids=[video_id]), None
     )
 
+    kinds = {a.kind for a in previous_assets(payload)}
+    assert kinds == {"video", "transcript", "srt"}
+
+
+@pytest.mark.asyncio
+async def test_cache_read_failure_falls_back_to_real_transcription(
+    ffmpeg_available, storage
+) -> None:
+    """A database blip on the read side must degrade to a cache miss, not
+    fail a stage a real transcription would have completed successfully --
+    the same guarantee the write path already has."""
+    source = storage.put(_WITH_AUDIO.read_bytes(), suggested_name="clip.mp4")
+    video_id = str(uuid.uuid4())
+    cache = FakeTranscriptCache()
+    cache.fail_gets_with(RuntimeError("db unreachable"))
+    fake = FakeTranscriber()
+
+    payload = await TranscribeWorker(fake, cache=cache).process(
+        _message([source], {}, video_ids=[video_id]), None
+    )
+
+    assert fake.calls == 1
     kinds = {a.kind for a in previous_assets(payload)}
     assert kinds == {"video", "transcript", "srt"}
 

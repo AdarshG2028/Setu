@@ -164,7 +164,18 @@ class TranscribeWorker(Worker):
                 cache_key = ids[0]
 
         if cache_key is not None:
-            cached = await self._cache.get(cache_key)
+            try:
+                cached = await self._cache.get(cache_key)
+            except Exception:
+                # Same reasoning as the put() failure below: a caching
+                # side-effect must never fail a stage that a real
+                # transcription would have completed successfully. Treated
+                # as a miss -- worst case, this call pays for a
+                # transcription the cache could have skipped.
+                logger.warning(
+                    "failed to read cached transcript for video %s", cache_key, exc_info=True
+                )
+                cached = None
             if cached is not None:
                 transcript, srt = cached
                 return _finish(carried, source_uri, transcript, srt)
