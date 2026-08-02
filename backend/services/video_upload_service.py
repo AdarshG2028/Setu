@@ -25,7 +25,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from backend.models import Job, Video
 from backend.repositories.project_job_repository import ProjectJobRepository
 from backend.repositories.project_repository import ProjectNotFoundError, ProjectRepository
-from backend.repositories.video_repository import VideoRepository
+from backend.repositories.video_repository import DuplicateVideoNameError, VideoRepository
 from backend.services.job_submission_service import JobSubmissionService
 from backend.storage import get_storage
 
@@ -56,6 +56,18 @@ class VideoUploadService:
     ) -> VideoUploadResult:
         if await self._projects.get(project_id) is None:
             raise ProjectNotFoundError(project_id)
+
+        # Checked before storage.put(): a name collision means this
+        # upload is rejected outright, so there is no point spending a
+        # write on bytes that won't be kept. Two videos sharing a name
+        # leaves the planner's video_1/video_2 handles as the only way to
+        # tell them apart, which defeats the point of naming them at all
+        # (observed live: a clarifying question that showed the same name
+        # for both candidates). Only checked when a name was actually
+        # given -- unnamed uploads fall back to original_filename at the
+        # display layer, not here, so this must not reject on None.
+        if name is not None and await self._videos.get_by_project_and_name(project_id, name) is not None:
+            raise DuplicateVideoNameError(project_id, name)
 
         uri = get_storage().put(data, suggested_name=filename)
 

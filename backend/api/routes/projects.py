@@ -48,7 +48,7 @@ from backend.repositories.project_member_repository import (
     ProjectMemberRepository,
 )
 from backend.repositories.project_repository import ProjectNotFoundError, ProjectRepository
-from backend.repositories.video_repository import VideoRepository
+from backend.repositories.video_repository import DuplicateVideoNameError, VideoRepository
 from backend.services.conversation_service import ConversationService
 from backend.services.planner_factory import get_default_planner
 from backend.services.proposal_confirmation_service import (
@@ -263,6 +263,11 @@ async def upload_video(
     except ProjectNotFoundError as exc:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND, detail="project not found"
+        ) from exc
+    except DuplicateVideoNameError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"a video named {name!r} already exists in this project",
         ) from exc
     return VideoUploadResponse(
         video_id=result.video.id,

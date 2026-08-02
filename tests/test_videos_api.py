@@ -147,6 +147,61 @@ def test_upload_to_unknown_project_is_404(client: TestClient) -> None:
     assert response.status_code == 404
 
 
+def test_duplicate_name_in_the_same_project_is_409(
+    client: TestClient, cleanup_project_ids: list, cleanup_video_ids: list
+) -> None:
+    """A double-click on Execute (or any retry) that reuses the same name
+    must not silently create a second video -- observed live: a planner
+    clarifying question that showed the same display name for two
+    genuinely different videos, with no way for the user to tell them
+    apart."""
+    project_id = _create_project(client)
+    cleanup_project_ids.append(project_id)
+
+    first = _upload(client, project_id, name="vid_1")
+    assert first.status_code == 201
+    cleanup_video_ids.append(uuid.UUID(first.json()["video_id"]))
+
+    second = _upload(client, project_id, name="vid_1")
+    assert second.status_code == 409
+
+
+def test_same_name_in_different_projects_is_allowed(
+    client: TestClient, cleanup_project_ids: list, cleanup_video_ids: list
+) -> None:
+    """The constraint is scoped per project, not global -- two unrelated
+    rooms naming their upload "final" is not a collision."""
+    project_a = _create_project(client)
+    project_b = _create_project(client)
+    cleanup_project_ids.append(project_a)
+    cleanup_project_ids.append(project_b)
+
+    first = _upload(client, project_a, name="final")
+    second = _upload(client, project_b, name="final")
+
+    assert first.status_code == 201
+    assert second.status_code == 201
+    cleanup_video_ids.append(uuid.UUID(first.json()["video_id"]))
+    cleanup_video_ids.append(uuid.UUID(second.json()["video_id"]))
+
+
+def test_two_unnamed_uploads_in_the_same_project_are_both_allowed(
+    client: TestClient, cleanup_project_ids: list, cleanup_video_ids: list
+) -> None:
+    """No name given is not a collision with another no-name upload --
+    only an explicit, matching name is checked."""
+    project_id = _create_project(client)
+    cleanup_project_ids.append(project_id)
+
+    first = _upload(client, project_id)
+    second = _upload(client, project_id)
+
+    assert first.status_code == 201
+    assert second.status_code == 201
+    cleanup_video_ids.append(uuid.UUID(first.json()["video_id"]))
+    cleanup_video_ids.append(uuid.UUID(second.json()["video_id"]))
+
+
 def test_get_video_returns_analyzing_before_analysis_completes(
     client: TestClient, cleanup_project_ids: list, cleanup_video_ids: list
 ) -> None:
