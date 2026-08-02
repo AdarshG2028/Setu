@@ -56,6 +56,8 @@ __all__ = [
     "output_tempfile",
     "previous_assets",
     "primary_video",
+    "PREVIEW_OUTPUT_ARGS",
+    "PREVIEW_SCALE_FILTER",
     "probe",
     "process_video",
     "put_asset",
@@ -79,9 +81,14 @@ _COPY_CHUNK_SIZE = 1024 * 1024
 # both shrink, and never upscales a source already smaller than the cap.
 # -2 keeps the other dimension even, which h264 requires. The comma inside
 # min() is escaped because commas separate filters in a filtergraph.
+#
+# Exported (not module-private) so a capability that can't use
+# process_video -- because it needs a filter_complex rather than one
+# linear -vf/-af chain, e.g. remove_segment_worker.py -- can still honour
+# preview mode instead of silently ignoring it.
 _PREVIEW_HEIGHT = 480
-_PREVIEW_SCALE_FILTER = rf"scale=-2:min(ih\,{_PREVIEW_HEIGHT})"
-_PREVIEW_OUTPUT_ARGS = ("-preset", "ultrafast", "-crf", "30")
+PREVIEW_SCALE_FILTER = rf"scale=-2:min(ih\,{_PREVIEW_HEIGHT})"
+PREVIEW_OUTPUT_ARGS = ("-preset", "ultrafast", "-crf", "30")
 
 # Set by compile_workflow when a proposal is submitted in preview mode.
 PREVIEW_FLAG = "_preview"
@@ -473,7 +480,7 @@ async def process_video(
 
     video_filters = list(video_filters or [])
     if preview:
-        video_filters.append(_PREVIEW_SCALE_FILTER)
+        video_filters.append(PREVIEW_SCALE_FILTER)
 
     args: list[str] = [*(input_args or [])]
     with materialize_to_tempfile(resolve_input_uri(message, previous_output)) as source:
@@ -490,7 +497,7 @@ async def process_video(
             args += ["-c:a", "copy"]
 
         if preview:
-            args += list(_PREVIEW_OUTPUT_ARGS)
+            args += list(PREVIEW_OUTPUT_ARGS)
         else:
             # Placed before output_args so a capability that needs a
             # specific preset can still override it -- later flags win.

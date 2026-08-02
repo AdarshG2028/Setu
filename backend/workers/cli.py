@@ -27,6 +27,7 @@ from backend.workers.crop_worker import CropWorker
 from backend.workers.dummy_worker import DummyWorker
 from backend.workers.filler_word_worker import FillerWordWorker
 from backend.workers.merge_worker import MergeWorker
+from backend.workers.remove_segment_worker import RemoveSegmentWorker
 from backend.workers.render_worker import RenderWorker
 from backend.workers.scene_detection_worker import SceneDetectionWorker
 from backend.workers.runner import WorkerRunner
@@ -62,6 +63,7 @@ WORKERS = {
     "frame_extraction": FrameExtractionWorker,
     "merge": MergeWorker,
     "pad": PadWorker,
+    "remove_segment": RemoveSegmentWorker,
     "resize": ResizeWorker,
     "rotate": RotateWorker,
     "vision_detection": VisionDetectionWorker,

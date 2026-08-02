@@ -20,11 +20,14 @@ from backend.workers.media import (
     AssetKind,
     InvalidMediaParamsError,
     materialize_to_tempfile,
+    output_tempfile,
     previous_assets,
     primary_video,
     probe,
+    run_ffmpeg,
 )
 from backend.workers.merge_worker import MergeWorker
+from backend.workers.remove_segment_worker import RemoveSegmentWorker
 from backend.workers.trim_worker import TrimWorker
 
 _FIXTURES = Path(__file__).parent / "fixtures"
@@ -59,6 +62,24 @@ async def _info(uri: str) -> dict:
         else:
             info["audio_duration"] = float(stream.get("duration") or 0.0)
     return info
+
+
+async def _sample_color(uri: str, at_seconds: float) -> tuple[int, int, int]:
+    """The average RGB of a single frame, downscaled to one pixel so a
+    (possibly compression-noisy) solid-colour test frame still reads back
+    as unambiguously red/green/blue rather than needing an image library
+    to do proper pixel analysis."""
+    with materialize_to_tempfile(uri) as path, output_tempfile(".rgb") as destination:
+        await run_ffmpeg(
+            [
+                "-ss", str(at_seconds), "-i", str(path),
+                "-frames:v", "1", "-vf", "scale=1:1",
+                "-f", "rawvideo", "-pix_fmt", "rgb24",
+                str(destination),
+            ]
+        )
+        data = destination.read_bytes()
+        return data[0], data[1], data[2]
 
 
 # --- trim ------------------------------------------------------------------
@@ -281,3 +302,201 @@ async def test_merge_then_trim_chains(
     assert info["video_duration"] == pytest.approx(5.0, abs=0.2), (
         "must trim the 8s merged result, not the 4s original"
     )
+
+
+# --- remove_segment ---------------------------------------------------------
+#
+# trim's complement: keeps everything *except* a range, rather than only
+# what's inside it. Built after a live mix-up where "trim from 0:40 to
+# 1:10" was read as "keep that range" when "remove that range" was meant
+# — see both capabilities' descriptions in capability_registry.py.
+
+
+@pytest.fixture
+async def rgb_thirds_clip(ffmpeg_available) -> bytes:
+    """A 3s clip: red for second 0-1, green for 1-2, blue for 2-3 —
+    removing the middle second has an unambiguous, checkable result: the
+    remainder must be red directly followed by blue, with no green frame
+    anywhere and no gap between them."""
+    with output_tempfile(".mp4") as destination:
+        await run_ffmpeg(
+            [
+                "-f", "lavfi", "-i", "color=c=red:s=64x64:d=1:r=10",
+                "-f", "lavfi", "-i", "color=c=green:s=64x64:d=1:r=10",
+                "-f", "lavfi", "-i", "color=c=blue:s=64x64:d=1:r=10",
+                "-filter_complex", "concat=n=3:v=1:a=0",
+                str(destination),
+            ]
+        )
+        return destination.read_bytes()
+
+
+@pytest.mark.asyncio
+async def test_remove_segment_cuts_out_the_middle_and_rejoins(
+    ffmpeg_available, ffprobe_available, storage, rgb_thirds_clip
+) -> None:
+    source = storage.put(rgb_thirds_clip, suggested_name="thirds.mp4")
+
+    payload = await RemoveSegmentWorker().process(
+        _message([source], {"start": 1, "end": 2}), None
+    )
+
+    uri = primary_video(previous_assets(payload)).uri
+    info = await _info(uri)
+    assert info["video_duration"] == pytest.approx(2.0, abs=0.2), "3s minus the 1s removed"
+
+    start_color = await _sample_color(uri, 0.1)
+    end_color = await _sample_color(uri, 1.9)
+    assert start_color[0] > 150 and start_color[1] < 80, f"expected red, got {start_color}"
+    assert end_color[2] > 150 and end_color[1] < 80, f"expected blue, got {end_color}"
+
+
+@pytest.mark.asyncio
+async def test_remove_segment_keeps_audio_and_video_in_sync(
+    ffmpeg_available, ffprobe_available, storage
+) -> None:
+    source = storage.put(_WITH_AUDIO.read_bytes(), suggested_name="clip.mp4")  # 4s, audio
+
+    payload = await RemoveSegmentWorker().process(
+        _message([source], {"start": 1, "end": 2}), None
+    )
+
+    info = await _info(primary_video(previous_assets(payload)).uri)
+    assert info["video_duration"] == pytest.approx(3.0, abs=0.2)
+    assert abs(info["video_duration"] - info["audio_duration"]) < 0.2
+
+
+@pytest.mark.asyncio
+async def test_remove_segment_works_on_a_video_with_no_audio_track(
+    ffmpeg_available, ffprobe_available, storage
+) -> None:
+    source = storage.put(_SILENT.read_bytes(), suggested_name="silent.mp4")  # 3s, no audio
+
+    payload = await RemoveSegmentWorker().process(
+        _message([source], {"start": 0.5, "end": 1.5}), None
+    )
+
+    info = await _info(primary_video(previous_assets(payload)).uri)
+    assert info["video_duration"] == pytest.approx(2.0, abs=0.2)
+    assert "audio_duration" not in info, "no audio in, no audio out"
+
+
+@pytest.mark.asyncio
+async def test_remove_segment_touching_the_start_degenerates_to_a_single_trim(
+    ffmpeg_available, ffprobe_available, storage
+) -> None:
+    """No 'before' piece survives when start is ~0 -- this must fall back
+    to a plain trim rather than feeding concat a near-empty first input."""
+    source = storage.put(_WITH_AUDIO.read_bytes(), suggested_name="clip.mp4")  # 4s
+
+    payload = await RemoveSegmentWorker().process(
+        _message([source], {"start": 0, "end": 1}), None
+    )
+
+    info = await _info(primary_video(previous_assets(payload)).uri)
+    assert info["video_duration"] == pytest.approx(3.0, abs=0.2)
+
+
+@pytest.mark.asyncio
+async def test_remove_segment_touching_the_end_degenerates_to_a_single_trim(
+    ffmpeg_available, ffprobe_available, storage
+) -> None:
+    """Symmetric case: no 'after' piece survives when end reaches (or
+    exceeds) the input's real duration."""
+    source = storage.put(_WITH_AUDIO.read_bytes(), suggested_name="clip.mp4")  # 4s
+
+    payload = await RemoveSegmentWorker().process(
+        _message([source], {"start": 3, "end": 100}), None
+    )
+
+    info = await _info(primary_video(previous_assets(payload)).uri)
+    assert info["video_duration"] == pytest.approx(3.0, abs=0.2)
+
+
+@pytest.mark.asyncio
+async def test_remove_segment_covering_the_entire_video_is_rejected(
+    ffmpeg_available, ffprobe_available, storage
+) -> None:
+    source = storage.put(_WITH_AUDIO.read_bytes(), suggested_name="clip.mp4")  # 4s
+
+    with pytest.raises(InvalidMediaParamsError, match="entire video"):
+        await RemoveSegmentWorker().process(
+            _message([source], {"start": 0, "end": 100}), None
+        )
+
+
+@pytest.mark.asyncio
+async def test_remove_segment_forwards_unrelated_assets(
+    ffmpeg_available, ffprobe_available, storage
+) -> None:
+    source = storage.put(_WITH_AUDIO.read_bytes(), suggested_name="clip.mp4")
+    first = await RemoveSegmentWorker().process(
+        _message([source], {"start": 1, "end": 2}), None
+    )
+    srt = Asset(kind=AssetKind.SRT, uri="local://captions.srt")
+
+    payload = await TrimWorker().process(
+        _message([source], {"end": 2}, stage=1),
+        {"assets": [*first["assets"], srt.to_dict()]},
+    )
+
+    assert srt in previous_assets(payload)
+
+
+@pytest.mark.asyncio
+async def test_trim_then_remove_segment_chains(
+    ffmpeg_available, ffprobe_available, storage
+) -> None:
+    """Applies to the running result, same as repeated trim (Phase 5A,
+    Step 5) — not to the original upload."""
+    source = storage.put(_WITH_AUDIO.read_bytes(), suggested_name="clip.mp4")  # 4s
+    trimmed = await TrimWorker().process(_message([source], {"end": 4}), None)  # still 4s
+
+    payload = await RemoveSegmentWorker().process(
+        _message([source], {"start": 1, "end": 3}, stage=1), trimmed
+    )
+
+    info = await _info(primary_video(previous_assets(payload)).uri)
+    assert info["video_duration"] == pytest.approx(2.0, abs=0.2), "4s minus the 2s removed"
+
+
+@pytest.mark.asyncio
+async def test_remove_segment_honours_preview_mode(
+    ffmpeg_available, ffprobe_available, storage
+) -> None:
+    """Driving run_ffmpeg directly (needed for the filter_complex) means
+    this capability can't fall through media.process_video's own preview
+    handling -- it has to apply the scale filter itself, or a
+    preview-proposal would silently render at full resolution."""
+    source = storage.put(_WITH_AUDIO.read_bytes(), suggested_name="clip.mp4")  # 320x240
+    message = _message([source], {"start": 1, "end": 2})
+    message.payload["_preview"] = True
+
+    payload = await RemoveSegmentWorker().process(message, None)
+
+    info = await _info(primary_video(previous_assets(payload)).uri)
+    assert info["size"][1] <= 240, "already under the 480 preview cap -- must not upscale"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "params",
+    [
+        {"start": 1},                    # end missing
+        {"end": 2},                      # start missing
+        {},                              # both missing
+        {"start": -1, "end": 2},         # negative
+        {"start": 3, "end": 1},          # inverted
+        {"start": 1, "end": 1},          # zero-length
+        {"start": "1", "end": 2},        # not a number
+        {"start": True, "end": 2},       # bool is an int subclass
+        {"start": 1, "end": 2, "from": 1},  # unknown param
+    ],
+)
+async def test_remove_segment_rejects_bad_windows_permanently(storage, params: dict) -> None:
+    source = storage.put(b"x", suggested_name="x.mp4")
+
+    with pytest.raises(InvalidMediaParamsError) as exc_info:
+        await RemoveSegmentWorker().process(_message([source], params), None)
+
+    assert isinstance(exc_info.value, PermanentError)

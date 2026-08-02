@@ -184,12 +184,33 @@ DEFAULT_CAPABILITY_REGISTRY = CapabilityRegistry(
         "trim": StageCapability(
             name="trim",
             description=(
-                "Cut the video down to a time range, given in seconds. 'start' "
-                "alone drops everything before it; 'end' alone drops everything "
-                "after it; both together keep only what lies between. Use for "
-                "removing a slow intro, cutting a rambling tail, or keeping one "
-                "section of a longer recording. Can be used more than once in a "
-                "workflow -- each trim applies to the result of the one before."
+                "Cut the video down to a time range, given in seconds -- KEEPS "
+                "only what's given, discards the rest. 'start' alone drops "
+                "everything before it; 'end' alone drops everything after it; "
+                "both together keep only what lies between. Use for removing a "
+                "slow intro, cutting a rambling tail, or keeping one section of a "
+                "longer recording. Can be used more than once in a workflow -- "
+                "each trim applies to the result of the one before. Do NOT use "
+                "this for 'cut out the middle part from X to Y' or 'remove the "
+                "part between X and Y' -- that means DISCARDING a middle range "
+                "and keeping both surrounding pieces, which is remove_segment, "
+                "not trim."
+            ),
+            parameter_schema={"start": float, "end": float},
+        ),
+        "remove_segment": StageCapability(
+            name="remove_segment",
+            description=(
+                "Cut a middle piece OUT of the video and rejoin the two "
+                "surrounding pieces into one clip -- the opposite of trim, "
+                "which keeps a range instead of removing it. Use this for 'cut "
+                "out 0:40 to 1:10', 'remove the part where X happens', or "
+                "deleting a mistake/interruption from the middle while keeping "
+                "everything before and after it. Both 'start' and 'end' "
+                "(seconds) are required and mark the range to DELETE. If what's "
+                "actually wanted is dropping only the intro or only the tail "
+                "(nothing survives on one side), use trim instead -- it's "
+                "cheaper and simpler for that case."
             ),
             parameter_schema={"start": float, "end": float},
         ),
