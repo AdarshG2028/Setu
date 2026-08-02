@@ -25,8 +25,10 @@ from backend.workers.audio_worker import AudioWorker
 from backend.workers.color_worker import ColorWorker
 from backend.workers.crop_worker import CropWorker
 from backend.workers.dummy_worker import DummyWorker
+from backend.workers.filler_word_worker import FillerWordWorker
 from backend.workers.merge_worker import MergeWorker
 from backend.workers.render_worker import RenderWorker
+from backend.workers.scene_detection_worker import SceneDetectionWorker
 from backend.workers.runner import WorkerRunner
 from backend.workers.subtitle_burn_worker import SubtitleBurnWorker
 from backend.workers.transcribe_worker import TranscribeWorker
@@ -53,6 +55,8 @@ WORKERS = {
     "burn_subtitles": SubtitleBurnWorker,
     "color": ColorWorker,
     "crop": CropWorker,
+    "detect_filler_words": FillerWordWorker,
+    "detect_scenes": SceneDetectionWorker,
     "dummy": DummyWorker,
     "flip": FlipWorker,
     "frame_extraction": FrameExtractionWorker,

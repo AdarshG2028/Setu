@@ -67,17 +67,18 @@ class FakeTranscriber(TranscriptionClient):
         )
 
 
-class FakeTranscriptCache:
-    """In-memory TranscriptCache double -- no database in these tests."""
+class FakeVideoAssetCache:
+    """In-memory VideoAssetCache double -- no database in these tests."""
 
     def __init__(self) -> None:
-        self.store: dict[str, tuple[Asset, Asset]] = {}
-        self.put_calls: list[str] = []
-        self.get_calls: list[str] = []
+        self.store: dict[tuple[str, str], Asset] = {}
+        self.put_calls: list[tuple[str, str]] = []
+        self.get_calls: list[tuple[str, str]] = []
         self._put_error: Exception | None = None
+        self._get_error: Exception | None = None
 
-    def seed(self, video_id: str, transcript: Asset, srt: Asset) -> None:
-        self.store[video_id] = (transcript, srt)
+    def seed(self, video_id: str, kind: str, asset: Asset) -> None:
+        self.store[(video_id, kind)] = asset
 
     def fail_puts_with(self, error: Exception) -> None:
         self._put_error = error
@@ -85,17 +86,17 @@ class FakeTranscriptCache:
     def fail_gets_with(self, error: Exception) -> None:
         self._get_error = error
 
-    async def get(self, video_id: str) -> tuple[Asset, Asset] | None:
-        self.get_calls.append(video_id)
-        if getattr(self, "_get_error", None):
+    async def get(self, video_id: str, kind: str) -> Asset | None:
+        self.get_calls.append((video_id, kind))
+        if self._get_error:
             raise self._get_error
-        return self.store.get(video_id)
+        return self.store.get((video_id, kind))
 
-    async def put(self, video_id: str, transcript: Asset, srt: Asset) -> None:
-        self.put_calls.append(video_id)
+    async def put(self, video_id: str, kind: str, asset: Asset, data=None) -> None:
+        self.put_calls.append((video_id, kind))
         if self._put_error:
             raise self._put_error
-        self.store[video_id] = (transcript, srt)
+        self.store[(video_id, kind)] = asset
 
 
 @pytest.fixture
@@ -298,10 +299,11 @@ async def test_cache_hit_skips_transcription_and_still_forwards_video_asset(
     specifically so this cannot regress."""
     source = storage.put(_WITH_AUDIO.read_bytes(), suggested_name="clip.mp4")
     video_id = str(uuid.uuid4())
-    cache = FakeTranscriptCache()
+    cache = FakeVideoAssetCache()
     cached_transcript = Asset(kind=AssetKind.TRANSCRIPT, uri="local://cached-transcript.json")
     cached_srt = Asset(kind=AssetKind.SRT, uri="local://cached-captions.srt")
-    cache.seed(video_id, cached_transcript, cached_srt)
+    cache.seed(video_id, AssetKind.TRANSCRIPT, cached_transcript)
+    cache.seed(video_id, AssetKind.SRT, cached_srt)
     fake = FakeTranscriber()
 
     payload = await TranscribeWorker(fake, cache=cache).process(
@@ -321,7 +323,7 @@ async def test_cache_miss_writes_through_after_transcribing(
 ) -> None:
     source = storage.put(_WITH_AUDIO.read_bytes(), suggested_name="clip.mp4")
     video_id = str(uuid.uuid4())
-    cache = FakeTranscriptCache()
+    cache = FakeVideoAssetCache()
     fake = FakeTranscriber()
 
     payload = await TranscribeWorker(fake, cache=cache).process(
@@ -329,9 +331,32 @@ async def test_cache_miss_writes_through_after_transcribing(
     )
 
     assert fake.calls == 1
-    assert cache.put_calls == [video_id]
+    assert cache.put_calls == [(video_id, AssetKind.TRANSCRIPT), (video_id, AssetKind.SRT)]
     produced = next(a for a in previous_assets(payload) if a.kind == AssetKind.TRANSCRIPT)
-    assert cache.store[video_id][0].uri == produced.uri
+    assert cache.store[(video_id, AssetKind.TRANSCRIPT)].uri == produced.uri
+
+
+@pytest.mark.asyncio
+async def test_cache_partial_hit_falls_back_to_real_transcription(
+    ffmpeg_available, storage
+) -> None:
+    """Both or neither: a transcript cached with no matching srt (an
+    interrupted write) must not be served as a hit."""
+    source = storage.put(_WITH_AUDIO.read_bytes(), suggested_name="clip.mp4")
+    video_id = str(uuid.uuid4())
+    cache = FakeVideoAssetCache()
+    cache.seed(
+        video_id, AssetKind.TRANSCRIPT, Asset(kind=AssetKind.TRANSCRIPT, uri="local://t.json")
+    )
+    fake = FakeTranscriber()
+
+    payload = await TranscribeWorker(fake, cache=cache).process(
+        _message([source], {}, video_ids=[video_id]), None
+    )
+
+    assert fake.calls == 1, "a partial hit must fall through to real transcription"
+    kinds = {a.kind for a in previous_assets(payload)}
+    assert kinds == {"video", "transcript", "srt"}
 
 
 @pytest.mark.asyncio
@@ -343,11 +368,14 @@ async def test_cache_is_bypassed_for_a_language_override(
     shared cache entry."""
     source = storage.put(_WITH_AUDIO.read_bytes(), suggested_name="clip.mp4")
     video_id = str(uuid.uuid4())
-    cache = FakeTranscriptCache()
+    cache = FakeVideoAssetCache()
     cache.seed(
         video_id,
+        AssetKind.TRANSCRIPT,
         Asset(kind=AssetKind.TRANSCRIPT, uri="local://should-not-be-used.json"),
-        Asset(kind=AssetKind.SRT, uri="local://should-not-be-used.srt"),
+    )
+    cache.seed(
+        video_id, AssetKind.SRT, Asset(kind=AssetKind.SRT, uri="local://should-not-be-used.srt")
     )
     fake = FakeTranscriber()
 
@@ -370,11 +398,14 @@ async def test_cache_is_bypassed_once_a_prior_stage_produced_a_video(
     changes what audio actually plays."""
     source = storage.put(_WITH_AUDIO.read_bytes(), suggested_name="clip.mp4")
     video_id = str(uuid.uuid4())
-    cache = FakeTranscriptCache()
+    cache = FakeVideoAssetCache()
     cache.seed(
         video_id,
+        AssetKind.TRANSCRIPT,
         Asset(kind=AssetKind.TRANSCRIPT, uri="local://should-not-be-used.json"),
-        Asset(kind=AssetKind.SRT, uri="local://should-not-be-used.srt"),
+    )
+    cache.seed(
+        video_id, AssetKind.SRT, Asset(kind=AssetKind.SRT, uri="local://should-not-be-used.srt")
     )
     fake = FakeTranscriber()
     previous_output = {"assets": [Asset(kind=AssetKind.VIDEO, uri=source).to_dict()]}
@@ -395,7 +426,7 @@ async def test_no_cache_key_when_video_ids_were_never_compiled(
     """A payload built without compile_workflow's video_ids (or any other
     legacy shape) must degrade to "no cache", not raise."""
     source = storage.put(_WITH_AUDIO.read_bytes(), suggested_name="clip.mp4")
-    cache = FakeTranscriptCache()
+    cache = FakeVideoAssetCache()
     fake = FakeTranscriber()
 
     await TranscribeWorker(fake, cache=cache).process(_message([source], {}), None)
@@ -413,7 +444,7 @@ async def test_cache_write_failure_does_not_fail_the_stage(
     transcription itself succeeded."""
     source = storage.put(_WITH_AUDIO.read_bytes(), suggested_name="clip.mp4")
     video_id = str(uuid.uuid4())
-    cache = FakeTranscriptCache()
+    cache = FakeVideoAssetCache()
     cache.fail_puts_with(RuntimeError("db unreachable"))
     fake = FakeTranscriber()
 
@@ -434,7 +465,7 @@ async def test_cache_read_failure_falls_back_to_real_transcription(
     the same guarantee the write path already has."""
     source = storage.put(_WITH_AUDIO.read_bytes(), suggested_name="clip.mp4")
     video_id = str(uuid.uuid4())
-    cache = FakeTranscriptCache()
+    cache = FakeVideoAssetCache()
     cache.fail_gets_with(RuntimeError("db unreachable"))
     fake = FakeTranscriber()
 

@@ -245,5 +245,34 @@ DEFAULT_CAPABILITY_REGISTRY = CapabilityRegistry(
             ),
             parameter_schema={"resolution": str, "format": str, "bitrate": str},
         ),
+        # Phase 10's foundation-scoped capabilities (§19 Phase 10): the
+        # two that need no new dependency (ffmpeg's own scene filter;
+        # a regex scan over a transcript already being produced/cached).
+        "detect_scenes": StageCapability(
+            name="detect_scenes",
+            description=(
+                "Find shot/scene-cut timestamps in the video -- points where the "
+                "picture changes abruptly, e.g. a camera cut or an edit point in "
+                "the source footage. Does not change the video itself; produces a "
+                "list of cut times for review or for choosing where to trim. "
+                "'threshold' (0 to 1, default 0.4) is sensitivity: lower catches "
+                "subtler cuts at the cost of false positives on fast pans."
+            ),
+            parameter_schema={"threshold": float},
+            produces_asset_kinds=("video", "scenes"),
+        ),
+        "detect_filler_words": StageCapability(
+            name="detect_filler_words",
+            description=(
+                "Flag verbal fillers already present in the transcript -- 'um', "
+                "'uh', 'erm', 'hmm' -- with roughly where each occurs. Does not "
+                "remove anything or change the video; produces a list for review. "
+                "Requires a 'transcribe' stage earlier in the workflow to supply "
+                "the transcript this reads."
+            ),
+            parameter_schema={},
+            requires_asset_kinds=("video", "transcript"),
+            produces_asset_kinds=("video", "filler_words"),
+        ),
     }
 )
