@@ -23,8 +23,18 @@ def test_build_video_contexts_assigns_stable_ordered_handles() -> None:
     contexts = build_video_contexts(videos)
 
     assert contexts == [
-        VideoContext(handle="video_1", video_id=str(videos[0].id), display_name="Intro"),
-        VideoContext(handle="video_2", video_id=str(videos[1].id), display_name="b.mp4"),
+        VideoContext(
+            handle="video_1",
+            video_id=str(videos[0].id),
+            display_name="Intro",
+            uri="local:///videos/x.mp4",
+        ),
+        VideoContext(
+            handle="video_2",
+            video_id=str(videos[1].id),
+            display_name="b.mp4",
+            uri="local:///videos/x.mp4",
+        ),
     ]
 
 

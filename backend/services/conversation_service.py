@@ -23,14 +23,24 @@ from backend.models import Conversation, Message, MessageRole
 from backend.models import Proposal as ProposalRow
 from backend.repositories.conversation_repository import ConversationRepository
 from backend.repositories.message_repository import MessageRepository
+from backend.repositories.project_repository import (
+    ProjectNotFoundError,
+    ProjectRepository,
+)
+from backend.repositories.proposal_repository import ProposalRepository
 from backend.repositories.result_repository import ResultRepository
-from backend.repositories.project_repository import ProjectNotFoundError, ProjectRepository
 from backend.repositories.user_preference_repository import UserPreferenceRepository
 from backend.repositories.video_repository import VideoRepository
-from backend.services.capability_registry import DEFAULT_CAPABILITY_REGISTRY, CapabilityRegistry
+from backend.services.capability_registry import (
+    DEFAULT_CAPABILITY_REGISTRY,
+    CapabilityRegistry,
+)
 from backend.services.planner import Planner, StaticPlanner
-from backend.services.planner_context import PlannerContext, build_video_contexts
-from backend.repositories.proposal_repository import ProposalRepository
+from backend.services.planner_context import (
+    PlannerContext,
+    build_video_contexts,
+    with_edit_history,
+)
 from backend.services.proposal_service import proposal_event
 from backend.services.room_events import get_room_events
 
@@ -106,10 +116,12 @@ class ConversationService:
             conversation.id, limit=get_settings().conversation_context_limit
         )
         videos = await self._videos.list_by_project(project_id)
+        video_contexts = build_video_contexts(videos, await self._video_analysis(videos))
+        video_contexts = await with_edit_history(self._session, project_id, video_contexts)
         context = PlannerContext(
             project=project,
             conversation_history=history,
-            videos=build_video_contexts(videos, await self._video_analysis(videos)),
+            videos=video_contexts,
             preferences=preferences,
             capability_registry=self._capability_registry,
             # Wording only -- the planner describes the room's rule so its

@@ -15,7 +15,11 @@ from backend.workers.media import (
     AssetKind,
     InvalidMediaParamsError,
     MediaProcessingError,
+    _orientation,
+    _parse_duration,
+    _parse_frame_rate,
     assets_payload,
+    extract_video_metadata,
     forward_assets,
     previous_assets,
     primary_video,
@@ -270,3 +274,74 @@ def test_resolve_input_uri_error_names_the_stage_without_crashing() -> None:
 
     with pytest.raises(InvalidMediaParamsError, match="stage 7"):
         resolve_input_uri(message, None)
+
+
+# --- extract_video_metadata / its parsing helpers --------------------------
+# Moved from tests/test_video_analysis_worker.py alongside the code they
+# cover, when it moved from video_analysis_worker.py into this module —
+# shared now by upload-time analysis and video_chain.measure() alike.
+
+_FAKE_LANDSCAPE_PROBE = {
+    "format": {"duration": "12.345"},
+    "streams": [
+        {
+            "codec_type": "video",
+            "codec_name": "h264",
+            "width": 1920,
+            "height": 1080,
+            "r_frame_rate": "24000/1001",
+        },
+        {"codec_type": "audio", "codec_name": "aac"},
+    ],
+}
+
+
+def test_extract_video_metadata_from_landscape_probe() -> None:
+    metadata = extract_video_metadata(_FAKE_LANDSCAPE_PROBE)
+
+    assert metadata["width"] == 1920
+    assert metadata["height"] == 1080
+    assert metadata["resolution"] == "1920x1080"
+    assert metadata["orientation"] == "landscape"
+    assert metadata["codec"] == "h264"
+    assert metadata["duration_seconds"] == 12.345
+    assert metadata["fps"] == pytest.approx(23.976, abs=0.001)
+
+
+def test_extract_video_metadata_raises_when_no_video_stream() -> None:
+    # video_stream()'s own check, reused rather than duplicated -- see
+    # test_media_ffmpeg.py / worker tests for what no-video-stream input
+    # translates to at each worker's own boundary (e.g.
+    # video_analysis_worker.UnsupportedVideoError).
+    with pytest.raises(InvalidMediaParamsError):
+        extract_video_metadata({"format": {}, "streams": [{"codec_type": "audio"}]})
+
+
+def test_orientation_portrait_when_taller_than_wide() -> None:
+    assert _orientation(1080, 1920) == "portrait"
+
+
+def test_orientation_landscape_when_wider_than_tall() -> None:
+    assert _orientation(1920, 1080) == "landscape"
+
+
+def test_orientation_none_when_dimensions_missing() -> None:
+    assert _orientation(None, 1080) is None
+    assert _orientation(1920, None) is None
+
+
+def test_parse_frame_rate_handles_ratio_string() -> None:
+    assert _parse_frame_rate("30/1") == 30.0
+    assert _parse_frame_rate("24000/1001") == pytest.approx(23.976, abs=0.001)
+
+
+def test_parse_frame_rate_none_for_missing_or_malformed() -> None:
+    assert _parse_frame_rate(None) is None
+    assert _parse_frame_rate("") is None
+    assert _parse_frame_rate("not-a-ratio") is None
+
+
+def test_parse_duration_none_for_missing_or_malformed() -> None:
+    assert _parse_duration({"format": {}}) is None
+    assert _parse_duration({"format": {"duration": "not-a-number"}}) is None
+    assert _parse_duration({"format": {"duration": "5.5"}}) == 5.5

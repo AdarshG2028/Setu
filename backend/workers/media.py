@@ -45,19 +45,20 @@ from backend.storage import StorageObjectNotFoundError, get_storage
 from backend.workers.base import PermanentError, StageMessage
 
 __all__ = [
+    "PREVIEW_OUTPUT_ARGS",
+    "PREVIEW_SCALE_FILTER",
     "Asset",
     "AssetKind",
     "InvalidMediaParamsError",
     "MediaProcessingError",
     "assets_payload",
+    "extract_video_metadata",
     "forward_assets",
     "is_preview",
     "materialize_to_tempfile",
     "output_tempfile",
     "previous_assets",
     "primary_video",
-    "PREVIEW_OUTPUT_ARGS",
-    "PREVIEW_SCALE_FILTER",
     "probe",
     "process_video",
     "put_asset",
@@ -405,11 +406,11 @@ async def run_ffmpeg(args: list[str], *, cwd: Path | None = None) -> str:
 async def probe(path: Path) -> dict[str, Any]:
     """ffprobe metadata for a local file, as parsed JSON.
 
-    Deliberately not shared with video_analysis_worker._run_ffprobe:
-    that one raises VideoAnalysisError/UnsupportedVideoError, which are
-    part of its own tested contract, and collapsing the two would mean
-    one of them starts raising errors named for the other. The duplicated
-    surface is a dozen lines of argv.
+    Shared with video_analysis_worker.py, which translates the
+    MediaProcessingError/InvalidMediaParamsError this raises into its own
+    VideoAnalysisError/UnsupportedVideoError at its own boundary, to keep
+    its existing tested retry/DLQ contract without a second implementation
+    of the same dozen lines of argv.
     """
     try:
         proc = await asyncio.create_subprocess_exec(
@@ -446,6 +447,61 @@ def video_stream(probe_data: dict[str, Any]) -> dict[str, Any]:
     if stream is None:
         raise InvalidMediaParamsError("input has no video stream")
     return stream
+
+
+def extract_video_metadata(probe_data: dict[str, Any]) -> dict[str, Any]:
+    """duration/resolution/orientation/fps/codec from a probe() result.
+
+    Was video_analysis_worker.py's own private `_extract_metadata`, backed
+    by a second, near-identical ffprobe-running implementation. Moved here
+    so upload-time analysis and any later re-measurement of an edited
+    video (backend/services/video_chain.py's `measure`) share one
+    implementation rather than three ways of reading the same JSON.
+    Raises InvalidMediaParamsError (via video_stream) when there is no
+    video stream -- video_analysis_worker.py translates that into its own
+    UnsupportedVideoError to keep its existing retry/DLQ contract.
+    """
+    stream = video_stream(probe_data)
+    width = stream.get("width")
+    height = stream.get("height")
+    return {
+        "duration_seconds": _parse_duration(probe_data),
+        "fps": _parse_frame_rate(stream.get("r_frame_rate")),
+        "width": width,
+        "height": height,
+        "resolution": f"{width}x{height}" if width and height else None,
+        "orientation": _orientation(width, height),
+        "codec": stream.get("codec_name"),
+    }
+
+
+def _parse_duration(probe_data: dict[str, Any]) -> float | None:
+    raw = probe_data.get("format", {}).get("duration")
+    if raw is None:
+        return None
+    try:
+        return round(float(raw), 3)
+    except (TypeError, ValueError):
+        return None
+
+
+def _parse_frame_rate(raw: str | None) -> float | None:
+    """ffprobe reports frame rate as a "num/den" ratio string, not a float."""
+    if not raw:
+        return None
+    num, _, den = raw.partition("/")
+    den = den or "1"
+    try:
+        denominator = float(den)
+        return round(float(num) / denominator, 3) if denominator else None
+    except ValueError:
+        return None
+
+
+def _orientation(width: int | None, height: int | None) -> str | None:
+    if not width or not height:
+        return None
+    return "portrait" if height > width else "landscape"
 
 
 # --- the workhorse ---------------------------------------------------------

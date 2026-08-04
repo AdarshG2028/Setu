@@ -205,11 +205,32 @@ class PromptBuilder:
             "or `{\"type\": \"proposal\", ...}` once you have enough to propose a "
             "concrete edit.",
             "",
-            "Available videos in this project (reference by handle in `video_ids`, "
-            "never by any other identifier):",
+            "Available videos in this project. Handles (video_1, video_2, ...) exist "
+            "ONLY for the structured `video_ids` field -- that is the one place you "
+            "must use the handle and never the display name. Everywhere you write "
+            "prose for the room to read (`summary`, `reasoning`, `discussion_summary`, "
+            "or a clarifying `text` message), do the opposite: use the video's "
+            "display name (e.g. \"My Renamed Clip\"), never its handle -- the room "
+            "named their own footage, and a reply that says \"video_1\" instead of "
+            "the name they gave it reads as if you ignored them. When a handle's "
+            "note says it is the output of a previous edit, build on THAT by "
+            "default (e.g. a second trim request continues from the first) -- and "
+            "when that note names which stages already ran, your workflow for an "
+            "additional change must NOT include those stage names again: they are "
+            "already baked into this "
+            "handle, and repeating one re-runs it a second time on the already-"
+            "edited video rather than adding the new change. A video with edit "
+            "history may also list a `_previous` handle (the edit before the most "
+            "recent one) and an `_original` handle (the untouched upload) -- use "
+            "`_previous` only when the user asks to undo, go back a step, or build "
+            "on the version before the last edit, and use `_original` only when "
+            "they clearly ask to start over from scratch:",
         ]
         for video in context.videos:
-            lines.append(f"- {video.handle}: {video.display_name}{_video_facts(video)}")
+            line = f"- {video.handle}: {video.display_name}{_video_facts(video)}"
+            if video.edit_note:
+                line += f" [{video.edit_note}]"
+            lines.append(line)
 
         lines.append("")
         lines.append("Available stages (only use these in `workflow`):")

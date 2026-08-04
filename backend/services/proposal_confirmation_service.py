@@ -27,12 +27,18 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from backend.models import Proposal as ProposalRow
 from backend.repositories.conversation_repository import ConversationRepository
 from backend.repositories.project_job_repository import ProjectJobRepository
-from backend.repositories.project_repository import ProjectNotFoundError, ProjectRepository
+from backend.repositories.project_repository import (
+    ProjectNotFoundError,
+    ProjectRepository,
+)
 from backend.repositories.proposal_repository import ProposalRepository
 from backend.repositories.video_repository import VideoRepository
-from backend.services.job_submission_service import JobSubmissionResult, JobSubmissionService
+from backend.services.job_submission_service import (
+    JobSubmissionResult,
+    JobSubmissionService,
+)
 from backend.services.memory_update_service import CONVERSATION_ID_KEY
-from backend.services.planner_context import build_video_contexts
+from backend.services.planner_context import build_video_contexts, with_edit_history
 from backend.services.proposal import Proposal
 from backend.services.workflow_compiler import (
     ExecutionContext,
@@ -95,14 +101,16 @@ class ProposalConfirmationService:
         project_id = proposal.project_id
         videos = await self._videos.list_by_project(project_id)
         contexts = build_video_contexts(videos)
-        video_uris = {
-            video_context.handle: video.storage_uri
-            for video_context, video in zip(contexts, videos)
-        }
-        video_db_ids = {
-            video_context.handle: str(video.id)
-            for video_context, video in zip(contexts, videos)
-        }
+        # Same resolution ConversationService used to draft this proposal's
+        # prompt (see with_edit_history's docstring) -- so a handle that
+        # validated when the proposal was created still resolves the same
+        # way here. Each context now carries its own uri, so the map is a
+        # direct read rather than a zip() that silently assumed one context
+        # per video -- which stopped holding once a chained video gained a
+        # second, `_original`, handle.
+        contexts = await with_edit_history(self._session, project_id, contexts)
+        video_uris = {context.handle: context.uri for context in contexts}
+        video_db_ids = {context.handle: context.video_id for context in contexts}
         # The row keeps its stages under a "workflow" key, mirroring
         # Job.workflow, while summary and the facilitation fields live in
         # their own columns -- so the domain object is reassembled from

@@ -6,10 +6,13 @@ already loaded).
 """
 
 import uuid
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
+
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from backend.models import Message, Project, UserPreference, Video
 from backend.services.capability_registry import CapabilityRegistry
+from backend.services.video_chain import measure, recent_edits
 
 
 @dataclass(frozen=True)
@@ -35,6 +38,18 @@ class VideoContext:
     resolution: str | None = None
     orientation: str | None = None
 
+    # What this handle actually resolves to -- the original upload's URI
+    # by default. with_edit_history() below is what ever sets this to
+    # something else. Defaults to "" (not None) so a caller that only
+    # needs the metadata fields, like every existing test constructing a
+    # VideoContext by hand, is unaffected.
+    uri: str = ""
+
+    # Set by with_edit_history() when this handle's uri points at a prior
+    # edit's output rather than the original upload -- told to the planner
+    # so it knows to say so, and so it knows the facts above may be stale.
+    edit_note: str | None = None
+
 
 def build_video_contexts(
     videos: list[Video], analysis: dict[str, dict] | None = None
@@ -47,6 +62,10 @@ def build_video_contexts(
     list hasn't changed shape in between. Acceptable for V1 per the
     "no proposal persistence in Phase 4" deferral; revisit if that
     assumption ever breaks in practice.
+
+    Deliberately pure (no DB besides the `videos`/`analysis` already
+    fetched) -- see with_edit_history() for the async step that looks up
+    whether any of these videos have since been edited.
     """
     analysis = analysis or {}
     return [
@@ -57,9 +76,152 @@ def build_video_contexts(
             duration_seconds=analysis.get(str(video.id), {}).get("duration_seconds"),
             resolution=analysis.get(str(video.id), {}).get("resolution"),
             orientation=analysis.get(str(video.id), {}).get("orientation"),
+            uri=video.storage_uri,
         )
         for i, video in enumerate(videos, start=1)
     ]
+
+
+def _edit_note(stages: list[str], *, measured: bool) -> str:
+    """What the planner is told about an edited handle: that it's already
+    the output of specific prior stages, and what NOT to do about that.
+
+    Naming the stages is what this exists for. A note that only says "this
+    is a previous edit" (the earlier version of this function) gave the
+    model nothing concrete to avoid repeating -- and in a real room, asked
+    to remove an extra 5 seconds from an already-trimmed clip, it re-emitted
+    the *entire* prior workflow including the original remove_segment call.
+    That ran a second, different 30-second cut on top of the already-cut
+    video instead of just trimming 5 more seconds off the end -- 105.8s
+    minus a second unwanted 30s cut is 75.8s, which is exactly the wrong
+    output the room got. Naming "already applied: remove_segment, trim" and
+    saying not to repeat them is the direct fix for that failure mode.
+    """
+    applied = ", ".join(stages) if stages else "a prior edit"
+    if measured:
+        facts_clause = (
+            "the duration/resolution above were measured for this edited "
+            "version, not carried over from the original"
+        )
+    else:
+        facts_clause = (
+            "its duration/resolution could not be measured just now, so the "
+            "facts above are the ORIGINAL video's and may not be accurate for it"
+        )
+    return (
+        f"this is the OUTPUT of a previous edit in this room (already applied: "
+        f"{applied}) -- {facts_clause}. For an ADDITIONAL change, propose only "
+        f"the new stage(s) on top of this -- do NOT include {applied} again, "
+        f"that would re-run them on the already-edited video and compound the "
+        f"edit. To instead CHANGE how one of those stages was done, use the "
+        f"matching `_previous`/`_original` handle and redo from there, not this one."
+    )
+
+
+async def _measured_facts(
+    uri: str, fallback: VideoContext, stages: list[str]
+) -> tuple[float | None, str | None, str | None, str]:
+    """(duration_seconds, resolution, orientation, edit_note) for `uri`,
+    freshly measured -- or `fallback`'s own (stale) facts if measuring
+    fails, so a probe hiccup degrades gracefully instead of blanking out
+    what little was already known."""
+    facts = await measure(uri)
+    if facts is None:
+        return (
+            fallback.duration_seconds,
+            fallback.resolution,
+            fallback.orientation,
+            _edit_note(stages, measured=False),
+        )
+    return (
+        facts.get("duration_seconds"),
+        facts.get("resolution"),
+        facts.get("orientation"),
+        _edit_note(stages, measured=True),
+    )
+
+
+async def with_edit_history(
+    session: AsyncSession, project_id: uuid.UUID, contexts: list[VideoContext]
+) -> list[VideoContext]:
+    """For every handle whose video has been edited, point its uri at the
+    latest edit (with freshly measured duration/resolution/orientation,
+    not the original's) and add up to two more handles to revert to:
+    `<handle>_previous` (the edit before that, if one exists) and
+    `<handle>_original` (the untouched upload) -- a bounded 3-state window
+    (latest / previous / original), not a full version history, per the
+    room being able to revert to either of the last two edits or start
+    over, and nothing further back than that.
+
+    Building on the latest edit by default is what makes "trim 0:10 to
+    0:15" after "trim 0:40 to 1:10" continue from the first trim instead of
+    silently re-running on the original. Measuring it fresh rather than
+    reusing the original's stale facts is what stops the planner having to
+    ask the room for the current duration in chat -- fragile in a way a
+    real conversation demonstrated: an answer meant as the post-edit
+    duration got read as the original's, and the turn after that
+    fabricated a duration nobody had ever stated.
+
+    **The one place this is resolved.** Both ConversationService (building
+    what the planner sees) and ProposalConfirmationService (compiling an
+    approved proposal into a job) call this on top of build_video_contexts.
+    If they resolved edit history separately, a proposal validated against
+    one view could 409 at approval against the other -- so there is
+    exactly one function that decides which handles exist and what they
+    point at, and both callers inherit it.
+    """
+    augmented: list[VideoContext] = []
+    for context in contexts:
+        edits = await recent_edits(session, project_id, uuid.UUID(context.video_id), limit=2)
+        if not edits:
+            augmented.append(context)
+            continue
+
+        duration, resolution, orientation, edit_note = await _measured_facts(
+            edits[0].uri, context, edits[0].stages
+        )
+        augmented.append(
+            replace(
+                context,
+                uri=edits[0].uri,
+                duration_seconds=duration,
+                resolution=resolution,
+                orientation=orientation,
+                edit_note=edit_note,
+            )
+        )
+
+        if len(edits) >= 2:
+            prev_duration, prev_resolution, prev_orientation, prev_edit_note = (
+                await _measured_facts(edits[1].uri, context, edits[1].stages)
+            )
+            augmented.append(
+                VideoContext(
+                    handle=f"{context.handle}_previous",
+                    video_id=context.video_id,
+                    display_name=(
+                        f"{context.display_name} (previous edit, before the most recent one)"
+                    ),
+                    duration_seconds=prev_duration,
+                    resolution=prev_resolution,
+                    orientation=prev_orientation,
+                    uri=edits[1].uri,
+                    edit_note=prev_edit_note,
+                )
+            )
+
+        augmented.append(
+            VideoContext(
+                handle=f"{context.handle}_original",
+                video_id=context.video_id,
+                display_name=f"{context.display_name} (original, before edits)",
+                duration_seconds=context.duration_seconds,
+                resolution=context.resolution,
+                orientation=context.orientation,
+                uri=context.uri,
+            )
+        )
+    return augmented
 
 
 @dataclass(frozen=True)
