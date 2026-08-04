@@ -11,9 +11,14 @@ Phase 9 adds proposal approval.
 import uuid
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile, status
-from sqlalchemy.ext.asyncio import AsyncSession
+from fastapi import APIRouter, File, Form, HTTPException, UploadFile, status
 
+from backend.api.deps import (
+    CurrentUserDep,
+    ProjectMemberDep,
+    ProjectOwnerDep,
+    SessionDep,
+)
 from backend.api.schemas.artifact import ArtifactResponse
 from backend.api.schemas.conversation import (
     ConfirmProposalResponse,
@@ -34,12 +39,11 @@ from backend.api.schemas.project import (
     UpdateProjectRequest,
 )
 from backend.api.schemas.room import ExportResponse, RoomSnapshotResponse
-from backend.api.schemas.video import VideoListResponse, VideoSummaryResponse, VideoUploadResponse
-from backend.api.deps import (
-    CurrentUserDep,
-    ProjectMemberDep,
-    ProjectOwnerDep,
-    SessionDep,
+from backend.api.schemas.video import (
+    RenameVideoRequest,
+    VideoListResponse,
+    VideoSummaryResponse,
+    VideoUploadResponse,
 )
 from backend.models import Project
 from backend.repositories.project_member_repository import (
@@ -47,8 +51,14 @@ from backend.repositories.project_member_repository import (
     OWNER,
     ProjectMemberRepository,
 )
-from backend.repositories.project_repository import ProjectNotFoundError, ProjectRepository
-from backend.repositories.video_repository import DuplicateVideoNameError, VideoRepository
+from backend.repositories.project_repository import (
+    ProjectNotFoundError,
+    ProjectRepository,
+)
+from backend.repositories.video_repository import (
+    DuplicateVideoNameError,
+    VideoRepository,
+)
 from backend.services.conversation_service import ConversationService
 from backend.services.planner_factory import get_default_planner
 from backend.services.proposal_confirmation_service import (
@@ -58,6 +68,7 @@ from backend.services.proposal_confirmation_service import (
 )
 from backend.services.room_events import get_room_events
 from backend.services.room_snapshot_service import RoomSnapshotService
+from backend.services.video_rename_service import VideoNotFoundError, VideoRenameService
 from backend.services.video_upload_service import VideoUploadService
 
 router = APIRouter(prefix="/projects", tags=["projects"])
@@ -337,6 +348,40 @@ async def list_videos(
             )
             for v in videos
         ]
+    )
+
+
+@router.patch("/{project_id}/videos/{video_id}", response_model=VideoSummaryResponse)
+async def rename_video(
+    project_id: uuid.UUID,
+    video_id: uuid.UUID,
+    request: RenameVideoRequest,
+    session: SessionDep,
+    user_id: ProjectMemberDep,
+) -> VideoSummaryResponse:
+    """Any member may rename any video in the room -- not owner-gated, per
+    the same collaborative-by-default posture the rest of the room takes
+    (uploading, messaging). Renaming isn't a room-level setting like
+    approval policy, just a label on one piece of shared footage.
+    """
+    try:
+        video = await VideoRenameService(session).rename(
+            project_id=project_id, video_id=video_id, name=request.name
+        )
+    except VideoNotFoundError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="video not found"
+        ) from exc
+    except DuplicateVideoNameError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"a video named {request.name!r} already exists in this project",
+        ) from exc
+    return VideoSummaryResponse(
+        id=video.id,
+        original_filename=video.original_filename,
+        name=video.name,
+        created_at=video.created_at,
     )
 
 

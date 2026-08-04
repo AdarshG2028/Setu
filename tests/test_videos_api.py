@@ -10,14 +10,21 @@ import asyncio
 import uuid
 
 import pytest
-
-from tests.conftest import as_user
 import sqlalchemy as sa
 from fastapi.testclient import TestClient
 from sqlalchemy.ext.asyncio import create_async_engine
 from sqlalchemy.pool import NullPool
 
-from backend.models import IdempotencyKey, Job, OutboxEvent, Project, Result, Video, WorkerExecution
+from backend.models import (
+    IdempotencyKey,
+    Job,
+    OutboxEvent,
+    Project,
+    Result,
+    Video,
+    WorkerExecution,
+)
+from tests.conftest import as_user
 
 pytestmark = pytest.mark.usefixtures("database_url", "kafka_bootstrap_servers")
 
@@ -118,7 +125,8 @@ def test_upload_returns_201_with_video_and_job_id(
 
     assert body["project_id"] == str(project_id)
     assert body["status"] == "analyzing"
-    assert body["name"] is None
+    # No name given: defaults to the uploaded file's own name.
+    assert body["name"] == "clip.mp4"
     uuid.UUID(body["job_id"])  # doesn't raise
 
 
@@ -185,11 +193,12 @@ def test_same_name_in_different_projects_is_allowed(
     cleanup_video_ids.append(uuid.UUID(second.json()["video_id"]))
 
 
-def test_two_unnamed_uploads_in_the_same_project_are_both_allowed(
+def test_two_unnamed_uploads_of_the_same_filename_get_disambiguated(
     client: TestClient, cleanup_project_ids: list, cleanup_video_ids: list
 ) -> None:
-    """No name given is not a collision with another no-name upload --
-    only an explicit, matching name is checked."""
+    """Two phones both producing "clip.mp4" is routine, not a mistake --
+    the second upload must still succeed, with a name that doesn't collide
+    with the first rather than being rejected outright."""
     project_id = _create_project(client)
     cleanup_project_ids.append(project_id)
 
@@ -200,6 +209,24 @@ def test_two_unnamed_uploads_in_the_same_project_are_both_allowed(
     assert second.status_code == 201
     cleanup_video_ids.append(uuid.UUID(first.json()["video_id"]))
     cleanup_video_ids.append(uuid.UUID(second.json()["video_id"]))
+    assert first.json()["name"] == "clip.mp4"
+    assert second.json()["name"] == "clip (2).mp4"
+
+
+def test_disambiguation_handles_a_filename_with_no_extension(
+    client: TestClient, cleanup_project_ids: list, cleanup_video_ids: list
+) -> None:
+    project_id = _create_project(client)
+    cleanup_project_ids.append(project_id)
+
+    first = _upload(client, project_id, filename="myvideo")
+    second = _upload(client, project_id, filename="myvideo")
+
+    assert first.status_code == 201
+    assert second.status_code == 201
+    cleanup_video_ids.append(uuid.UUID(first.json()["video_id"]))
+    cleanup_video_ids.append(uuid.UUID(second.json()["video_id"]))
+    assert second.json()["name"] == "myvideo (2)"
 
 
 def test_get_video_returns_analyzing_before_analysis_completes(
@@ -248,6 +275,156 @@ def test_list_videos_returns_uploaded_videos(
 def test_list_videos_for_unknown_project_is_404(client: TestClient) -> None:
     response = client.get(f"/projects/{uuid.uuid4()}/videos", headers=as_user(uuid.uuid4()))
     assert response.status_code == 404
+
+
+# --- PATCH /projects/{id}/videos/{id}: renaming --------------------------
+
+
+def test_rename_video_persists_the_new_name(
+    client: TestClient, cleanup_project_ids: list, cleanup_video_ids: list
+) -> None:
+    project_id = _create_project(client)
+    cleanup_project_ids.append(project_id)
+    video_id = _upload(client, project_id).json()["video_id"]
+    cleanup_video_ids.append(uuid.UUID(video_id))
+
+    response = client.patch(
+        f"/projects/{project_id}/videos/{video_id}",
+        json={"name": "Final cut"},
+        headers=as_user(_OWNERS[project_id]),
+    )
+    assert response.status_code == 200
+    assert response.json()["name"] == "Final cut"
+
+    detail = client.get(f"/videos/{video_id}").json()
+    assert detail["name"] == "Final cut"
+
+
+def test_rename_video_any_member_can_do_it_not_just_the_owner(
+    client: TestClient, cleanup_project_ids: list, cleanup_video_ids: list
+) -> None:
+    """Renaming is a label on shared footage, not a room-level setting --
+    unlike inviting members, it isn't owner-gated."""
+    project_id = _create_project(client)
+    cleanup_project_ids.append(project_id)
+    video_id = _upload(client, project_id).json()["video_id"]
+    cleanup_video_ids.append(uuid.UUID(video_id))
+
+    member = uuid.uuid4()
+    client.post(
+        f"/projects/{project_id}/members",
+        json={"user_id": str(member)},
+        headers=as_user(_OWNERS[project_id]),
+    )
+    client.post(f"/projects/{project_id}/join", headers=as_user(member))
+
+    response = client.patch(
+        f"/projects/{project_id}/videos/{video_id}",
+        json={"name": "Renamed by a member"},
+        headers=as_user(member),
+    )
+    assert response.status_code == 200
+    assert response.json()["name"] == "Renamed by a member"
+
+
+def test_rename_video_to_a_name_already_taken_is_409(
+    client: TestClient, cleanup_project_ids: list, cleanup_video_ids: list
+) -> None:
+    project_id = _create_project(client)
+    cleanup_project_ids.append(project_id)
+    first = _upload(client, project_id, name="taken").json()["video_id"]
+    second = _upload(client, project_id, filename="other.mp4").json()["video_id"]
+    cleanup_video_ids.append(uuid.UUID(first))
+    cleanup_video_ids.append(uuid.UUID(second))
+
+    response = client.patch(
+        f"/projects/{project_id}/videos/{second}",
+        json={"name": "taken"},
+        headers=as_user(_OWNERS[project_id]),
+    )
+    assert response.status_code == 409
+
+
+def test_rename_video_to_its_own_current_name_is_a_noop_not_a_409(
+    client: TestClient, cleanup_project_ids: list, cleanup_video_ids: list
+) -> None:
+    project_id = _create_project(client)
+    cleanup_project_ids.append(project_id)
+    video_id = _upload(client, project_id, name="clip").json()["video_id"]
+    cleanup_video_ids.append(uuid.UUID(video_id))
+
+    response = client.patch(
+        f"/projects/{project_id}/videos/{video_id}",
+        json={"name": "clip"},
+        headers=as_user(_OWNERS[project_id]),
+    )
+    assert response.status_code == 200
+
+
+def test_rename_unknown_video_is_404(
+    client: TestClient, cleanup_project_ids: list
+) -> None:
+    project_id = _create_project(client)
+    cleanup_project_ids.append(project_id)
+
+    response = client.patch(
+        f"/projects/{project_id}/videos/{uuid.uuid4()}",
+        json={"name": "whatever"},
+        headers=as_user(_OWNERS[project_id]),
+    )
+    assert response.status_code == 404
+
+
+def test_rename_video_from_a_different_project_is_404(
+    client: TestClient, cleanup_project_ids: list, cleanup_video_ids: list
+) -> None:
+    """A video id that's real but belongs to someone else's room must not
+    be renamable (or even confirmable to exist) through this project."""
+    project_a = _create_project(client)
+    project_b = _create_project(client)
+    cleanup_project_ids.append(project_a)
+    cleanup_project_ids.append(project_b)
+    video_id = _upload(client, project_a).json()["video_id"]
+    cleanup_video_ids.append(uuid.UUID(video_id))
+
+    response = client.patch(
+        f"/projects/{project_b}/videos/{video_id}",
+        json={"name": "hijacked"},
+        headers=as_user(_OWNERS[project_b]),
+    )
+    assert response.status_code == 404
+
+
+def test_rename_video_by_a_stranger_is_404(
+    client: TestClient, cleanup_project_ids: list, cleanup_video_ids: list
+) -> None:
+    project_id = _create_project(client)
+    cleanup_project_ids.append(project_id)
+    video_id = _upload(client, project_id).json()["video_id"]
+    cleanup_video_ids.append(uuid.UUID(video_id))
+
+    response = client.patch(
+        f"/projects/{project_id}/videos/{video_id}",
+        json={"name": "whatever"},
+        headers=as_user(uuid.uuid4()),
+    )
+    assert response.status_code == 404
+
+
+def test_rename_video_to_empty_string_is_422(
+    client: TestClient, cleanup_project_ids: list, cleanup_video_ids: list
+) -> None:
+    project_id = _create_project(client)
+    cleanup_project_ids.append(project_id)
+    video_id = _upload(client, project_id).json()["video_id"]
+    cleanup_video_ids.append(uuid.UUID(video_id))
+
+    response = client.patch(
+        f"/projects/{project_id}/videos/{video_id}",
+        json={"name": ""},
+        headers=as_user(_OWNERS[project_id]),
+    )
+    assert response.status_code == 422
 
 
 @pytest.mark.asyncio

@@ -4,7 +4,11 @@ import datetime as dt
 import uuid
 from typing import Any
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
+
+
+class RenameVideoRequest(BaseModel):
+    name: str = Field(min_length=1, max_length=255)
 
 
 class VideoUploadResponse(BaseModel):

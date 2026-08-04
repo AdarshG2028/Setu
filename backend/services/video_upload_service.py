@@ -24,8 +24,14 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from backend.models import Job, Video
 from backend.repositories.project_job_repository import ProjectJobRepository
-from backend.repositories.project_repository import ProjectNotFoundError, ProjectRepository
-from backend.repositories.video_repository import DuplicateVideoNameError, VideoRepository
+from backend.repositories.project_repository import (
+    ProjectNotFoundError,
+    ProjectRepository,
+)
+from backend.repositories.video_repository import (
+    DuplicateVideoNameError,
+    VideoRepository,
+)
 from backend.services.job_submission_service import JobSubmissionService
 from backend.storage import get_storage
 
@@ -57,22 +63,36 @@ class VideoUploadService:
         if await self._projects.get(project_id) is None:
             raise ProjectNotFoundError(project_id)
 
-        # Checked before storage.put(): a name collision means this
-        # upload is rejected outright, so there is no point spending a
-        # write on bytes that won't be kept. Two videos sharing a name
-        # leaves the planner's video_1/video_2 handles as the only way to
-        # tell them apart, which defeats the point of naming them at all
-        # (observed live: a clarifying question that showed the same name
-        # for both candidates). Only checked when a name was actually
-        # given -- unnamed uploads fall back to original_filename at the
-        # display layer, not here, so this must not reject on None.
-        if name is not None and await self._videos.get_by_project_and_name(project_id, name) is not None:
-            raise DuplicateVideoNameError(project_id, name)
+        # Checked before storage.put(): a rejected upload should not have
+        # spent a write on bytes that won't be kept.
+        #
+        # An EXPLICIT name is a deliberate choice, so a collision is
+        # rejected outright -- the uploader learns immediately rather than
+        # ending up with a video named something they didn't ask for. Two
+        # videos sharing a name also leaves the planner's video_1/video_2
+        # handles as the only way to tell them apart (observed live: a
+        # clarifying question that showed the same display name for two
+        # genuinely different videos).
+        #
+        # No name given defaults to the file's own name instead of staying
+        # null -- but disambiguated, never rejected: two phones both
+        # producing "video.mp4" is routine, and an upload failing over a
+        # name nobody typed would be a worse experience than the
+        # display-layer fallback to original_filename it replaces.
+        if name is not None:
+            if await self._videos.get_by_project_and_name(project_id, name) is not None:
+                raise DuplicateVideoNameError(project_id, name)
+            resolved_name = name
+        else:
+            resolved_name = await self._unique_name(project_id, filename)
 
         uri = get_storage().put(data, suggested_name=filename)
 
         video = Video(
-            project_id=project_id, storage_uri=uri, original_filename=filename, name=name
+            project_id=project_id,
+            storage_uri=uri,
+            original_filename=filename,
+            name=resolved_name,
         )
         self._videos.add(video)
         await self._session.flush()  # assigns video.id
@@ -100,3 +120,18 @@ class VideoUploadService:
         await self._session.commit()
 
         return VideoUploadResult(video=video, job=submission.job)
+
+    async def _unique_name(self, project_id: uuid.UUID, filename: str) -> str:
+        """`filename`, or `filename` with a " (2)", " (3)", ... suffix
+        inserted before the extension if that name is already taken in
+        this project. Bounded by how many videos share one filename in one
+        room -- never more than a handful in practice, so a query per
+        candidate is simpler than a single smarter lookup for a case this
+        rare."""
+        candidate = filename
+        suffix = 2
+        while await self._videos.get_by_project_and_name(project_id, candidate) is not None:
+            stem, dot, ext = filename.rpartition(".")
+            candidate = f"{stem} ({suffix}).{ext}" if dot else f"{filename} ({suffix})"
+            suffix += 1
+        return candidate
