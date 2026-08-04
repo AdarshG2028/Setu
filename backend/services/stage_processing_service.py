@@ -14,6 +14,19 @@ means back off and let Kafka redeliver; EXHAUSTED means the retry budget
 counter that would reset on a crash) is spent and the harness should route
 the message to the dead-letter topic and commit the offset to unblock the
 partition.
+
+Both commit sites also expect to lose an occasional race to another
+delivery of the same message (redelivered before this one's offset
+committed, or two worker replicas both live on the same partition during a
+rebalance): IntegrityError from a duplicate Result, or StaleDataError from
+a concurrent UPDATE to the same Job row finding it already changed. Either
+one means somebody else already recorded this attempt's outcome — this
+call's own write is redundant, not wrong, so both are caught and treated
+the same way IntegrityError always was: log, roll back, return normally.
+The alternative — an uncaught StaleDataError killing the worker process
+outright — is exactly what took video_analysis down for three days
+straight in this project's history; nothing restarted it, and its jobs
+sat unprocessed the whole time.
 """
 
 import datetime as dt
@@ -24,6 +37,7 @@ from enum import StrEnum
 
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm.exc import StaleDataError
 
 from backend.models import Job, JobStatus, Result, WorkerExecution
 from backend.models.enums import ExecutionStatus
@@ -147,45 +161,81 @@ class StageProcessingService:
         self, job: Job, message: StageMessage, attempt: int, exc: Exception
     ) -> ProcessingResult:
         error_text = str(exc)[:2000]
-        job.attempts = attempt
-        job.last_error = error_text
-        self._executions.add(
-            WorkerExecution(
-                job_id=job.id,
-                worker_name=self._worker.name,
-                stage=message.stage,
-                attempt=attempt,
-                status=ExecutionStatus.FAILED,
-                error=error_text,
-                finished_at=dt.datetime.now(dt.UTC),
-            )
-        )
-
         # A PermanentError skips straight to EXHAUSTED regardless of budget
         # remaining: the worker is telling us this exact input will fail
         # identically next time too, so spending the retry backoff on it
         # only delays the DLQ, it never avoids it.
-        exhausted = attempt >= job.max_attempts or isinstance(exc, PermanentError)
-        if exhausted:
-            # Never over-write a cancellation (Phase 9b). A user who
-            # cancelled a job and then saw it reported `dead_lettered`
-            # because its in-flight stage happened to fail its last
-            # attempt would be told the system broke, when in fact it did
-            # what they asked. The execution row above still records the
-            # failure, so nothing is hidden -- only the job's own status,
-            # which the user has already decided, is left alone.
-            #
-            # Read fresh for the same reason as the success path: `job`
-            # was loaded before the worker ran.
-            if await self._jobs.current_status(job.id) == JobStatus.CANCELLED:
-                job.status = JobStatus.CANCELLED
-            else:
-                job.status = JobStatus.DEAD_LETTERED
-            # No dedicated "dead_lettered_at" column; completed_at implies
-            # success, so leave it null and rely on the auto-maintained
-            # updated_at for when this became terminal.
+        #
+        # Read now, before anything below can lose a race: `job.max_attempts`
+        # is only ever set at creation, so this value can't go stale, and
+        # capturing it here means the return at the bottom never has to
+        # touch `job` again after a possibly-failed flush.
+        max_attempts = job.max_attempts
+        exhausted = attempt >= max_attempts or isinstance(exc, PermanentError)
 
-        await self._session.commit()
+        try:
+            job.attempts = attempt
+            job.last_error = error_text
+            self._executions.add(
+                WorkerExecution(
+                    job_id=job.id,
+                    worker_name=self._worker.name,
+                    stage=message.stage,
+                    attempt=attempt,
+                    status=ExecutionStatus.FAILED,
+                    error=error_text,
+                    finished_at=dt.datetime.now(dt.UTC),
+                )
+            )
+
+            if exhausted:
+                # Never over-write a cancellation (Phase 9b). A user who
+                # cancelled a job and then saw it reported `dead_lettered`
+                # because its in-flight stage happened to fail its last
+                # attempt would be told the system broke, when in fact it
+                # did what they asked. The execution row above still
+                # records the failure, so nothing is hidden -- only the
+                # job's own status, which the user has already decided, is
+                # left alone.
+                #
+                # Read fresh for the same reason as the success path:
+                # `job` was loaded before the worker ran. This SELECT also
+                # autoflushes the mutations above -- a concurrent delivery
+                # that already claimed this row can surface a StaleDataError
+                # right here, not only at the explicit commit below, which
+                # is why the try wraps this and not just the commit.
+                if await self._jobs.current_status(job.id) == JobStatus.CANCELLED:
+                    job.status = JobStatus.CANCELLED
+                else:
+                    job.status = JobStatus.DEAD_LETTERED
+                # No dedicated "dead_lettered_at" column; completed_at
+                # implies success, so leave it null and rely on the
+                # auto-maintained updated_at for when this became terminal.
+
+            await self._session.commit()
+        except (IntegrityError, StaleDataError):
+            # Another delivery of this same message already recorded this
+            # attempt's failure (and possibly advanced the job further,
+            # e.g. to dead_lettered), whether via a duplicate Result row or
+            # a concurrent update to this same Job row. Their write stands;
+            # the outcome computed above still drives this call's own
+            # return so the harness's retry/DLQ decision for *this*
+            # delivery is unaffected -- worst case a harmless extra
+            # redelivery, never a crashed worker.
+            #
+            # Roll back before touching `job` again: a failed flush leaves
+            # the session's transaction deactivated, and merely reading an
+            # expired ORM attribute (job.id) would make SQLAlchemy try to
+            # refresh it from the DB, raising PendingRollbackError instead
+            # of the log line it was meant to be. `message.job_id` is a
+            # plain value already in hand, not an ORM attribute, so it is
+            # safe to read either way -- used for exactly that reason.
+            await self._session.rollback()
+            logger.info(
+                "stage failure commit lost a race to a concurrent delivery; discarding",
+                extra={"job_id": str(message.job_id), "stage": message.stage},
+            )
+
         outcome = ProcessingOutcome.EXHAUSTED if exhausted else ProcessingOutcome.RETRY
         STAGE_OUTCOMES_TOTAL.labels(outcome=outcome).inc()
         if exhausted:
@@ -193,73 +243,91 @@ class StageProcessingService:
         return ProcessingResult(
             outcome=outcome,
             attempt=attempt,
-            max_attempts=job.max_attempts,
+            max_attempts=max_attempts,
             error=error_text,
         )
 
     async def _record_success(
         self, job: Job, message: StageMessage, attempt: int, result_payload: dict
     ) -> ProcessingResult:
-        self._results.add(
-            Result(
-                job_id=job.id,
-                worker_name=self._worker.name,
-                stage=message.stage,
-                payload=result_payload,
-                artifact_uri=_primary_video_uri(result_payload),
-            )
-        )
-        self._executions.add(
-            WorkerExecution(
-                job_id=job.id,
-                worker_name=self._worker.name,
-                stage=message.stage,
-                attempt=attempt,
-                status=ExecutionStatus.SUCCEEDED,
-                finished_at=dt.datetime.now(dt.UTC),
-            )
-        )
-        job.attempts = attempt
-
-        # Read fresh rather than trusting `job.status` (Phase 9b): that
-        # object was loaded before the worker ran, which for a render is
-        # minutes ago, and a cancel arriving during the work is precisely
-        # what this needs to see.
-        cancelled = await self._jobs.current_status(job.id) == JobStatus.CANCELLED
-
-        # WorkflowEngine owns workflow position (current_stage, whether
-        # another stage exists, dispatching it) — not job lifecycle. It
-        # already added the next stage's OutboxEvent to this same session
-        # if progress.is_last_stage is False; committing below covers
-        # that dispatch atomically along with this stage's Result.
-        progress = self._engine.advance(job, message, cancelled=cancelled)
-        if progress.is_last_stage and not cancelled:
-            job.status = JobStatus.COMPLETED
-            job.completed_at = dt.datetime.now(dt.UTC)
-        if cancelled:
-            # The in-flight stage's Result above is kept -- the user asked
-            # to stop, not to discard work already paid for -- but the
-            # status they set stands. Writing COMPLETED here would undo a
-            # deliberate action just because the last stage happened to
-            # land first.
-            job.status = JobStatus.CANCELLED
-
         try:
-            await self._session.commit()
-        except IntegrityError:
-            # Someone else's delivery of the same message already committed
-            # a Result for this (job_id, stage) between our check above and
-            # this commit. Their write stands; ours is redundant, not wrong.
-            await self._session.rollback()
+            self._results.add(
+                Result(
+                    job_id=job.id,
+                    worker_name=self._worker.name,
+                    stage=message.stage,
+                    payload=result_payload,
+                    artifact_uri=_primary_video_uri(result_payload),
+                )
+            )
+            self._executions.add(
+                WorkerExecution(
+                    job_id=job.id,
+                    worker_name=self._worker.name,
+                    stage=message.stage,
+                    attempt=attempt,
+                    status=ExecutionStatus.SUCCEEDED,
+                    finished_at=dt.datetime.now(dt.UTC),
+                )
+            )
+            job.attempts = attempt
 
-        logger.info(
-            "stage processed successfully",
-            extra={
-                "job_id": str(job.id),
-                "stage": message.stage,
-                "attempt": attempt,
-                "job_status": job.status,
-            },
-        )
+            # Read fresh rather than trusting `job.status` (Phase 9b): that
+            # object was loaded before the worker ran, which for a render
+            # is minutes ago, and a cancel arriving during the work is
+            # precisely what this needs to see. This SELECT also
+            # autoflushes the mutations above -- a concurrent delivery
+            # that already claimed this row can surface a StaleDataError
+            # right here, not only at the explicit commit below, which is
+            # why the try wraps this and not just the commit.
+            cancelled = await self._jobs.current_status(job.id) == JobStatus.CANCELLED
+
+            # WorkflowEngine owns workflow position (current_stage, whether
+            # another stage exists, dispatching it) — not job lifecycle.
+            # It already added the next stage's OutboxEvent to this same
+            # session if progress.is_last_stage is False; committing below
+            # covers that dispatch atomically along with this stage's
+            # Result.
+            progress = self._engine.advance(job, message, cancelled=cancelled)
+            if progress.is_last_stage and not cancelled:
+                job.status = JobStatus.COMPLETED
+                job.completed_at = dt.datetime.now(dt.UTC)
+            if cancelled:
+                # The in-flight stage's Result above is kept -- the user
+                # asked to stop, not to discard work already paid for --
+                # but the status they set stands. Writing COMPLETED here
+                # would undo a deliberate action just because the last
+                # stage happened to land first.
+                job.status = JobStatus.CANCELLED
+
+            await self._session.commit()
+        except (IntegrityError, StaleDataError):
+            # Someone else's delivery of the same message already committed
+            # a Result for this (job_id, stage) -- IntegrityError -- or
+            # already updated this Job row -- StaleDataError, possibly
+            # raised by the autoflush inside the current_status() read
+            # above rather than by the commit itself. Either way their
+            # write stands; ours is redundant, not wrong.
+            #
+            # `message.job_id`, not `job.id`: a failed flush leaves the
+            # session's transaction deactivated, and reading an ORM
+            # attribute off the now-possibly-expired `job` would raise
+            # PendingRollbackError instead of logging cleanly.
+            await self._session.rollback()
+            logger.info(
+                "stage success commit lost a race to a concurrent delivery; discarding",
+                extra={"job_id": str(message.job_id), "stage": message.stage},
+            )
+        else:
+            logger.info(
+                "stage processed successfully",
+                extra={
+                    "job_id": str(job.id),
+                    "stage": message.stage,
+                    "attempt": attempt,
+                    "job_status": job.status,
+                },
+            )
+
         STAGE_OUTCOMES_TOTAL.labels(outcome=ProcessingOutcome.SUCCEEDED).inc()
         return ProcessingResult(outcome=ProcessingOutcome.SUCCEEDED, attempt=attempt)
