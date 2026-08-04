@@ -367,6 +367,66 @@ def test_later_stages_need_no_video_ids() -> None:
     assert result.valid is True, result.errors
 
 
+def test_a_must_be_first_stage_capability_is_rejected_out_of_position() -> None:
+    """Observed live: the planner proposed [trim, merge] -- merge as stage
+    1 rather than 0. Every other check passed, the room approved it, and
+    it dead-lettered at execution (merge_worker.py refuses to run anywhere
+    but stage 0, since later stages only receive the video the stage
+    before them produced, not the project's real uploads merge needs).
+    This is the check that turns that into a fixable ValidationResult
+    instead of a wasted vote and a doomed job."""
+    registry = CapabilityRegistry(
+        {
+            "trim": StageCapability(
+                name="trim", description="trim", parameter_schema={"start": float, "end": float}
+            ),
+            "merge": StageCapability(
+                name="merge", description="merge", must_be_first_stage=True
+            ),
+        }
+    )
+    proposal = Proposal(
+        summary="trim then merge",
+        workflow=[
+            ProposalStage(stage="trim", video_ids=["video_1"], params={"start": 0.0, "end": 10.0}),
+            ProposalStage(stage="merge", video_ids=["video_1", "video_2"], params={}),
+        ],
+    )
+
+    result = validate_proposal(
+        proposal, registry, known_video_handles=frozenset({"video_1", "video_2"})
+    )
+
+    assert result.valid is False
+    assert any("merge" in error and "position 1" in error for error in result.errors)
+
+
+def test_a_must_be_first_stage_capability_at_position_zero_is_accepted() -> None:
+    registry = CapabilityRegistry(
+        {
+            "merge": StageCapability(
+                name="merge", description="merge", must_be_first_stage=True
+            ),
+            "trim": StageCapability(
+                name="trim", description="trim", parameter_schema={"start": float, "end": float}
+            ),
+        }
+    )
+    proposal = Proposal(
+        summary="merge then trim",
+        workflow=[
+            ProposalStage(stage="merge", video_ids=["video_1", "video_2"], params={}),
+            ProposalStage(stage="trim", video_ids=[], params={"start": 0.0, "end": 10.0}),
+        ],
+    )
+
+    result = validate_proposal(
+        proposal, registry, known_video_handles=frozenset({"video_1", "video_2"})
+    )
+
+    assert result.valid is True, result.errors
+
+
 def test_a_first_stage_needing_no_video_is_exempt() -> None:
     """dummy declares it consumes nothing, so requiring it to name a video
     would be wrong."""

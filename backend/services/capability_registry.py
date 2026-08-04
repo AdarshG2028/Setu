@@ -45,6 +45,18 @@ class StageCapability:
     requires_asset_kinds: tuple[str, ...] = ("video",)
     produces_asset_kinds: tuple[str, ...] = ("video",)
 
+    # True only for merge (backend/workers/merge_worker.py). Setu forwards
+    # the original job-submission payload to every stage, so a video's real
+    # uploads are only visible at stage 0 -- from stage 1 on, the true
+    # input is whatever the previous stage produced, a single video. A
+    # merge placed later would silently concatenate the *original* uploads
+    # and discard every edit before it, so the worker refuses at runtime;
+    # validate_proposal below checks it structurally instead, so the room
+    # never votes on a proposal already guaranteed to dead-letter (observed
+    # live: `[trim, merge]` got approved, ran, and dead-lettered instead of
+    # being caught before anyone voted).
+    must_be_first_stage: bool = False
+
 
 class CapabilityRegistry:
     def __init__(self, capabilities: dict[str, StageCapability] | None = None) -> None:
@@ -226,6 +238,7 @@ DEFAULT_CAPABILITY_REGISTRY = CapabilityRegistry(
                 "frame; clips without sound are joined with silence."
             ),
             parameter_schema={},
+            must_be_first_stage=True,
         ),
         "transcribe": StageCapability(
             name="transcribe",

@@ -81,6 +81,19 @@ def test_asset_kinds_can_declare_a_producer_consumer_pair() -> None:
     assert "srt" in burn.requires_asset_kinds
 
 
+def test_must_be_first_stage_defaults_to_false() -> None:
+    assert StageCapability(name="crop", description="crop").must_be_first_stage is False
+
+
+def test_default_registrys_merge_requires_first_position() -> None:
+    """Regression guard: merge_worker.py refuses to run anywhere but stage
+    0 (it would otherwise silently concatenate the original uploads and
+    discard prior edits). This flag is what lets validate_proposal catch
+    that before the room ever votes, instead of the job dead-lettering
+    after approval -- observed live for `[trim, merge]`."""
+    assert DEFAULT_CAPABILITY_REGISTRY.get("merge").must_be_first_stage is True
+
+
 def test_asset_kind_defaults_are_immutable_and_unshared() -> None:
     """Tuples rather than lists, so the default can be a plain value: two
     capabilities can't end up aliasing one mutable default list, and no

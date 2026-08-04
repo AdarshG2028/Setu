@@ -91,6 +91,20 @@ def validate_proposal(
             )
         available_kinds.update(capability.produces_asset_kinds)
 
+        # Structural, not asset-kind-based: a stage like merge that needs
+        # every project video's real URI (not just "a video") only has
+        # that at position 0 -- every later stage's real input is whatever
+        # the stage before it produced, not the project's uploads. Caught
+        # here rather than left to the worker's own runtime refusal, so
+        # the room votes on a proposal that can actually succeed instead
+        # of approving one already guaranteed to dead-letter.
+        if capability.must_be_first_stage and index != 0:
+            errors.append(
+                f"stage '{item.stage}' (position {index}) must be the first stage "
+                f"of the workflow -- move it to position 0, with any other stages "
+                f"after it"
+            )
+
         if known_video_handles is not None:
             # A stage gets its input either from the stage before it or,
             # when nothing precedes it, from the video it names. So the
