@@ -11,7 +11,8 @@ Phase 9 adds proposal approval.
 import uuid
 from typing import Annotated
 
-from fastapi import APIRouter, File, Form, HTTPException, UploadFile, status
+from fastapi import APIRouter, File, Form, HTTPException, Request, UploadFile, status
+from fastapi.responses import RedirectResponse, StreamingResponse
 
 from backend.api.deps import (
     CurrentUserDep,
@@ -60,6 +61,7 @@ from backend.repositories.video_repository import (
     VideoRepository,
 )
 from backend.services.conversation_service import ConversationService
+from backend.services.media_streaming import stream_storage_object
 from backend.services.planner_factory import get_default_planner
 from backend.services.proposal_confirmation_service import (
     NoPendingProposalError,
@@ -280,6 +282,20 @@ async def upload_video(
             status_code=status.HTTP_409_CONFLICT,
             detail=f"a video named {name!r} already exists in this project",
         ) from exc
+    # After the commit (VideoUploadService.upload() commits internally),
+    # and only the uploader's own room previously saw this: everyone else
+    # only found out about a new video on their next full snapshot
+    # refetch, since nothing announced it live.
+    get_room_events().publish(
+        project_id,
+        type="video.created",
+        data={
+            "id": str(result.video.id),
+            "original_filename": result.video.original_filename,
+            "name": result.video.name,
+            "created_at": result.video.created_at.isoformat(),
+        },
+    )
     return VideoUploadResponse(
         video_id=result.video.id,
         project_id=project_id,
@@ -377,12 +393,59 @@ async def rename_video(
             status_code=status.HTTP_409_CONFLICT,
             detail=f"a video named {request.name!r} already exists in this project",
         ) from exc
+    get_room_events().publish(
+        project_id,
+        type="video.updated",
+        data={
+            "id": str(video.id),
+            "original_filename": video.original_filename,
+            "name": video.name,
+            "created_at": video.created_at.isoformat(),
+        },
+    )
     return VideoSummaryResponse(
         id=video.id,
         original_filename=video.original_filename,
         name=video.name,
         created_at=video.created_at,
     )
+
+
+@router.get("/{project_id}/videos/{video_id}/download", response_model=None)
+async def download_video(
+    project_id: uuid.UUID,
+    video_id: uuid.UUID,
+    request: Request,
+    session: SessionDep,
+    user_id: ProjectMemberDep,
+) -> StreamingResponse | RedirectResponse:
+    """Stream the original uploaded video, before any edit ever touches it.
+
+    A real, previously-unfilled gap: every other watchable thing in this
+    API is a job's *output* (GET /artifacts, authorized via
+    require_artifact_access against a job that produced the asset) -- but
+    a fresh upload's own video_analysis job produces no assets at all
+    (it predates the asset model), so there was no sanctioned way to watch
+    or download what you just uploaded until an edit had run on it.
+
+    Authorized by room membership alone, same as rename_video above --
+    any member may view any video already visible in the room's own
+    library (GET /projects/{id}/videos), so this adds no new exposure.
+    Deliberately a separate route rather than routing storage_uri through
+    GET /artifacts: that route's authorization is job-shaped (a URI plus
+    the job that produced it), and a raw upload has no such job.
+    """
+    video = await VideoRepository(session).get(video_id)
+    if video is None or video.project_id != project_id:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="video not found")
+    uri, filename = video.storage_uri, video.original_filename
+    # Release the pooled connection before streaming -- see the same call
+    # in backend/api/routes/artifacts.py for why holding it across a video
+    # download exhausts the pool and takes the whole API down with it.
+    # Read what we need off `video` first: the instance is expired once
+    # its session closes, so touching it afterwards would re-query.
+    await session.close()
+    return await stream_storage_object(request, uri, fallback_filename=filename)
 
 
 @router.post(

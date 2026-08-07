@@ -456,3 +456,118 @@ async def test_upload_creates_job1_event_published_end_to_end(
             await asyncio.sleep(0.5)
         assert status_value == "published"
     await engine.dispose()
+
+
+# --- GET /projects/{id}/videos/{id}/download ------------------------------
+#
+# The original upload, before any edit has run on it -- previously
+# unreachable, since a fresh video_analysis job produces no assets and so
+# has no sanctioned artifact to authorize a download against (see
+# backend/api/routes/projects.py's download_video docstring).
+
+
+def test_download_video_streams_the_uploaded_bytes(
+    client: TestClient, cleanup_project_ids: list, cleanup_video_ids: list
+) -> None:
+    project_id = _create_project(client)
+    cleanup_project_ids.append(project_id)
+    payload = b"pretend this is an mp4"
+    uploaded = _upload(client, project_id, data=payload).json()
+    video_id = uploaded["video_id"]
+    cleanup_video_ids.append(uuid.UUID(video_id))
+
+    response = client.get(
+        f"/projects/{project_id}/videos/{video_id}/download",
+        headers=as_user(_OWNERS[project_id]),
+    )
+
+    assert response.status_code == 200
+    assert response.content == payload
+    assert response.headers["accept-ranges"] == "bytes"
+
+
+def test_download_video_honours_range_requests(
+    client: TestClient, cleanup_project_ids: list, cleanup_video_ids: list
+) -> None:
+    project_id = _create_project(client)
+    cleanup_project_ids.append(project_id)
+    payload = bytes(range(256)) * 100  # 25.6 KiB, larger than a token range
+    uploaded = _upload(client, project_id, data=payload).json()
+    video_id = uploaded["video_id"]
+    cleanup_video_ids.append(uuid.UUID(video_id))
+
+    response = client.get(
+        f"/projects/{project_id}/videos/{video_id}/download",
+        headers={**as_user(_OWNERS[project_id]), "Range": "bytes=10-19"},
+    )
+
+    assert response.status_code == 206
+    assert response.content == payload[10:20]
+    assert response.headers["content-range"] == f"bytes 10-19/{len(payload)}"
+
+
+def test_download_unknown_video_is_404(client: TestClient, cleanup_project_ids: list) -> None:
+    project_id = _create_project(client)
+    cleanup_project_ids.append(project_id)
+
+    response = client.get(
+        f"/projects/{project_id}/videos/{uuid.uuid4()}/download",
+        headers=as_user(_OWNERS[project_id]),
+    )
+
+    assert response.status_code == 404
+
+
+def test_download_video_via_a_different_project_is_404(
+    client: TestClient, cleanup_project_ids: list, cleanup_video_ids: list
+) -> None:
+    """The video is real and downloadable -- just not through a project
+    that isn't actually its own, even for a member of that other room."""
+    project_a = _create_project(client)
+    project_b = _create_project(client)
+    cleanup_project_ids.append(project_a)
+    cleanup_project_ids.append(project_b)
+    uploaded = _upload(client, project_a).json()
+    cleanup_video_ids.append(uuid.UUID(uploaded["video_id"]))
+
+    response = client.get(
+        f"/projects/{project_b}/videos/{uploaded['video_id']}/download",
+        headers=as_user(_OWNERS[project_b]),
+    )
+
+    assert response.status_code == 404
+
+
+# NOT TESTED HERE, deliberately: both streaming routes release their DB
+# session before the first byte goes out (see download_video in
+# backend/api/routes/projects.py), because get_session is a FastAPI
+# yield-dependency whose pooled connection is otherwise held until the
+# response is *fully sent* -- i.e. the whole video download. Held open by
+# a browser's parallel range requests, that exhausted the pool (size 10 +
+# overflow 5) and made every endpoint in the API fail with QueuePool
+# timeouts, which surfaced to the user as "could not reach backend".
+#
+# Two attempts at a regression test for it were written and thrown away:
+# both passed with the fix *and* without it, which is worse than no test.
+# Starlette's TestClient drives the app through a portal and buffers each
+# response fully before returning, so a request is already complete (and
+# its session released) by the time the test can hold onto it -- there is
+# no way to keep N streams genuinely in flight. Reproducing this needs a
+# real uvicorn and real concurrent clients; it was verified that way
+# instead, against the running dev server.
+
+
+def test_a_stranger_cannot_download_a_rooms_video(
+    client: TestClient, cleanup_project_ids: list, cleanup_video_ids: list
+) -> None:
+    project_id = _create_project(client)
+    cleanup_project_ids.append(project_id)
+    uploaded = _upload(client, project_id).json()
+    cleanup_video_ids.append(uuid.UUID(uploaded["video_id"]))
+
+    response = client.get(
+        f"/projects/{project_id}/videos/{uploaded['video_id']}/download",
+        headers=as_user(uuid.uuid4()),
+    )
+
+    assert response.status_code == 404

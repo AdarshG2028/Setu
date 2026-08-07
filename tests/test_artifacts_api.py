@@ -91,19 +91,20 @@ class _FakePresigningStorage:
 @pytest.fixture
 def presigning_storage(monkeypatch) -> _FakePresigningStorage:
     fake = _FakePresigningStorage()
-    monkeypatch.setattr("backend.api.routes.artifacts.get_storage", lambda: fake)
+    monkeypatch.setattr("backend.services.media_streaming.get_storage", lambda: fake)
     return fake
 
 
 @pytest.fixture
 def artifact_storage(tmp_path, monkeypatch) -> LocalDiskStorage:
     """Point the download route at a temp dir rather than the configured
-    ./data/storage. The route resolves get_storage() per request, so
-    patching its module reference is enough — and it keeps these tests
-    (one of which writes a deliberately large object) from leaving files
-    behind in the real storage directory on every run."""
+    ./data/storage. The route resolves get_storage() per request via
+    backend.services.media_streaming, so patching its module reference is
+    enough — and it keeps these tests (one of which writes a deliberately
+    large object) from leaving files behind in the real storage directory
+    on every run."""
     disk = LocalDiskStorage(tmp_path)
-    monkeypatch.setattr("backend.api.routes.artifacts.get_storage", lambda: disk)
+    monkeypatch.setattr("backend.services.media_streaming.get_storage", lambda: disk)
     return disk
 
 

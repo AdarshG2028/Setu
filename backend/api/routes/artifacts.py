@@ -13,101 +13,24 @@ referenced by several stages once assets are forwarded down a chain
 **Range requests are supported**, which for a video product is not a nicety:
 without them a <video> element can play a file but cannot seek, so
 scrubbing through a render to check the crop framing or caption timing --
-the entire point of reviewing output -- silently does nothing.
+the entire point of reviewing output -- silently does nothing. The actual
+streaming/redirect mechanics live in backend/services/media_streaming.py,
+shared with the raw-video-preview route (backend/api/routes/projects.py),
+which needs byte-for-byte the same behavior once a caller is authorized.
 """
 
-import mimetypes
-import re
-from pathlib import Path
-from typing import BinaryIO
-
-from fastapi import APIRouter, HTTPException, Request, status
+from fastapi import APIRouter, Request
 from fastapi.responses import RedirectResponse, StreamingResponse
 
-from backend.api.deps import ArtifactAccessDep
-from backend.storage import StorageObjectNotFoundError, get_storage
+from backend.api.deps import ArtifactAccessDep, SessionDep
+from backend.services.media_streaming import stream_storage_object
 
 router = APIRouter(tags=["artifacts"])
-
-_CHUNK_SIZE = 64 * 1024
-_FALLBACK_CONTENT_TYPE = "application/octet-stream"
-
-# Only the single-range form. Browsers request one range at a time for
-# media playback; multipart/byteranges exists but nothing that matters
-# here emits it, and supporting it would mean generating MIME parts for
-# no practical gain.
-_RANGE = re.compile(r"^bytes=(\d*)-(\d*)$")
-
-
-def _parse_range(header: str | None, size: int) -> tuple[int, int] | None:
-    """Resolve a Range header to inclusive (start, end) byte offsets.
-
-    Returns None when there is no range to honour, and raises 416 when one
-    was asked for but cannot be satisfied -- the distinction matters,
-    since a malformed range must not silently return the whole file.
-
-    Handles all three forms: `bytes=500-999` (explicit), `bytes=500-`
-    (open-ended, what a video element sends when it seeks), and
-    `bytes=-500` (the final N bytes, used to read an MP4's trailing
-    metadata when the index is not at the front).
-    """
-    if not header:
-        return None
-
-    match = _RANGE.match(header.strip())
-    if not match or size <= 0:
-        return None
-
-    raw_start, raw_end = match.group(1), match.group(2)
-    if not raw_start and not raw_end:
-        return None
-
-    if not raw_start:  # bytes=-N -> the last N bytes
-        length = int(raw_end)
-        if length <= 0:
-            raise HTTPException(
-                status_code=status.HTTP_416_RANGE_NOT_SATISFIABLE,
-                headers={"Content-Range": f"bytes */{size}"},
-                detail="unsatisfiable range",
-            )
-        start, end = max(0, size - length), size - 1
-    else:
-        start = int(raw_start)
-        end = int(raw_end) if raw_end else size - 1
-        end = min(end, size - 1)
-
-    if start > end or start >= size:
-        raise HTTPException(
-            status_code=status.HTTP_416_RANGE_NOT_SATISFIABLE,
-            headers={"Content-Range": f"bytes */{size}"},
-            detail="unsatisfiable range",
-        )
-    return start, end
-
-
-def _stream(handle: BinaryIO, start: int, length: int):
-    """Yield `length` bytes from `start`, in chunks.
-
-    Closing is tied to the generator rather than the request: the response
-    body is produced lazily after the handler returns, so closing in the
-    handler would shut the file before a single byte was sent.
-    """
-    try:
-        handle.seek(start)
-        remaining = length
-        while remaining > 0:
-            chunk = handle.read(min(_CHUNK_SIZE, remaining))
-            if not chunk:
-                break
-            remaining -= len(chunk)
-            yield chunk
-    finally:
-        handle.close()
 
 
 @router.get("/artifacts", response_model=None)
 async def download_artifact(
-    request: Request, uri: ArtifactAccessDep
+    request: Request, uri: ArtifactAccessDep, session: SessionDep
 ) -> StreamingResponse | RedirectResponse:
     """Stream a stored artifact, honouring Range requests.
 
@@ -121,73 +44,19 @@ async def download_artifact(
     route never parses or reconstructs one, per backend/storage/base.py's
     opaque-URI contract.
 
-    Path traversal is handled by the backend rather than re-checked here:
-    LocalDiskStorage._path_for / S3Storage._key_for reject any key
-    containing a separator or a relative segment before it ever touches
-    the filesystem or S3, so a hostile `uri` fails the same way an unknown
-    one does. Duplicating that check here would risk the two drifting
-    apart. The guard runs first, so reaching that code now also requires a
-    hostile URI to have been recorded as a real asset of a room's job.
-
-    An S3-backed storage answers presigned_url() with a real URL instead
-    of None, so this handler redirects the caller straight to S3 rather
-    than streaming the bytes through this process itself -- cutting the
-    API server's egress and RAM use for every video byte served. Local
-    disk has nothing to presign (Storage.presigned_url's default), so
-    this branch is simply never taken there and the existing streaming
-    path is unchanged.
+    `session` is declared only to be *released*: it is the same
+    request-scoped session require_artifact_access already used for its
+    membership check (FastAPI caches a dependency per request), and
+    get_session is a yield-dependency, so FastAPI would otherwise hold its
+    pooled connection until the response is fully sent -- which for a
+    video means the whole download. A browser <video> opens several
+    parallel range requests and holds them open while buffering and
+    seeking, so a couple of viewers were enough to exhaust the pool
+    (QueuePool limit of size 10 overflow 5) and make *every* endpoint in
+    the API start timing out. Nothing below needs the database, so the
+    connection goes back to the pool before the first byte is streamed.
+    close() is idempotent -- get_session's own context manager closing it
+    again on exit is harmless.
     """
-    storage = get_storage()
-
-    redirect_url = storage.presigned_url(uri)
-    if redirect_url is not None:
-        return RedirectResponse(
-            redirect_url,
-            status_code=status.HTTP_307_TEMPORARY_REDIRECT,
-            # Every call mints a fresh, short-lived URL (see
-            # storage_s3_presigned_url_ttl_seconds) -- nothing here should
-            # ever be cached and replayed past that window.
-            headers={"Cache-Control": "no-store"},
-        )
-
-    try:
-        size = storage.size(uri)
-        handle = storage.open_stream(uri)
-    except StorageObjectNotFoundError as exc:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND, detail="artifact not found"
-        ) from exc
-
-    try:
-        window = _parse_range(request.headers.get("range"), size)
-    except HTTPException:
-        handle.close()
-        raise
-
-    filename = Path(uri).name or "artifact"
-    headers = {
-        # Advertised so a client knows seeking is available at all; without
-        # it browsers assume the whole file must be downloaded to play.
-        "Accept-Ranges": "bytes",
-        # inline, not attachment: Phase 7 wants these playable in a video
-        # element, and a browser download still works from the same URL.
-        "Content-Disposition": f'inline; filename="{filename}"',
-    }
-    content_type = mimetypes.guess_type(filename)[0] or _FALLBACK_CONTENT_TYPE
-
-    if window is None:
-        headers["Content-Length"] = str(size)
-        return StreamingResponse(
-            _stream(handle, 0, size), media_type=content_type, headers=headers
-        )
-
-    start, end = window
-    length = end - start + 1
-    headers["Content-Range"] = f"bytes {start}-{end}/{size}"
-    headers["Content-Length"] = str(length)
-    return StreamingResponse(
-        _stream(handle, start, length),
-        status_code=status.HTTP_206_PARTIAL_CONTENT,
-        media_type=content_type,
-        headers=headers,
-    )
+    await session.close()
+    return await stream_storage_object(request, uri)

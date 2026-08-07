@@ -306,6 +306,51 @@ def test_joining_is_announced_to_the_room(client: TestClient, cleanup_project_id
     assert event["data"]["user_id"] == str(invitee)
 
 
+def test_uploading_a_video_is_announced_to_the_room(
+    client: TestClient, room, cleanup_project_ids
+) -> None:
+    """Previously only the uploader found out about a new video (from
+    their own upload response); everyone else had to wait for their next
+    full snapshot refetch. member here is a different user than the one
+    uploading, so this proves it reaches someone who didn't cause it."""
+    project_id, owner, member = room
+
+    with client.websocket_connect(_url(project_id, member)) as ws:
+        client.post(
+            f"/projects/{project_id}/videos",
+            files={"file": ("clip.mp4", b"fake video bytes", "video/mp4")},
+            headers=as_user(owner),
+        )
+
+        event = ws.receive_json()
+
+    assert event["type"] == "video.created"
+    assert event["data"]["original_filename"] == "clip.mp4"
+
+
+def test_renaming_a_video_is_announced_to_the_room(
+    client: TestClient, room, cleanup_project_ids
+) -> None:
+    project_id, owner, member = room
+    uploaded = client.post(
+        f"/projects/{project_id}/videos",
+        files={"file": ("clip.mp4", b"fake video bytes", "video/mp4")},
+        headers=as_user(owner),
+    ).json()
+
+    with client.websocket_connect(_url(project_id, member)) as ws:
+        client.patch(
+            f"/projects/{project_id}/videos/{uploaded['video_id']}",
+            json={"name": "Intro"},
+            headers=as_user(owner),
+        )
+
+        event = ws.receive_json()
+
+    assert event["type"] == "video.updated"
+    assert event["data"]["name"] == "Intro"
+
+
 def test_a_rooms_events_never_reach_another_room(client: TestClient, room, cleanup_project_ids) -> None:
     """The registry is keyed by project. Without that, every socket in the
     process would see every room's traffic."""
