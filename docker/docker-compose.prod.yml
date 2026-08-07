@@ -1,0 +1,234 @@
+# Production stack: Postgres, Redpanda, the API, and one container per
+# stage worker. Deliberately separate from docker-compose.yml, which is
+# local-dev infrastructure only (its own comments note the app runs on the
+# host there) and additionally carries Grafana/Jaeger/Prometheus/Adminer/
+# Console -- demo tooling that is not deployed.
+#
+#   docker compose -f docker/docker-compose.prod.yml up -d --build
+#   docker compose -f docker/docker-compose.prod.yml run --rm api migrate
+#
+# Run migrate once after any deploy that changes the schema. It is not run
+# automatically at container start -- see docker/entrypoint.sh for why.
+#
+# ---------------------------------------------------------------------
+# SIZING -- read before choosing an instance
+#
+# Every capability is its own process: WorkerRunner consumes exactly one
+# topic, so 16 capabilities means 16 containers. They are idle-cheap but
+# each one is a full Python process with SQLAlchemy and aiokafka loaded,
+# budgeted at ~150 MB under load (see the EC2 sizing notes). With Postgres
+# and Redpanda (pinned at 1 GB below) alongside, **a 4 GB box is not
+# enough to run all 16 plus the API** -- 8 GB (t3.large) is the honest
+# floor for the full set.
+#
+# The alternative on a smaller box is to run only the workers you need:
+# comment out the rest. Be aware of the failure mode -- a proposal that
+# reaches a stage with no worker consuming its topic does not error, it
+# simply never progresses, and the job sits in the room forever. There is
+# no "capability unavailable" check anywhere in the planner or validator.
+#
+# ffmpeg is CPU-bound and t3 is burstable: sustained encoding drains CPU
+# credits and then throttles hard. Enable T3 Unlimited or use a
+# non-burstable instance.
+# ---------------------------------------------------------------------
+
+name: setu-prod
+
+# Secrets and connection settings, shared by the API and every worker.
+# Values come from the environment (or an --env-file); nothing is baked
+# into the image, which is what lets one image serve every environment.
+x-app-env: &app-env
+  DATABASE_URL: postgresql+asyncpg://setu:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}@postgres:5432/setu
+  # The INTERNAL listener. Containers must not use the EXTERNAL one:
+  # it advertises localhost:19092, which inside a container resolves to
+  # that container, and consumers fail with UnknownTopicOrPartitionError.
+  KAFKA_BOOTSTRAP_SERVERS: redpanda:9092
+  STORAGE_LOCAL_PATH: /app/data/storage
+  GROQ_API_KEY: ${GROQ_API_KEY:?set GROQ_API_KEY}
+  # No OTLP collector is deployed here. Left on, the exporter retries a
+  # refused connection forever and floods the logs.
+  TRACING_ENABLED: "false"
+  LOG_LEVEL: ${LOG_LEVEL:-INFO}
+  ENVIRONMENT: production
+  # Browser origins allowed to call this API -- the deployed frontend.
+  # Narrow it: the default in config.py is "*".
+  CORS_ALLOWED_ORIGINS: ${CORS_ALLOWED_ORIGINS:?set CORS_ALLOWED_ORIGINS}
+
+x-app-image: &app-image
+  image: setu:${IMAGE_TAG:-latest}
+  build:
+    context: ..
+    dockerfile: Dockerfile
+
+# Every worker is the same container with a different command. Anchored
+# rather than written out 16 times so a change to the shared parts cannot
+# drift between them.
+x-worker: &worker
+  <<: *app-image
+  restart: unless-stopped
+  environment: *app-env
+  # Workers read source video and write renders through the same Storage
+  # backend the API serves from, so this must be the *same* volume --
+  # otherwise the API 404s on files a worker just produced.
+  volumes:
+    - storage:/app/data/storage
+  depends_on:
+    postgres:
+      condition: service_healthy
+    redpanda:
+      condition: service_healthy
+  # A worker that dies mid-encode should not take the box down with it;
+  # the job is redelivered by Kafka on restart (that is the whole point of
+  # the retry/DLQ machinery). Tune down if running the full set on a
+  # smaller instance -- but see SIZING above first.
+  mem_limit: ${WORKER_MEM_LIMIT:-512m}
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: setu
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}
+      POSTGRES_DB: setu
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    # No published port: nothing outside the compose network should reach
+    # the database. Use `docker compose exec postgres psql` for access.
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U setu -d setu"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  redpanda:
+    image: redpandadata/redpanda:v24.2.7
+    restart: unless-stopped
+    command:
+      - redpanda
+      - start
+      - --smp=1
+      - --memory=${REDPANDA_MEMORY:-1G}
+      - --overprovisioned
+      - --node-id=0
+      - --check=false
+      # Only the internal listener: unlike the dev stack there is no host
+      # process to serve, and exposing a broker publicly is not something
+      # to do by accident.
+      - --kafka-addr=INTERNAL://0.0.0.0:9092
+      - --advertise-kafka-addr=INTERNAL://redpanda:9092
+    volumes:
+      - redpanda_data:/var/lib/redpanda/data
+    healthcheck:
+      test: ["CMD-SHELL", "rpk cluster health | grep -q 'Healthy:.*true'"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+
+  api:
+    <<: *app-image
+    restart: unless-stopped
+    environment: *app-env
+    volumes:
+      - storage:/app/data/storage
+    ports:
+      # Bound to loopback: TLS terminates at a reverse proxy (Caddy) on
+      # the host, which is what holds the certificate. Publishing 8000 to
+      # 0.0.0.0 would expose the API unencrypted alongside it.
+      # The host port is overridable so this stack can be brought up
+      # beside something already holding 8000.
+      - "127.0.0.1:${API_HOST_PORT:-8000}:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redpanda:
+        condition: service_healthy
+    # Here rather than in the Dockerfile: the same image runs as 16
+    # workers, none of which have an HTTP port to probe.
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=4).status==200 else 1)\""]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 20s
+
+  # --- stage workers ---------------------------------------------------
+  # One per capability, matching the keys in backend/workers/cli.py's
+  # WORKERS. Topic name and worker name are the same string; entrypoint.sh
+  # passes the argument as both.
+  #
+  # METRICS_PORT is left at its default: each container has its own
+  # network namespace, so every worker can serve 9100 without colliding.
+  # Prometheus (not deployed here) would scrape them by service name.
+
+  worker-video-analysis:
+    <<: *worker
+    command: ["worker", "video_analysis"]
+
+  worker-crop:
+    <<: *worker
+    command: ["worker", "crop"]
+
+  worker-color:
+    <<: *worker
+    command: ["worker", "color"]
+
+  worker-audio:
+    <<: *worker
+    command: ["worker", "audio"]
+
+  worker-trim:
+    <<: *worker
+    command: ["worker", "trim"]
+
+  worker-remove-segment:
+    <<: *worker
+    command: ["worker", "remove_segment"]
+
+  worker-merge:
+    <<: *worker
+    command: ["worker", "merge"]
+
+  worker-resize:
+    <<: *worker
+    command: ["worker", "resize"]
+
+  worker-rotate:
+    <<: *worker
+    command: ["worker", "rotate"]
+
+  worker-flip:
+    <<: *worker
+    command: ["worker", "flip"]
+
+  worker-pad:
+    <<: *worker
+    command: ["worker", "pad"]
+
+  worker-transcribe:
+    <<: *worker
+    command: ["worker", "transcribe"]
+
+  worker-burn-subtitles:
+    <<: *worker
+    command: ["worker", "burn_subtitles"]
+
+  worker-render:
+    <<: *worker
+    command: ["worker", "render"]
+
+  worker-detect-scenes:
+    <<: *worker
+    command: ["worker", "detect_scenes"]
+
+  worker-detect-filler-words:
+    <<: *worker
+    command: ["worker", "detect_filler_words"]
+
+volumes:
+  postgres_data:
+  redpanda_data:
+  # Uploaded footage and every render. Named rather than baked into the
+  # image or left to an anonymous volume: without this, a redeploy loses
+  # every video in every room. Back this up.
+  storage:

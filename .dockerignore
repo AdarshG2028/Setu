@@ -1,6 +1,40 @@
-.venv
-__pycache__
-*.pyc
-.git
-.pytest_cache
-docker
+# Deny by default, then re-allow exactly what the image needs.
+#
+# The previous version was an allow-by-default list of five entries, which
+# meant anything new was shipped unless someone remembered to exclude it.
+# Two things were already leaking through it:
+#
+#   .env   -- carries GROQ_API_KEY. `COPY . .` baked it into an image
+#             layer, where it survives regardless of what the running
+#             container's environment says, and is readable by anyone who
+#             can pull the image.
+#   data/  -- 185 MB of uploaded footage and renders at time of writing,
+#             copied into every build.
+#
+# Inverting the default is what stops the next one silently repeating it.
+*
+
+# --- what the build actually needs ------------------------------------
+!pyproject.toml
+!uv.lock
+!alembic.ini
+!backend/
+!docker/entrypoint.sh
+# Not documentation as far as the build is concerned: pyproject.toml
+# declares `readme = "README.md"`, so hatchling fails the wheel build with
+# `OSError: Readme file does not exist` without it.
+!README.md
+
+# --- re-exclude things that live under the paths above -----------------
+**/__pycache__/
+**/*.py[cod]
+**/.pytest_cache/
+**/.mypy_cache/
+**/.ruff_cache/
+
+# Secrets: never in an image layer. Configuration is injected at run time
+# (env vars / --env-file), which is also what lets one image serve local,
+# staging and production without a rebuild. Redundant given the `*` above,
+# and kept anyway -- this is the line that must not be deleted by accident.
+**/.env
+**/.env.*
