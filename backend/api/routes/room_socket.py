@@ -64,6 +64,16 @@ async def room_socket(websocket: WebSocket, project_id: uuid.UUID, session: Sess
         await websocket.close(code=_POLICY_VIOLATION, reason="project not found")
         return
 
+    # Release the pooled connection before the socket opens. get_session is
+    # a yield-dependency, so it is held until this handler *returns* -- and
+    # this one returns when the client disconnects, which may be hours. The
+    # membership check above is the only query here, so a room left open in
+    # a browser tab was pinning a connection for nothing; a handful of tabs
+    # exhausted the pool (size 10 + overflow 5) and every database-backed
+    # endpoint in the API began timing out while /health stayed green.
+    # Same failure as the streaming routes -- see media_streaming.py.
+    await session.close()
+
     await websocket.accept()
 
     events = get_room_events()
